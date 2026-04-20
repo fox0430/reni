@@ -1,0 +1,66 @@
+{
+  "source": "testoutput7",
+  "count": 1318,
+  "tests": [
+    {
+      "kind": "match",
+      "pattern": "5E5C704E7B322C337D58",
+      "flags": "",
+      "subject": "313258",
+      "line": 2193,
+      "groups": [
+        {
+          "index": 0,
+          "value": "313258"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "5E5C704E7B322C337D58",
+      "flags": "",
+      "subject": "31323358",
+      "line": 2193,
+      "groups": [
+        {
+          "index": 0,
+          "value": "31323358"
+        }
+      ]
+    },
+    {
+      "kind": "no_match",
+      "pattern": "5E5C704E7B322C337D58",
+      "flags": "",
+      "subject": "58",
+      "line": 2193
+    },
+    {
+      "kind": "no_match",
+      "pattern": "5E5C704E7B322C337D58",
+      "flags": "",
+      "subject": "3158",
+      "line": 2193
+    },
+    {
+      "kind": "no_match",
+      "pattern": "5E5C704E7B322C337D58",
+      "flags": "",
+      "subject": "3132333458",
+      "line": 2193
+    },
+    {
+      "kind": "match",
+      "pattern": "5C707B4C7D7B347D",
+      "flags": "",
+      "subject": "31323361626364656667",
+      "line": 2579,
+      "groups": [
+        {
+          "index": 0,
+          "value": "61626364"
+        }
+      ]
+    }
+  ]
+}

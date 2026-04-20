@@ -1,0 +1,440 @@
+{
+  "source": "test_syntax.c",
+  "count": 67,
+  "tests": [
+    {
+      "kind": "x2",
+      "pattern": "617b312c337d3f",
+      "subject": "616161",
+      "from": 0,
+      "to": 1,
+      "line": 143
+    },
+    {
+      "kind": "x2",
+      "pattern": "617b337d",
+      "subject": "616161",
+      "from": 0,
+      "to": 3,
+      "line": 144
+    },
+    {
+      "kind": "x2",
+      "pattern": "617b337d3f",
+      "subject": "616161",
+      "from": 0,
+      "to": 3,
+      "line": 145
+    },
+    {
+      "kind": "x2",
+      "pattern": "617b332c337d3f",
+      "subject": "616161",
+      "from": 0,
+      "to": 3,
+      "line": 147
+    },
+    {
+      "kind": "n",
+      "pattern": "617b332c337d3f",
+      "subject": "6161",
+      "line": 148
+    },
+    {
+      "kind": "x2",
+      "pattern": "",
+      "subject": "",
+      "from": 0,
+      "to": 0,
+      "line": 164
+    },
+    {
+      "kind": "x2",
+      "pattern": "5e",
+      "subject": "",
+      "from": 0,
+      "to": 0,
+      "line": 165
+    },
+    {
+      "kind": "n",
+      "pattern": "2e",
+      "subject": "0a",
+      "line": 167
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f733a2e29",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 168
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f73292e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 169
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c2e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 170
+    },
+    {
+      "kind": "n",
+      "pattern": "283f733a61297c2e",
+      "subject": "0a",
+      "line": 171
+    },
+    {
+      "kind": "n",
+      "pattern": "28283f732961297c2e",
+      "subject": "0a",
+      "line": 173
+    },
+    {
+      "kind": "n",
+      "pattern": "62283f3a283f732961297c7a7c2e",
+      "subject": "0a",
+      "line": 174
+    },
+    {
+      "kind": "n",
+      "pattern": "2e7c62283f732961",
+      "subject": "0a",
+      "line": 175
+    },
+    {
+      "kind": "n",
+      "pattern": "2e283f7329",
+      "subject": "0a",
+      "line": 176
+    },
+    {
+      "kind": "n",
+      "pattern": "283f7329283f2d7329617c2e",
+      "subject": "0a",
+      "line": 177
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c2e283f2d7329",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 178
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c28283f2d7329292e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 179
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c283f3a283f2d7329292e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 180
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c283f3a292e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 181
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c283f3a2e29",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 182
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c283f3a612a292e",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 183
+    },
+    {
+      "kind": "n",
+      "pattern": "617c283f3a292e",
+      "subject": "0a",
+      "line": 184
+    },
+    {
+      "kind": "n",
+      "pattern": "617c283f3a29282e29",
+      "subject": "0a",
+      "line": 185
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f7329617c283f3a29282e29",
+      "subject": "0a",
+      "from": 0,
+      "to": 1,
+      "line": 186
+    },
+    {
+      "kind": "n",
+      "pattern": "6228283f732961297c283f3a29282e29",
+      "subject": "0a",
+      "line": 188
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3d61292e62",
+      "subject": "6162",
+      "from": 0,
+      "to": 2,
+      "line": 195
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3d61627c282e29295c31",
+      "subject": "6162",
+      "from": 1,
+      "to": 2,
+      "line": 196
+    },
+    {
+      "kind": "n",
+      "pattern": "283f21282e297a29615c31",
+      "subject": "6161",
+      "line": 197
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d612962",
+      "subject": "6162",
+      "from": 1,
+      "to": 2,
+      "line": 204
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d617c622963",
+      "subject": "616263",
+      "from": 2,
+      "to": 3,
+      "line": 205
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d617c282e29295c31",
+      "subject": "61626363",
+      "from": 3,
+      "to": 4,
+      "line": 206
+    },
+    {
+      "kind": "n",
+      "pattern": "283f3c21524d412958",
+      "subject": "313233524d4158",
+      "line": 209
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d524d412958",
+      "subject": "313233524d4158",
+      "from": 6,
+      "to": 7,
+      "line": 210
+    },
+    {
+      "kind": "n",
+      "pattern": "283f3c21524d412924",
+      "subject": "313233524d41",
+      "line": 211
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d524d412924",
+      "subject": "313233524d41",
+      "from": 6,
+      "to": 6,
+      "line": 212
+    },
+    {
+      "kind": "n",
+      "pattern": "283f3c21524d41295c5a",
+      "subject": "313233524d41",
+      "line": 213
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d524d41295c5a",
+      "subject": "313233524d41",
+      "from": 6,
+      "to": 6,
+      "line": 214
+    },
+    {
+      "kind": "n",
+      "pattern": "283f3c21524d41295c7a",
+      "subject": "313233524d41",
+      "line": 215
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f3c3d524d41295c7a",
+      "subject": "313233524d41",
+      "from": 6,
+      "to": 6,
+      "line": 216
+    },
+    {
+      "kind": "n",
+      "pattern": "283f3c21637c632961",
+      "subject": "6361",
+      "line": 221
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c775c2d255d",
+      "subject": "61",
+      "from": 0,
+      "to": 1,
+      "line": 228
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c775c2d255d",
+      "subject": "25",
+      "from": 0,
+      "to": 1,
+      "line": 229
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c775c2d255d",
+      "subject": "2d",
+      "from": 0,
+      "to": 1,
+      "line": 230
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c772d255d",
+      "subject": "61",
+      "from": 0,
+      "to": 1,
+      "line": 233
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c772d255d",
+      "subject": "25",
+      "from": 0,
+      "to": 1,
+      "line": 234
+    },
+    {
+      "kind": "x2",
+      "pattern": "5b5c772d255d",
+      "subject": "2d",
+      "from": 0,
+      "to": 1,
+      "line": 235
+    },
+    {
+      "kind": "x3",
+      "pattern": "2829",
+      "subject": "616263",
+      "from": 0,
+      "to": 0,
+      "line": 331,
+      "mem": 1
+    },
+    {
+      "kind": "e",
+      "pattern": "28",
+      "subject": "",
+      "error": "ONIGERR_END_PATTERN_WITH_UNMATCHED_PARENTHESIS",
+      "line": 332
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f692974657374",
+      "subject": "74657374",
+      "from": 0,
+      "to": 4,
+      "line": 398
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f2d692974657374",
+      "subject": "74657374",
+      "from": 0,
+      "to": 4,
+      "line": 399
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f692974657374",
+      "subject": "54455354",
+      "from": 0,
+      "to": 4,
+      "line": 400
+    },
+    {
+      "kind": "n",
+      "pattern": "283f2d692974657374",
+      "subject": "74655374",
+      "line": 401
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f69297465283f2d69297374",
+      "subject": "54457374",
+      "from": 0,
+      "to": 4,
+      "line": 402
+    },
+    {
+      "kind": "n",
+      "pattern": "283f69297465283f2d69297374",
+      "subject": "54657354",
+      "line": 403
+    },
+    {
+      "kind": "x2",
+      "pattern": "2861626329283f2d3129",
+      "subject": "616263616263",
+      "from": 0,
+      "to": 6,
+      "line": 405
+    },
+    {
+      "kind": "x2",
+      "pattern": "283f2b31292861626329",
+      "subject": "616263616263",
+      "from": 0,
+      "to": 6,
+      "line": 406
+    },
+    {
+      "kind": "x2",
+      "pattern": "2861626329283f3129",
+      "subject": "616263616263",
+      "from": 0,
+      "to": 6,
+      "line": 407
+    }
+  ]
+}

@@ -1,3 +1,13 @@
 nimcache/
 nimblecache/
 htmldocs/
+
+vendor/
+
+remi.out
+tests/test_*
+!tests/*.nim
+
+tools/port_*
+!tools/*.nim
+!tools/*.py

@@ -1,0 +1,118 @@
+{
+  "source": "testoutput4",
+  "count": 1524,
+  "tests": [
+    {
+      "kind": "match",
+      "pattern": "5E5B5E645D2A3F24",
+      "flags": "",
+      "subject": "616263",
+      "line": 967,
+      "groups": [
+        {
+          "index": 0,
+          "value": "616263"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "5E5B5E645D2A3F24",
+      "flags": "i",
+      "subject": "616263",
+      "line": 975,
+      "groups": [
+        {
+          "index": 0,
+          "value": "616263"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "285B5C704C5D3D2861626329292A58",
+      "flags": "",
+      "subject": "4C3D61626358",
+      "line": 2256,
+      "groups": [
+        {
+          "index": 0,
+          "value": "4C3D61626358"
+        },
+        {
+          "index": 1,
+          "value": "4C3D616263"
+        },
+        {
+          "index": 2,
+          "value": "616263"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "5C707B4C7D7B347D",
+      "flags": "",
+      "subject": "31323361626364656667",
+      "line": 2268,
+      "groups": [
+        {
+          "index": 0,
+          "value": "61626364"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "283F3D2E2A62295C704C",
+      "flags": "",
+      "subject": "31316262",
+      "line": 3824,
+      "groups": [
+        {
+          "index": 0,
+          "value": "62"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "283F283F3D2E2A6229283F3D2E2A62295C704C7C2E2A6329",
+      "flags": "",
+      "subject": "31316262",
+      "line": 3828,
+      "groups": [
+        {
+          "index": 0,
+          "value": "62"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "5C707B204C207D",
+      "flags": "",
+      "subject": "323341423536",
+      "line": 4647,
+      "groups": [
+        {
+          "index": 0,
+          "value": "41"
+        }
+      ]
+    },
+    {
+      "kind": "match",
+      "pattern": "5C707B20205E204C2075207D",
+      "flags": "",
+      "subject": "41624364",
+      "line": 4737,
+      "groups": [
+        {
+          "index": 0,
+          "value": "62"
+        }
+      ]
+    }
+  ]
+}
