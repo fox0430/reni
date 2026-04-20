@@ -4,6 +4,8 @@ A **re**gular expression engine compatible with O**ni**guruma
 
 A pure Nim regex engine that replicates the syntax and semantics of [Oniguruma](https://github.com/kkos/oniguruma).
 
+This project aims to implement a tmLanguage parser.
+
 ## Features
 
 - Capture groups (numbered and named)
