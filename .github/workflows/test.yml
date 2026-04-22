@@ -63,5 +63,5 @@ jobs:
         run: nimble test -y
 
       - name: Gen docs
-      run: |
-        nim doc --project --index:on --outdir:./htmldocs ./reni.nim
+        run: |
+          nim doc --project --index:on --outdir:./htmldocs ./reni.nim
