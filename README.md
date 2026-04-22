@@ -120,6 +120,10 @@ depend on them, and they may be removed or restricted in a future release.
 Use `captureText`, `captureSpan`, `captureIndex`, `captureCount`,
 `namedCaptures`, and `pattern` instead.
 
+## Documentation
+
+https://fox0430.github.io/reni/reni.html
+
 ## License
 
 MIT
