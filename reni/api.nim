@@ -111,13 +111,13 @@ proc captureText*(
     return none(string)
   captureText(m, idx, subject)
 
-proc nextRunePos(subject: string, pos: int): int =
+proc nextRunePos*(subject: string, pos: int): int =
   ## Advance past one UTF-8 code point. Returns the byte offset after the rune.
   result = pos + 1
   while result < subject.len and (subject[result].uint8 and 0xC0'u8) == 0x80'u8:
     inc result
 
-proc advanceAfterMatch(subject: string, matchEnd, pos: int): int {.inline.} =
+proc advanceAfterMatch*(subject: string, matchEnd, pos: int): int {.inline.} =
   ## Return next search position after a match.
   ## For zero-width matches, advance by one rune to avoid infinite loop.
   ## Returns -1 to signal that iteration should stop.
