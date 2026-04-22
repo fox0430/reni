@@ -1,0 +1,22 @@
+name: Format with nph
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/nph.yml'
+      - 'reni.nim*'
+      - 'reni/**'
+      - 'tests/**'
+
+jobs:
+  nph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check `nph` formatting
+        uses: arnetheduck/nph-action@v1
+        with:
+          version: latest
+          options: "./"
+          fail: true
+          suggest: true
