@@ -1,3 +1,17 @@
+## Core type definitions shared across the reni regex engine.
+##
+## This module defines the AST node tags, character-class atoms, flag and
+## anchor enums, the compiled ``Regex`` object, and the ``Match`` / ``Span``
+## result types used by the parser, compiler, and engine.  It also hosts the
+## first-character and required-byte optimization analyses that the compiler
+## runs on the parsed AST.
+##
+## Most of the surface exposed here (``Node``, ``NodeKind``, ``CcAtom``,
+## ``ast``, etc.) is **internal API** — exported only so sibling modules in
+## this package can cooperate — and is not part of the stable public
+## contract.  User code should consume the documented API re-exported from
+## ``reni`` instead.
+
 import std/unicode
 
 type
