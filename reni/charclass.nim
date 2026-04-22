@@ -630,8 +630,8 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
   result = (negated, atoms)
 
 proc parseCharClass*(src: string, pos: int, flags: RegexFlags): (int, Node) =
-  ## Parse a character class starting at '[' at position pos.
-  ## Returns (new position after ']', Node).
+  ## Parse a character class starting at `[` at position pos.
+  ## Returns (new position after `]`, Node).
   var p = initCcParser(src, pos, flags)
   p.advance() # skip '['
 

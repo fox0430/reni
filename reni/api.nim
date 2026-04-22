@@ -1,3 +1,18 @@
+## High-level public API for the reni regex engine.
+##
+## This module is the user-facing entry point re-exported from ``reni``.
+## It wraps the low-level matcher in ``engine`` with the documented
+## operations: ``search`` / ``searchBackward`` / ``matchAt`` to run a
+## pattern against a subject, ``matchSpan`` / ``captureSpan`` /
+## ``captureText`` / ``captured`` / ``groupCount`` / ``captureIndex`` to
+## inspect ``Match`` results (including named groups), the ``findAll``
+## iterator, string / callback ``replace`` (with ``$0``-``$N``, ``${name}``,
+## ``$$`` substitutions), and ``split``.
+##
+## All matching procs accept ``stepLimit`` and ``maxRecursionDepth``
+## parameters for ReDoS protection; out-of-range indices raise
+## ``ValueError`` and invalid replacement references raise ``RegexError``.
+
 import std/options
 
 import types, engine

@@ -35,6 +35,18 @@
 ## See the project README for more examples including named captures,
 ## `matchAt`, `findAll`, `replace`, `split`, and backward search.
 
+## Modules
+## =======
+## - `types <reni/types.html>`_ — Core type definitions shared across the
+##   engine: ``Regex``, ``Match``, ``Span``, flag and anchor enums, and the
+##   (internal) AST node tags.
+## - `compiler <reni/compiler.html>`_ — Pattern compilation entry point.
+##   Exposes ``re(pattern, flags)`` which parses, validates, and optimizes
+##   a pattern into a reusable ``Regex``.
+## - `api <reni/api.html>`_ — High-level matching API: ``search``,
+##   ``searchBackward``, ``matchAt``, ``findAll``, ``replace``, ``split``,
+##   plus ``Match`` / capture-group accessors.
+
 import reni/[types, compiler, api]
 
 export types, compiler, api
