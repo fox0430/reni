@@ -1651,16 +1651,51 @@ proc resetForPosition(ctx: var MatchContext, startPos: int, searchStart: int) =
     ctx.calloutCounters.clear()
   ctx.graphemeMode = gmNone
 
-proc searchImpl*(
+proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.} =
+  ## Fill ``m`` in place from a capture vector, reusing ``m.boundaries``'
+  ## existing capacity when possible.  Used when ``captures`` is still
+  ## live (e.g. inside the findLongest closure, which may re-enter).
+  m.found = true
+  m.boundaries.setLen(captures.len)
+  for i in 0 ..< captures.len:
+    m.boundaries[i] = captures[i]
+
+proc writeFoundMove(m: var Match, captures: var seq[Span]) {.inline.} =
+  ## Fill ``m`` by moving ``captures`` into ``m.boundaries``.  The caller
+  ## must guarantee ``captures`` is no longer used (typically the
+  ## MatchContext is about to go out of scope).  Saves both a heap copy
+  ## of the span vector and — on the common ``search`` return path — the
+  ## separate allocation the compiler would otherwise make for the
+  ## value-returned Match's ``boundaries``.
+  m.found = true
+  m.boundaries = move(captures)
+
+proc writeNotFound(m: var Match) {.inline.} =
+  m.found = false
+  m.boundaries.setLen(0)
+
+proc searchImplInto*(
     subject: string,
     regex: Regex,
+    m: var Match,
     start: int = 0,
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
-): Match =
+) =
+  ## In-place variant of ``searchImpl``. Writes the result into ``m``,
+  ## moving ``ctx.captures`` into ``m.boundaries`` on the found path so
+  ## that the extra seq copy of the value-returning API is avoided.
+  ## (``m.boundaries``' previous buffer is released by the move; it is
+  ## not reused across top-level calls. Capacity reuse happens only
+  ## within the ``findLongest`` closure, which updates ``bestMatch``
+  ## in place via ``setLen``.)
   let findLongest = rfFindLongest in regex.flags
-  var bestMatch = Match(found: false)
   var bestLen = -1
+  # ``m`` is a ``var`` parameter and cannot be captured by the findLongest
+  # closure (Nim would reject it for memory safety). Use a local ``Match``
+  # for that path and copy into ``m`` at the end.
+  var bestMatch: Match
+  writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence
   let rb = regex.requiredByte
   if rb.valid:
@@ -1670,7 +1705,7 @@ proc searchImpl*(
         found = true
         break
     if not found:
-      return Match(found: false)
+      return
   var ctx = initMatchContext(subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   var startPos = start
@@ -1704,18 +1739,19 @@ proc searchImpl*(
     resetForPosition(ctx, startPos, start)
 
     if findLongest:
-      # Find longest: try all match alternatives at this position
+      # Find longest: try all match alternatives at this position.  The
+      # closure re-enters and mutates ctx.captures, so we must copy (not
+      # move) out of it here.
       let sp = startPos
       var matchCont: MatchCont
       matchCont = proc(ctx: var MatchContext): bool =
         let mLen = ctx.pos - sp
         if mLen > bestLen:
           bestLen = mLen
-          var caps = ctx.captures
-          caps[0] = span(sp, ctx.pos)
+          writeFoundCopy(bestMatch, ctx.captures)
+          bestMatch.boundaries[0] = span(sp, ctx.pos)
           if ctx.keepStart != sp:
-            caps[0].a = ctx.keepStart
-          bestMatch = Match(found: true, boundaries: caps)
+            bestMatch.boundaries[0].a = ctx.keepStart
         false # return false to force backtracking for more alternatives
       discard matchWithCont(ctx, regex.ast, matchCont)
     else:
@@ -1723,7 +1759,10 @@ proc searchImpl*(
         ctx.captures[0] = span(startPos, ctx.pos)
         if ctx.keepStart != startPos:
           ctx.captures[0].a = ctx.keepStart
-        return Match(found: true, boundaries: ctx.captures)
+        # ctx is local and dies when we return — steal its captures
+        # buffer instead of copying.
+        writeFoundMove(m, ctx.captures)
+        return
 
     # Advance to next UTF-8 code point boundary
     if startPos >= subject.len:
@@ -1732,20 +1771,35 @@ proc searchImpl*(
     while startPos < subject.len and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
       inc startPos
 
-  if findLongest:
-    return bestMatch
-  Match(found: false)
+  if findLongest and bestMatch.found:
+    writeFoundMove(m, bestMatch.boundaries)
 
-proc searchBackwardImpl*(
+proc searchImpl*(
     subject: string,
     regex: Regex,
-    start: int = -1,
+    start: int = 0,
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ): Match =
-  ## Search backward: try starting positions from right to left,
-  ## return the first (rightmost) forward match found.
-  ## If start >= 0, begin scanning from that position instead of the end.
+  searchImplInto(
+    subject,
+    regex,
+    result,
+    start = start,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )
+
+proc searchBackwardImplInto*(
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = -1,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+) =
+  ## In-place variant of ``searchBackwardImpl``.
+  writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence
   let rb = regex.requiredByte
   if rb.valid:
@@ -1755,7 +1809,7 @@ proc searchBackwardImpl*(
         found = true
         break
     if not found:
-      return Match(found: false)
+      return
   var ctx = initMatchContext(subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   var startPos =
@@ -1797,14 +1851,51 @@ proc searchBackwardImpl*(
       ctx.captures[0] = span(startPos, ctx.pos)
       if ctx.keepStart != startPos:
         ctx.captures[0].a = ctx.keepStart
-      return Match(found: true, boundaries: ctx.captures)
+      writeFoundMove(m, ctx.captures)
+      return
 
     if startPos == 0:
       break
     dec startPos
     while startPos > 0 and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
       dec startPos
-  Match(found: false)
+
+proc searchBackwardImpl*(
+    subject: string,
+    regex: Regex,
+    start: int = -1,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+): Match =
+  ## Search backward: try starting positions from right to left,
+  ## return the first (rightmost) forward match found.
+  ## If start >= 0, begin scanning from that position instead of the end.
+  searchBackwardImplInto(
+    subject,
+    regex,
+    result,
+    start = start,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )
+
+proc matchAtImplInto*(
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    pos: int = 0,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+) =
+  ## In-place variant of ``matchAtImpl``.
+  writeNotFound(m)
+  var ctx = initMatchContext(subject, regex, stepLimit, maxRecursionDepth)
+  resetForPosition(ctx, pos, pos)
+  if matchNode(ctx, regex.ast):
+    ctx.captures[0] = span(pos, ctx.pos)
+    if ctx.keepStart != pos:
+      ctx.captures[0].a = ctx.keepStart
+    writeFoundMove(m, ctx.captures)
 
 proc matchAtImpl*(
     subject: string,
@@ -1814,11 +1905,11 @@ proc matchAtImpl*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ): Match =
   ## Try to match only at the given position (no scanning).
-  var ctx = initMatchContext(subject, regex, stepLimit, maxRecursionDepth)
-  resetForPosition(ctx, pos, pos)
-  if matchNode(ctx, regex.ast):
-    ctx.captures[0] = span(pos, ctx.pos)
-    if ctx.keepStart != pos:
-      ctx.captures[0].a = ctx.keepStart
-    return Match(found: true, boundaries: ctx.captures)
-  Match(found: false)
+  matchAtImplInto(
+    subject,
+    regex,
+    result,
+    pos = pos,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )

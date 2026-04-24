@@ -182,10 +182,12 @@ proc replace*(
   result = ""
   var pos = 0
   var replaced = 0
+  var m: Match
   while pos <= subject.len:
-    let m = searchImpl(
+    searchImplInto(
       subject,
       regex,
+      m,
       start = pos,
       stepLimit = stepLimit,
       maxRecursionDepth = maxRecursionDepth,
@@ -262,10 +264,12 @@ proc replace*(
   result = ""
   var pos = 0
   var replaced = 0
+  var m: Match
   while pos <= subject.len:
-    let m = searchImpl(
+    searchImplInto(
       subject,
       regex,
+      m,
       start = pos,
       stepLimit = stepLimit,
       maxRecursionDepth = maxRecursionDepth,
@@ -300,12 +304,14 @@ proc split*(
   result = @[]
   var pos = 0
   var splits = 0
+  var m: Match
   while pos <= subject.len:
     if maxSplit > 0 and splits >= maxSplit:
       break
-    let m = searchImpl(
+    searchImplInto(
       subject,
       regex,
+      m,
       start = pos,
       stepLimit = stepLimit,
       maxRecursionDepth = maxRecursionDepth,
