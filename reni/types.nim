@@ -165,13 +165,18 @@ type
     ckAlwaysTrue ## (?()...) empty condition, (?({...})...) code condition
     ckRegexCond ## (?(regex)...) - bare name that's not a capture group
 
-  Node* = ref object
+  Node* {.acyclic.} = ref object
     ## **Internal API.** The parsed / compiled AST is not part of the public
     ## contract. Fields are exported only so that `compiler` and `engine`
     ## (which live in separate modules) can walk the tree. User code MUST
     ## NOT read or mutate Node fields; the shape is subject to change
     ## without notice, and mutating a Node on a compiled `Regex` will
     ## corrupt the matcher state.
+    ##
+    ## ``{.acyclic.}``: the parser constructs trees strictly top-down and
+    ## the compiler never splices a node back into its own subtree.
+    ## ``nkSubexpCall`` resolves by index/name at match time, never by
+    ## pointer back-edge.
     case kind*: NodeKind
     of nkLiteral:
       rune*: Rune

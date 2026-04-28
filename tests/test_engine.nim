@@ -2082,3 +2082,242 @@ suite "matchSpan on non-matching result":
   test "matchSpan UnsetSpan exported constant":
     check UnsetSpan.a == -1
     check UnsetSpan.b == -1
+
+suite "MatchContext-based API":
+  test "searchIntoCtx parity with search on simple literal":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "xxab", re("ab"), m)
+    let ref0 = search("xxab", re("ab"))
+    check m.found == ref0.found
+    check m.boundaries == ref0.boundaries
+
+  test "searchIntoCtx not-found clears boundaries":
+    let ctx = newMatchContext()
+    var m: Match
+    check not searchIntoCtx(ctx, "abc", re("zzz"), m)
+    check not m.found
+    check m.boundaries.len == 0
+    check m.matchSpan == UnsetSpan
+
+  test "reusing ctx across many calls matches fresh search":
+    let ctx = newMatchContext()
+    var m: Match
+    let subjects = @["hello world", "foo bar baz", "", "a", "abcabc"]
+    let patterns = @[re("\\w+"), re("o.+"), re("a"), re("z?"), re("(abc)+")]
+    for s in subjects:
+      for r in patterns:
+        let expected = search(s, r)
+        discard searchIntoCtx(ctx, s, r, m)
+        check m.found == expected.found
+        check m.boundaries == expected.boundaries
+
+  test "reusing ctx across patterns with different capture counts":
+    let ctx = newMatchContext()
+    var m: Match
+    # Pattern with 3 groups first, then 1, then 0 — boundaries must shrink/grow.
+    check searchIntoCtx(ctx, "2026-04-29", re("(\\d+)-(\\d+)-(\\d+)"), m)
+    check m.boundaries.len == 4
+    check captureText(m, 1, "2026-04-29").get == "2026"
+    check captureText(m, 3, "2026-04-29").get == "29"
+
+    check searchIntoCtx(ctx, "abc123", re("(\\d+)"), m)
+    check m.boundaries.len == 2
+    check captureText(m, 1, "abc123").get == "123"
+
+    check searchIntoCtx(ctx, "hello", re("ell"), m)
+    check m.boundaries.len == 1
+    check m.matchSpan.a == 1
+    check m.matchSpan.b == 4
+
+  test "reusing ctx with back-reference (captureStacks path)":
+    # Back-references touch ctx.captureStacks; reusing must not leak stale
+    # frames into the next call.
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(\\w+) \\1")
+    check searchIntoCtx(ctx, "go go", r, m)
+    check captureText(m, 1, "go go").get == "go"
+    # Different subject, no back-ref match this time.
+    check not searchIntoCtx(ctx, "go stop", r, m)
+    # Same regex again should still work after a not-found run.
+    check searchIntoCtx(ctx, "ha ha", r, m)
+    check captureText(m, 1, "ha ha").get == "ha"
+
+  test "reusing ctx between back-ref pattern and plain pattern":
+    let ctx = newMatchContext()
+    var m: Match
+    discard searchIntoCtx(ctx, "abab", re("(ab)\\1"), m)
+    check m.found
+    discard searchIntoCtx(ctx, "xxxx", re("x+"), m)
+    check m.found
+    check m.boundaries.len == 1
+    check m.matchSpan.a == 0
+    check m.matchSpan.b == 4
+
+  test "searchIntoCtx with start offset":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "abXab", re("ab"), m, start = 1)
+    check m.matchSpan.a == 3
+    check m.matchSpan.b == 5
+
+  test "searchIntoCtx raises on out-of-range start":
+    let ctx = newMatchContext()
+    var m: Match
+    expect ValueError:
+      discard searchIntoCtx(ctx, "abc", re("a"), m, start = -1)
+    expect ValueError:
+      discard searchIntoCtx(ctx, "abc", re("a"), m, start = 4)
+
+  test "searchBackwardIntoCtx parity with searchBackward (default start)":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchBackwardIntoCtx(ctx, "abXab", re("ab"), m)
+    let expected = searchBackward("abXab", re("ab"))
+    check m.boundaries == expected.boundaries
+
+  test "searchBackwardIntoCtx with explicit start":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchBackwardIntoCtx(ctx, "abXabYab", re("ab"), m, start = 5)
+    let expected = searchBackward("abXabYab", re("ab"), start = 5)
+    check m.boundaries == expected.boundaries
+
+  test "searchBackwardIntoCtx raises on out-of-range start":
+    let ctx = newMatchContext()
+    var m: Match
+    expect ValueError:
+      discard searchBackwardIntoCtx(ctx, "abc", re("a"), m, start = 4)
+
+  test "matchAtIntoCtx parity with matchAt":
+    let ctx = newMatchContext()
+    var m: Match
+    check matchAtIntoCtx(ctx, "abc", re("ab"), m, pos = 0)
+    check m.matchSpan.a == 0 and m.matchSpan.b == 2
+    # No forward scan — must fail at pos=1.
+    check not matchAtIntoCtx(ctx, "abc", re("ab"), m, pos = 1)
+    check not m.found
+
+  test "matchAtIntoCtx raises on out-of-range pos":
+    let ctx = newMatchContext()
+    var m: Match
+    expect ValueError:
+      discard matchAtIntoCtx(ctx, "abc", re("a"), m, pos = -1)
+    expect ValueError:
+      discard matchAtIntoCtx(ctx, "abc", re("a"), m, pos = 4)
+
+  test "captures from previous call do not bleed after not-found":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "key=val", re("(\\w+)=(\\w+)"), m)
+    check captureText(m, 1, "key=val").get == "key"
+    check not searchIntoCtx(ctx, "no-equals", re("(\\w+)=(\\w+)"), m)
+    check not m.found
+    check m.boundaries.len == 0
+
+  test "newMatchContext with pre-sized capacity behaves the same":
+    let ctx = newMatchContext(maxCapCount = 3)
+    var m: Match
+    check searchIntoCtx(ctx, "1-2-3", re("(\\d)-(\\d)-(\\d)"), m)
+    check m.boundaries.len == 4
+    check captureText(m, 2, "1-2-3").get == "2"
+
+  test "loop driven by searchIntoCtx finds all matches like findAll":
+    let ctx = newMatchContext()
+    var m: Match
+    var spans: seq[Span]
+    var pos = 0
+    let subject = "a1 b22 c333"
+    let r = re("\\d+")
+    while pos <= subject.len:
+      if not searchIntoCtx(ctx, subject, r, m, start = pos):
+        break
+      spans.add m.matchSpan
+      pos = advanceAfterMatch(subject, m.matchSpan.b, pos)
+      if pos < 0:
+        break
+    var expected: seq[Span]
+    for em in findAll(subject, r):
+      expected.add em.matchSpan
+    check spans == expected
+
+  test "ctx reuse across regex with shrinking capture count keeps captureStacks capacity":
+    # First regex has more capture groups; second has fewer.  A bug where
+    # ``resetForRegex`` shrinks ``captureStacks`` would discard inner
+    # ``seq`` capacity and corrupt subsequent reads if the third regex
+    # regrows past the second's capCount.  This test exercises that
+    # capacity-preservation contract by alternating sizes.
+    let ctx = newMatchContext()
+    var m: Match
+    let big = re("(\\w)(\\w)(\\w)(\\w)") # captureCount = 4
+    let small = re("(\\d)") # captureCount = 1
+    check searchIntoCtx(ctx, "abcd", big, m)
+    check m.boundaries.len == 5
+    check captureText(m, 4, "abcd").get == "d"
+    check searchIntoCtx(ctx, "x9y", small, m)
+    check m.boundaries.len == 2
+    check captureText(m, 1, "x9y").get == "9"
+    # Switch back to a big regex — captureStacks must still service group 4.
+    check searchIntoCtx(ctx, "wxyz", big, m)
+    check m.boundaries.len == 5
+    check captureText(m, 4, "wxyz").get == "z"
+
+  test "lookbehind with capture inside, reused via ctx":
+    # captureStacks state must not leak past the lookbehind boundary even
+    # when the body captures and the same ctx is reused across calls.
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(?<=(\\d))\\w")
+    check searchIntoCtx(ctx, "1a", r, m)
+    check m.matchSpan == 1 .. 2
+    check captureText(m, 1, "1a").get == "1"
+    check not searchIntoCtx(ctx, "ab", r, m)
+    check searchIntoCtx(ctx, "9z", r, m)
+    check captureText(m, 1, "9z").get == "9"
+
+  test "negative lookbehind with capture leaves outer captures intact":
+    # Body captures inside a negative lookbehind must not be exposed when
+    # the lookbehind succeeds (since negative => body did not match).
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(?<!(\\d))[a-z]")
+    check searchIntoCtx(ctx, "9a b", r, m)
+    # At pos 0 ('9'): not a-z, skip. pos 1 ('a'): preceded by '9', neg fails.
+    # pos 2 (' '): not a-z. pos 3 ('b'): preceded by ' ', neg succeeds.
+    check m.matchSpan == 3 .. 4
+    check not captured(m, 1)
+
+  test "lookahead containing capture, reused":
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(?=(\\d+))\\w+")
+    check searchIntoCtx(ctx, "abc123def", r, m)
+    check m.matchSpan == 3 .. 9
+    check captureText(m, 1, "abc123def").get == "123"
+    # Reuse: same regex, different subject — captureStacks must reset.
+    check searchIntoCtx(ctx, "x4y", r, m)
+    check captureText(m, 1, "x4y").get == "4"
+
+  test "alternation in lookbehind with captures":
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(?<=(a)|(bb))X")
+    check searchIntoCtx(ctx, "aX", r, m)
+    check captureText(m, 1, "aX").get == "a"
+    check not captured(m, 2)
+    check searchIntoCtx(ctx, "bbX", r, m)
+    check not captured(m, 1)
+    check captureText(m, 2, "bbX").get == "bb"
+
+  test "searchBackwardIntoCtx rejects start < -1":
+    let ctx = newMatchContext()
+    var m: Match
+    expect ValueError:
+      discard searchBackwardIntoCtx(ctx, "abc", re("a"), m, start = -2)
+    expect ValueError:
+      discard searchBackwardIntoCtx(ctx, "abc", re("a"), m, start = -100)
+
+  test "searchBackward rejects start < -1":
+    expect ValueError:
+      discard searchBackward("abc", re("a"), start = -2)

@@ -17,6 +17,87 @@ import std/options
 
 import types, engine
 
+export MatchContext, newMatchContext
+
+proc searchIntoCtx*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = 0,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+): bool {.discardable.} =
+  ## Allocation-reusing search.  Writes the result into ``m`` and
+  ## reuses the scratch buffers in ``ctx`` across calls — after the
+  ## first call, no further heap allocations are incurred by the
+  ## matcher itself.  ``ctx`` must not be shared across threads.
+  ##
+  ## Returns ``m.found`` for ``if searchIntoCtx(...): ...`` usage.
+  if start < 0 or start > subject.len:
+    raise newException(ValueError, "start index out of range: " & $start)
+  searchImplInto(
+    ctx,
+    subject,
+    regex,
+    m,
+    start = start,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )
+  m.found
+
+proc searchBackwardIntoCtx*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = -1,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+): bool {.discardable.} =
+  ## In-place variant of ``searchBackward``.  See ``searchIntoCtx`` for
+  ## the allocation-reuse contract.
+  ##
+  ## ``start = -1`` means "scan from the end of ``subject``"; any other
+  ## negative value or ``start > subject.len`` raises ``ValueError``.
+  if start < -1 or start > subject.len:
+    raise newException(ValueError, "start index out of range: " & $start)
+  searchBackwardImplInto(
+    ctx,
+    subject,
+    regex,
+    m,
+    start = start,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )
+  m.found
+
+proc matchAtIntoCtx*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    pos: int = 0,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+): bool {.discardable.} =
+  ## In-place variant of ``matchAt``.  See ``searchIntoCtx`` for the
+  ## allocation-reuse contract.
+  if pos < 0 or pos > subject.len:
+    raise newException(ValueError, "pos index out of range: " & $pos)
+  matchAtImplInto(
+    ctx,
+    subject,
+    regex,
+    m,
+    pos = pos,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+  )
+  m.found
+
 proc search*(
     subject: string,
     regex: Regex,
@@ -42,7 +123,10 @@ proc searchBackward*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ): Match =
   ## Search backward from the end (or from `start` if >= 0).
-  if start >= 0 and start > subject.len:
+  ##
+  ## ``start = -1`` means "scan from the end of ``subject``"; any other
+  ## negative value or ``start > subject.len`` raises ``ValueError``.
+  if start < -1 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
   searchBackwardImpl(
     subject,
@@ -183,8 +267,10 @@ proc replace*(
   var pos = 0
   var replaced = 0
   var m: Match
+  let ctx = newMatchContext(regex.captureCount)
   while pos <= subject.len:
     searchImplInto(
+      ctx,
       subject,
       regex,
       m,
@@ -265,8 +351,10 @@ proc replace*(
   var pos = 0
   var replaced = 0
   var m: Match
+  let ctx = newMatchContext(regex.captureCount)
   while pos <= subject.len:
     searchImplInto(
+      ctx,
       subject,
       regex,
       m,
@@ -305,10 +393,12 @@ proc split*(
   var pos = 0
   var splits = 0
   var m: Match
+  let ctx = newMatchContext(regex.captureCount)
   while pos <= subject.len:
     if maxSplit > 0 and splits >= maxSplit:
       break
     searchImplInto(
+      ctx,
       subject,
       regex,
       m,
