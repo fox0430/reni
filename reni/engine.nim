@@ -1,6 +1,7 @@
 ## Backtracking regex matching engine.
-## Uses closure-based continuation passing for correct backtracking
-## through alternations, quantifiers, and flag groups.
+## Uses an explicit frame stack on ``MatchContext`` for continuation
+## passing, giving correct backtracking through alternations,
+## quantifiers, and flag groups without per-call closure allocations.
 
 import std/[unicode, tables]
 
@@ -9,6 +10,69 @@ import pkg/unicodedb/casing
 import types, unicode_utils
 
 type
+  ContId = int32
+    ## Index into ``MatchContext.frames`` identifying a continuation.
+    ## ``TrueCont`` (-1) is the sentinel for "no further work, succeed".
+
+  ContKind = enum
+    ## Continuation kinds.  Each kind encodes a specific post-match
+    ## action that closures used to perform via captured locals.
+    ckSeqContinue ## After a child node, resume the next sibling.
+    ckCapture ## After capture body, write capture span and chain.
+    ckGroup ## After group body, restore flags before chaining.
+    ckFlagGroup ## After flag group body, restore flags / grapheme mode.
+    ckQuantGreedyMore ## Greedy quantifier: try one more rep, then fall back.
+    ckQuantLazyMore ## Lazy quantifier: try one more rep, then fall back.
+    ckRestoreSubjectEnd ## Absent abRange/abExpression: restore subjectEnd.
+    ckEndCheckPos ## Lookbehind: succeed iff ctx.pos == targetPos.
+    ckNonZeroPos ## Absent abFunction: succeed iff ctx.pos > startPos.
+    ckCapturesChanged ## Quantifier zero-width subloop: succeed iff captures differ.
+    ckFindLongestRec ## findLongest top level: record longest, return false.
+
+  Frame = object
+    ## A single continuation frame.  Frames live in a flat ``seq`` on
+    ## the ``MatchContext`` and are reused across calls; their
+    ## ``parent`` field implements the continuation chain.
+    parent: ContId
+    case kind: ContKind
+    of ckSeqContinue:
+      sNode: Node ## parent nkConcat node (children walked by idx)
+      sIdx: int32 ## next child index to match
+    of ckCapture:
+      cCapIdx: int32
+      cIndex: int32
+      cMyDepth: int32
+      cStartPos: int
+      cSavedFlags: RegexFlags
+    of ckGroup:
+      grpSavedFlags: RegexFlags
+    of ckFlagGroup:
+      fgSavedFlags: RegexFlags
+      fgSavedGM: GraphemeMode
+    of ckQuantGreedyMore, ckQuantLazyMore:
+      qBody: Node
+      qMinRep: int32
+      qMaxRep: int32
+      qCount: int32
+      qSavedPos: int
+    of ckRestoreSubjectEnd:
+      reSavedEnd: int
+      reAbsentPos: int
+    of ckEndCheckPos:
+      ecpTargetPos: int
+    of ckNonZeroPos:
+      nzpStartPos: int
+    of ckCapturesChanged:
+      ccSnapshotStart: int32
+        ## Start offset into ``ctx.captureSnapshots`` of this frame's
+        ## snapshot.  The length is ``ctx.captureSnapshots.len -
+        ## start`` at push time and the snapshot is popped together
+        ## with the frame.  Stored as a flat int32 here so the variant
+        ## doesn't carry a seq[Span] field, which would inflate every
+        ## Frame and trigger per-pop destructors on the cold path.
+    of ckFindLongestRec:
+      flStartPos: int
+
   MatchContext* {.acyclic.} = ref object
     ## Caller-owned scratch buffer used by the matcher.  Fields are
     ## engine-private; user code should only allocate via
@@ -22,10 +86,11 @@ type
     ## **Not thread-safe.** One ``MatchContext`` per thread.
     ##
     ## ``{.acyclic.}``: the engine never links a ``MatchContext`` back
-    ## into its own reachable graph (closures are transient,
-    ## ``calloutCounters`` is ``Table[string, int]`` with no refs,
-    ## ``captureStacks`` is ``seq[seq[Span]]`` where ``Span`` is a
-    ## plain object) — the cycle collector can skip tracking.
+    ## into its own reachable graph.  ``frames`` holds plain values
+    ## (Node refs are themselves ``{.acyclic.}``), ``calloutCounters``
+    ## is ``Table[string, int]`` with no refs, and ``captureStacks``
+    ## is ``seq[seq[Span]]`` where ``Span`` is a plain object — the
+    ## cycle collector can skip tracking.
     subject: string
     pos: int
     flags: RegexFlags
@@ -50,8 +115,15 @@ type
       ## calls touching the stack) leaves the whole vector untouched
       ## so ``resetForPosition`` can skip the per-group ``setLen(0)``
       ## loop entirely.
-
-  MatchCont = proc(ctx: MatchContext): bool {.closure.}
+    frames: seq[Frame]
+      ## Continuation frame stack.  Reused across calls; only
+      ## ``setLen`` is used so the underlying capacity persists.
+    captureSnapshots: seq[Span]
+      ## Side stack used by ``ckCapturesChanged`` to store full
+      ## ``ctx.captures`` snapshots without inflating the ``Frame``
+      ## variant.  Push/pop is LIFO with ``frames``.
+    flBestLen: int ## findLongest: best match length so far (-1 if none)
+    flBestMatch: Match ## findLongest: deepest match recorded
 
   SavedState = object
     pos: int
@@ -61,17 +133,34 @@ type
     subjectEnd: int
     graphemeMode: GraphemeMode
 
+const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
+
 const MaxQuantRepetitions = 10_000
 const MaxCallDepth* = 400
   ## Guard against stack overflow. Each concat node uses ~4 real call frames
-  ## (matchWithCont + matchSeqCont + matchLiteral + closure), so this must be
+  ## (matchSeqCont + matchWithCont + matchLiteral + runCont), so this must be
   ## well below Nim's debug call depth limit (2000) to catch deep recursion.
 
 # Forward declarations
-proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool
+proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool
+proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
+proc matchQuantGreedy(
+  ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: ContId
+): bool
 
-proc trueCont(ctx: MatchContext): bool =
-  true
+proc matchQuantLazy(
+  ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: ContId
+): bool
+
+proc runCont(ctx: MatchContext, cont: ContId): bool
+
+proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
+  ## Push a frame and return its index.  The frame must be popped by
+  ## the pusher (``ctx.frames.setLen(fid)``) before returning to the
+  ## caller, so that frames pushed during recursive matching are
+  ## reclaimed deterministically.
+  result = ctx.frames.len.int32
+  ctx.frames.add(frame)
 
 proc save(ctx: MatchContext): SavedState =
   SavedState(
@@ -134,11 +223,12 @@ proc getNodeRune(node: Node): (bool, Rune) =
   else:
     (false, Rune(0))
 
-proc matchSeqCont(
-    ctx: MatchContext, nodes: seq[Node], idx: int, cont: MatchCont
-): bool =
+proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool =
+  template nodes(): untyped =
+    parent.children
+
   if idx >= nodes.len:
-    return cont(ctx)
+    return runCont(ctx, cont)
   # Handle absent range markers in sequence
   let node = nodes[idx]
   if node.kind == nkAbsent and node.absentKind == abRange:
@@ -152,7 +242,7 @@ proc matchSeqCont(
       while checkPos < ctx.subjectEnd:
         let saved = save(ctx)
         ctx.pos = checkPos
-        if matchWithCont(ctx, absentBody, trueCont):
+        if matchWithCont(ctx, absentBody, TrueCont):
           absentPos = checkPos
           restore(ctx, saved)
           break findAbsent
@@ -164,19 +254,23 @@ proc matchSeqCont(
     ctx.pos = rangeStart
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
-    let restoreCont = proc(ctx: MatchContext): bool =
-      ctx.subjectEnd = savedEnd
-      let ok = cont(ctx)
-      if not ok:
-        ctx.subjectEnd = absentPos
-      ok
-    let ok = matchSeqCont(ctx, nodes, idx + 1, restoreCont)
+    let fid = pushFrame(
+      ctx,
+      Frame(
+        kind: ckRestoreSubjectEnd,
+        parent: cont,
+        reSavedEnd: savedEnd,
+        reAbsentPos: absentPos,
+      ),
+    )
+    let ok = matchSeqCont(ctx, parent, idx + 1, fid)
+    ctx.frames.setLen(fid)
     ctx.subjectEnd = savedEnd
     return ok
   if node.kind == nkAbsent and node.absentKind == abClear:
     # (?~|) or (?~) in sequence - restore subject end (clear absent range limit)
     ctx.subjectEnd = ctx.subject.len
-    return matchSeqCont(ctx, nodes, idx + 1, cont)
+    return matchSeqCont(ctx, parent, idx + 1, cont)
   # Multi-char fold: subject char folds to match consecutive pattern literals
   # e.g., subject "ß" matching pattern "ss"
   if rfIgnoreCase in ctx.flags and ctx.pos < ctx.subjectEnd and idx + 1 < nodes.len:
@@ -192,16 +286,16 @@ proc matchSeqCont(
         for i in 0 ..< reverses.len:
           if srFold == simpleFold(reverses.runes[i]):
             # Subject char matches a multi-char fold of the pattern pair
-            if matchSeqCont(ctx, nodes, idx + 2, cont):
+            if matchSeqCont(ctx, parent, idx + 2, cont):
               return true
             break
         ctx.pos = savedPos
-  matchWithCont(
-    ctx,
-    nodes[idx],
-    proc(ctx: MatchContext): bool =
-      matchSeqCont(ctx, nodes, idx + 1, cont),
+  let fid = pushFrame(
+    ctx, Frame(kind: ckSeqContinue, parent: cont, sNode: parent, sIdx: int32(idx + 1))
   )
+  let ok = matchWithCont(ctx, nodes[idx], fid)
+  ctx.frames.setLen(fid)
+  ok
 
 proc caseInsensitiveMatch(r, target: Rune, flags: RegexFlags): bool =
   ## Case-insensitive comparison respecting rfIgnoreCaseAscii flag.
@@ -214,14 +308,14 @@ proc caseInsensitiveMatch(r, target: Rune, flags: RegexFlags): bool =
     return r == target
   simpleFold(r) == simpleFold(target)
 
-proc matchLiteral(ctx: MatchContext, target: Rune, cont: MatchCont): bool =
+proc matchLiteral(ctx: MatchContext, target: Rune, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
   let savedPos = ctx.pos
   var r: Rune
   fastRuneAt(ctx.subject, ctx.pos, r, true)
   if r == target or caseInsensitiveMatch(r, target, ctx.flags):
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
   # Multi-char fold: pattern char folds to multiple chars (e.g., ß → ss)
@@ -240,12 +334,12 @@ proc matchLiteral(ctx: MatchContext, target: Rune, cont: MatchCont): bool =
         if not caseInsensitiveMatch(sr, fold.runes[i], ctx.flags):
           matched = false
           break
-      if matched and cont(ctx):
+      if matched and runCont(ctx, cont):
         return true
       ctx.pos = savedPos
   false
 
-proc matchString(ctx: MatchContext, runes: seq[Rune], cont: MatchCont): bool =
+proc matchString(ctx: MatchContext, runes: seq[Rune], cont: ContId): bool =
   let savedPos = ctx.pos
   var i = 0
   while i < runes.len:
@@ -295,12 +389,12 @@ proc matchString(ctx: MatchContext, runes: seq[Rune], cont: MatchCont): bool =
           continue
     ctx.pos = savedPos
     return false
-  if cont(ctx):
+  if runCont(ctx, cont):
     return true
   ctx.pos = savedPos
   false
 
-proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: MatchCont): bool =
+proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
   let savedPos = ctx.pos
@@ -322,7 +416,7 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: MatchCont): bool =
         nextGraphemeClusterEnd(ctx.subject, savedPos)
     if clusterEnd > savedPos:
       ctx.pos = clusterEnd
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
     ctx.pos = savedPos
     return false
@@ -332,12 +426,12 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: MatchCont): bool =
     if c == 0x0D:
       if ctx.pos < ctx.subjectEnd and ctx.subject[ctx.pos] == '\n':
         inc ctx.pos
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
       ctx.pos = savedPos
       return false
     elif c == 0x0A or c == 0x0B or c == 0x0C or c == 0x85 or c == 0x2028 or c == 0x2029:
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
       ctx.pos = savedPos
       return false
@@ -372,12 +466,12 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: MatchCont): bool =
     of ctNewlineSeq, ctGraphemeCluster:
       false # unreachable: handled above
   if matched:
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
   false
 
-proc matchAnchor(ctx: MatchContext, kind: AnchorKind, cont: MatchCont): bool =
+proc matchAnchor(ctx: MatchContext, kind: AnchorKind, cont: ContId): bool =
   let matched =
     case kind
     of akLineBegin:
@@ -410,11 +504,28 @@ proc matchAnchor(ctx: MatchContext, kind: AnchorKind, cont: MatchCont): bool =
   if matched:
     if kind == akKeep:
       ctx.keepStart = ctx.pos
-    return cont(ctx)
+    return runCont(ctx, cont)
   false
 
+proc tryCaptureChangingMatch(ctx: MatchContext, body: Node): bool {.inline.} =
+  ## Snapshot ``ctx.captures`` onto the side stack, attempt ``body`` and
+  ## accept only if captures changed (via ``ckCapturesChanged``).  The
+  ## frame and snapshot are popped before returning so the caller does
+  ## not see any leftover state on either stack.  Used by zero-width
+  ## quantifier subloops to force the body to pick a different
+  ## alternative on each iteration.
+  let snapStart = ctx.captureSnapshots.len.int32
+  for c in ctx.captures:
+    ctx.captureSnapshots.add(c)
+  let fid = pushFrame(
+    ctx, Frame(kind: ckCapturesChanged, parent: TrueCont, ccSnapshotStart: snapStart)
+  )
+  result = matchWithCont(ctx, body, fid)
+  ctx.frames.setLen(fid)
+  ctx.captureSnapshots.setLen(snapStart)
+
 proc matchQuantGreedyIter(
-    ctx: MatchContext, body: Node, minRep, maxRep, startCount: int, cont: MatchCont
+    ctx: MatchContext, body: Node, minRep, maxRep, startCount: int, cont: ContId
 ): bool =
   ## Iterative greedy fallback for large repetition counts.
   ## Matches body greedily, then tries cont from longest to shortest.
@@ -424,20 +535,17 @@ proc matchQuantGreedyIter(
 
   while (maxRep < 0 or startCount + reps < maxRep) and reps < MaxQuantRepetitions:
     let before = save(ctx)
-    if not matchWithCont(ctx, body, trueCont):
+    if not matchWithCont(ctx, body, TrueCont):
       restore(ctx, before)
       break
     if ctx.pos == before.pos:
       # Zero-width match: try cont, then force capture changes (matches recursive version)
       if startCount + reps >= minRep:
-        if cont(ctx):
+        if runCont(ctx, cont):
           return true
       for _ in 0 ..< ctx.captures.len:
         let s2 = save(ctx)
-        let prevCaps = ctx.captures
-        let changeCont = proc(ctx: MatchContext): bool =
-          ctx.captures != prevCaps
-        if not matchWithCont(ctx, body, changeCont):
+        if not tryCaptureChangingMatch(ctx, body):
           restore(ctx, s2)
           break
         if ctx.pos != s2.pos:
@@ -445,7 +553,7 @@ proc matchQuantGreedyIter(
           break
         inc reps
         if startCount + reps >= minRep:
-          if cont(ctx):
+          if runCont(ctx, cont):
             return true
       restore(ctx, before)
       break
@@ -455,14 +563,14 @@ proc matchQuantGreedyIter(
   for i in countdown(states.high, 0):
     if startCount + i >= minRep:
       restore(ctx, states[i])
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
 
   restore(ctx, states[0])
   false
 
 proc matchQuantLazyIter(
-    ctx: MatchContext, body: Node, minRep, maxRep, startCount: int, cont: MatchCont
+    ctx: MatchContext, body: Node, minRep, maxRep, startCount: int, cont: ContId
 ): bool =
   ## Iterative lazy fallback for large repetition counts.
   var reps = 0
@@ -470,7 +578,7 @@ proc matchQuantLazyIter(
   while startCount + reps < minRep and (maxRep < 0 or startCount + reps < maxRep) and
       reps < MaxQuantRepetitions:
     let before = save(ctx)
-    if not matchWithCont(ctx, body, trueCont):
+    if not matchWithCont(ctx, body, TrueCont):
       restore(ctx, before)
       return false
     if ctx.pos == before.pos:
@@ -482,7 +590,7 @@ proc matchQuantLazyIter(
 
   while reps < MaxQuantRepetitions:
     let saved = save(ctx)
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
     restore(ctx, saved)
 
@@ -490,26 +598,23 @@ proc matchQuantLazyIter(
       break
 
     let before = save(ctx)
-    if not matchWithCont(ctx, body, trueCont):
+    if not matchWithCont(ctx, body, TrueCont):
       restore(ctx, before)
       break
     if ctx.pos == before.pos:
       # Zero-width match: try cont, then force capture changes (matches recursive version)
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
       for _ in 0 ..< ctx.captures.len:
         let s2 = save(ctx)
-        let prevCaps = ctx.captures
-        let changeCont = proc(ctx: MatchContext): bool =
-          ctx.captures != prevCaps
-        if not matchWithCont(ctx, body, changeCont):
+        if not tryCaptureChangingMatch(ctx, body):
           restore(ctx, s2)
           break
         if ctx.pos != s2.pos:
           restore(ctx, s2)
           break
         inc reps
-        if cont(ctx):
+        if runCont(ctx, cont):
           return true
       restore(ctx, before)
       break
@@ -523,98 +628,137 @@ const QuantRecursionThreshold = 300
   ## call-depth limit of 2000.
 
 proc matchQuantGreedy(
-    ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: MatchCont
+    ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: ContId
 ): bool =
   if count >= QuantRecursionThreshold:
     return matchQuantGreedyIter(ctx, body, minRep, maxRep, count, cont)
   # Greedy: try one more repetition first, then fall back to continuation
   if maxRep < 0 or count < maxRep:
     let saved = save(ctx)
-    let moreRepsCont = proc(ctx: MatchContext): bool =
-      if ctx.pos == saved.pos:
-        # Zero-width body match. Try cont, then try more iterations
-        # in a bounded loop to set different captures (no recursive backtracking).
-        if cont(ctx):
-          return true
-        # Force body to pick alternatives that change captures
-        for _ in 0 ..< ctx.captures.len:
-          let s2 = save(ctx)
-          let prevCaps = ctx.captures
-          let changeCont = proc(ctx: MatchContext): bool =
-            ctx.captures != prevCaps # only accept if captures changed
-          if not matchWithCont(ctx, body, changeCont):
-            restore(ctx, s2)
-            break
-          if ctx.pos != s2.pos:
-            restore(ctx, s2)
-            break
-          if cont(ctx):
-            return true
-        return false
-      matchQuantGreedy(ctx, body, minRep, maxRep, count + 1, cont)
-    if matchWithCont(ctx, body, moreRepsCont):
+    let fid = pushFrame(
+      ctx,
+      Frame(
+        kind: ckQuantGreedyMore,
+        parent: cont,
+        qBody: body,
+        qMinRep: int32(minRep),
+        qMaxRep: int32(maxRep),
+        qCount: int32(count),
+        qSavedPos: saved.pos,
+      ),
+    )
+    let ok = matchWithCont(ctx, body, fid)
+    ctx.frames.setLen(fid)
+    if ok:
       return true
     restore(ctx, saved)
 
   # Fall back: stop repeating, try continuation
   if count >= minRep:
-    return cont(ctx)
+    return runCont(ctx, cont)
   false
 
 proc matchQuantLazy(
-    ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: MatchCont
+    ctx: MatchContext, body: Node, minRep, maxRep, count: int, cont: ContId
 ): bool =
   if count >= QuantRecursionThreshold:
     return matchQuantLazyIter(ctx, body, minRep, maxRep, count, cont)
   # Lazy: try continuation first, then one more repetition
   if count >= minRep:
     let saved = save(ctx)
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
     restore(ctx, saved)
 
   if maxRep < 0 or count < maxRep:
     let saved = save(ctx)
-    let moreRepsCont = proc(ctx: MatchContext): bool =
-      if ctx.pos == saved.pos:
-        if cont(ctx):
-          return true
-        for _ in 0 ..< ctx.captures.len:
-          let s2 = save(ctx)
-          let prevCaps = ctx.captures
-          let changeCont = proc(ctx: MatchContext): bool =
-            ctx.captures != prevCaps
-          if not matchWithCont(ctx, body, changeCont):
-            restore(ctx, s2)
-            break
-          if ctx.pos != s2.pos:
-            restore(ctx, s2)
-            break
-          if cont(ctx):
-            return true
-        return false
-      matchQuantLazy(ctx, body, minRep, maxRep, count + 1, cont)
-    if matchWithCont(ctx, body, moreRepsCont):
+    let fid = pushFrame(
+      ctx,
+      Frame(
+        kind: ckQuantLazyMore,
+        parent: cont,
+        qBody: body,
+        qMinRep: int32(minRep),
+        qMaxRep: int32(maxRep),
+        qCount: int32(count),
+        qSavedPos: saved.pos,
+      ),
+    )
+    let ok = matchWithCont(ctx, body, fid)
+    ctx.frames.setLen(fid)
+    if ok:
       return true
     restore(ctx, saved)
   false
 
 proc matchQuantPossessive(
-    ctx: MatchContext, body: Node, minRep, maxRep: int, cont: MatchCont
+    ctx: MatchContext, body: Node, minRep, maxRep: int, cont: ContId
 ): bool =
   # Possessive: match greedily, no backtracking on count
   var count = 0
   while maxRep < 0 or count < maxRep:
     let savedPos = ctx.pos
-    if not matchWithCont(ctx, body, trueCont):
+    if not matchWithCont(ctx, body, TrueCont):
       ctx.pos = savedPos
       break
     count += 1
     if ctx.pos == savedPos:
       break # zero-width: count as one rep, then stop
   if count >= minRep:
-    return cont(ctx)
+    return runCont(ctx, cont)
   false
+
+proc runQuantGreedyMore(ctx: MatchContext, contId: ContId): bool =
+  ## Continuation invoked after a single greedy quantifier body match.
+  ## Captures the body's outcome ("zero-width" vs progress) and decides
+  ## whether to try one more repetition or fall back to ``cont``.
+  let savedPos = ctx.frames[contId].qSavedPos
+  let body = ctx.frames[contId].qBody
+  let minRep = int(ctx.frames[contId].qMinRep)
+  let maxRep = int(ctx.frames[contId].qMaxRep)
+  let count = int(ctx.frames[contId].qCount)
+  let parent = ctx.frames[contId].parent
+  if ctx.pos == savedPos:
+    # Zero-width body match. Try cont, then try more iterations
+    # in a bounded loop to set different captures (no recursive backtracking).
+    if runCont(ctx, parent):
+      return true
+    # Force body to pick alternatives that change captures
+    for _ in 0 ..< ctx.captures.len:
+      let s2 = save(ctx)
+      if not tryCaptureChangingMatch(ctx, body):
+        restore(ctx, s2)
+        break
+      if ctx.pos != s2.pos:
+        restore(ctx, s2)
+        break
+      if runCont(ctx, parent):
+        return true
+    return false
+  matchQuantGreedy(ctx, body, minRep, maxRep, count + 1, parent)
+
+proc runQuantLazyMore(ctx: MatchContext, contId: ContId): bool =
+  let savedPos = ctx.frames[contId].qSavedPos
+  let body = ctx.frames[contId].qBody
+  let minRep = int(ctx.frames[contId].qMinRep)
+  let maxRep = int(ctx.frames[contId].qMaxRep)
+  let count = int(ctx.frames[contId].qCount)
+  let parent = ctx.frames[contId].parent
+  if ctx.pos == savedPos:
+    if runCont(ctx, parent):
+      return true
+    for _ in 0 ..< ctx.captures.len:
+      let s2 = save(ctx)
+      if not tryCaptureChangingMatch(ctx, body):
+        restore(ctx, s2)
+        break
+      if ctx.pos != s2.pos:
+        restore(ctx, s2)
+        break
+      if runCont(ctx, parent):
+        return true
+    return false
+  matchQuantLazy(ctx, body, minRep, maxRep, count + 1, parent)
 
 proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
   case atom.kind
@@ -729,7 +873,7 @@ proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
       discard
   false
 
-proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: MatchCont): bool =
+proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: ContId): bool =
   ## Try multi-character case fold expansions for bracket character classes.
   ## e.g., (?i:[ß]) should match "ss" because ß folds to "ss".
   if not (rfIgnoreCase in ctx.flags and node.bracketClass and not node.negated):
@@ -761,12 +905,12 @@ proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     if ok:
       let savedPos = ctx.pos
       ctx.pos = p
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
       ctx.pos = savedPos
   false
 
-proc matchCharClass(ctx: MatchContext, node: Node, cont: MatchCont): bool =
+proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
   # Try multi-char case fold first (e.g., ß → ss)
@@ -792,7 +936,7 @@ proc matchCharClass(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     else:
       anyMatch
   if matched:
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
   false
@@ -839,9 +983,7 @@ proc resolveCapture(ctx: MatchContext, capIdx: int, level: int): Span =
     return UnsetSpan
   ctx.captures[capIdx]
 
-proc matchBackref(
-    ctx: MatchContext, capIdx: int, cont: MatchCont, level: int = 0
-): bool =
+proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0): bool =
   let cap = resolveCapture(ctx, capIdx, level)
   if cap.a < 0:
     return false # unset capture
@@ -908,7 +1050,7 @@ proc matchBackref(
       return false
     let savedPos = ctx.pos
     ctx.pos = mp # use actual bytes consumed, not capture byte length
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
     ctx.pos = savedPos
     false
@@ -920,12 +1062,12 @@ proc matchBackref(
         return false
     let savedPos = ctx.pos
     ctx.pos += capLen
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
     ctx.pos = savedPos
     false
 
-proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: MatchCont): bool =
+proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool =
   let capIdx = index + 1 # boundaries[0] = overall match
   let startPos = ctx.pos
   let savedFlags = ctx.flags
@@ -935,30 +1077,52 @@ proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: MatchCont): b
       ctx.groupRecursionDepth[index]
     else:
       -1
-  let capCont = proc(ctx: MatchContext): bool =
-    let endPos = ctx.pos
-    let savedCap = ctx.captures[capIdx]
-    ctx.captures[capIdx] = span(startPos, endPos)
-    # Record capture in recursion-level stack
-    var savedStackEntry = UnsetSpan
+  let fid = pushFrame(
+    ctx,
+    Frame(
+      kind: ckCapture,
+      parent: cont,
+      cCapIdx: int32(capIdx),
+      cIndex: int32(index),
+      cMyDepth: int32(myDepth),
+      cStartPos: startPos,
+      cSavedFlags: savedFlags,
+    ),
+  )
+  let ok = matchWithCont(ctx, body, fid)
+  ctx.frames.setLen(fid)
+  ok
+
+proc runCapture(ctx: MatchContext, contId: ContId): bool =
+  ## Continuation for ``matchCapture``: write the capture span, chain to
+  ## the parent continuation, and on failure restore the previous span.
+  let capIdx = int(ctx.frames[contId].cCapIdx)
+  let index = int(ctx.frames[contId].cIndex)
+  let myDepth = int(ctx.frames[contId].cMyDepth)
+  let startPos = ctx.frames[contId].cStartPos
+  let savedFlags = ctx.frames[contId].cSavedFlags
+  let parent = ctx.frames[contId].parent
+  let endPos = ctx.pos
+  let savedCap = ctx.captures[capIdx]
+  ctx.captures[capIdx] = span(startPos, endPos)
+  var savedStackEntry = UnsetSpan
+  if myDepth >= 0:
+    if index >= ctx.captureStacks.len:
+      ctx.captureStacks.setLen(index + 1)
+    if myDepth >= ctx.captureStacks[index].len:
+      ctx.captureStacks[index].setLen(myDepth + 1)
+    savedStackEntry = ctx.captureStacks[index][myDepth]
+    ctx.captureStacks[index][myDepth] = span(startPos, endPos)
+    ctx.captureStacksDirty = true
+  let modFlags = ctx.flags
+  ctx.flags = savedFlags # restore flags at group boundary
+  let ok = runCont(ctx, parent)
+  if not ok:
+    ctx.captures[capIdx] = savedCap
+    ctx.flags = modFlags
     if myDepth >= 0:
-      if index >= ctx.captureStacks.len:
-        ctx.captureStacks.setLen(index + 1)
-      if myDepth >= ctx.captureStacks[index].len:
-        ctx.captureStacks[index].setLen(myDepth + 1)
-      savedStackEntry = ctx.captureStacks[index][myDepth]
-      ctx.captureStacks[index][myDepth] = span(startPos, endPos)
-      ctx.captureStacksDirty = true
-    let modFlags = ctx.flags
-    ctx.flags = savedFlags # restore flags at group boundary
-    let ok = cont(ctx)
-    if not ok:
-      ctx.captures[capIdx] = savedCap
-      ctx.flags = modFlags
-      if myDepth >= 0:
-        ctx.captureStacks[index][myDepth] = savedStackEntry
-    ok
-  matchWithCont(ctx, body, capCont)
+      ctx.captureStacks[index][myDepth] = savedStackEntry
+  ok
 
 proc fixedByteLen(node: Node): int =
   ## Returns the fixed byte length consumed by a node, or -1 if variable/unknown.
@@ -1099,8 +1263,11 @@ proc maxByteLen(node: Node): int =
   of nkAbsent:
     -1
 
+proc endCheckFrame(targetPos: int): Frame {.inline.} =
+  Frame(kind: ckEndCheckPos, parent: TrueCont, ecpTargetPos: targetPos)
+
 proc matchLookbehindFixed(
-    ctx: MatchContext, body: Node, targetEnd: int, fbl: int, cont: MatchCont
+    ctx: MatchContext, body: Node, targetEnd: int, fbl: int, cont: ContId
 ): bool =
   ## Fixed-length lookbehind: only one starting position to try.
   let st = targetEnd - fbl
@@ -1109,61 +1276,60 @@ proc matchLookbehindFixed(
   let stackSnap = saveStackLens(ctx)
   let saved = save(ctx)
   ctx.pos = st
-  let te = targetEnd
-  let endCheck = proc(tryCtx: MatchContext): bool =
-    tryCtx.pos == te
-  if matchWithCont(ctx, body, endCheck):
+  let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+  let bodyMatch = matchWithCont(ctx, body, fid)
+  ctx.frames.setLen(fid)
+  if bodyMatch:
     let savedCaps = ctx.captures
     restore(ctx, saved)
     restoreStackLens(ctx, stackSnap)
     ctx.captures = savedCaps
-    return cont(ctx)
+    return runCont(ctx, cont)
   restore(ctx, saved)
   restoreStackLens(ctx, stackSnap)
   false
 
 proc matchNegLookbehindFixed(
-    ctx: MatchContext, body: Node, targetEnd: int, fbl: int, cont: MatchCont
+    ctx: MatchContext, body: Node, targetEnd: int, fbl: int, cont: ContId
 ): bool =
   ## Fixed-length negative lookbehind: only one starting position to try.
   let st = targetEnd - fbl
   if st < 0:
-    return cont(ctx) # can't match → negative succeeds
+    return runCont(ctx, cont) # can't match → negative succeeds
   let stackSnap = saveStackLens(ctx)
   let saved = save(ctx)
   ctx.pos = st
-  let te = targetEnd
-  let endCheck = proc(tryCtx: MatchContext): bool =
-    tryCtx.pos == te
-  let matched = matchWithCont(ctx, body, endCheck)
+  let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+  let matched = matchWithCont(ctx, body, fid)
+  ctx.frames.setLen(fid)
   restore(ctx, saved)
   restoreStackLens(ctx, stackSnap)
   if matched:
     return false
-  cont(ctx)
+  runCont(ctx, cont)
 
-proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
+proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
   let kind = node.lookKind
   case kind
   of lkAhead:
     let stackSnap = saveStackLens(ctx)
     let saved = save(ctx)
-    let bodyMatch = matchWithCont(ctx, node.lookBody, trueCont)
+    let bodyMatch = matchWithCont(ctx, node.lookBody, TrueCont)
     let savedCaps = ctx.captures # keep captures from positive lookahead
     restore(ctx, saved)
     restoreStackLens(ctx, stackSnap)
     if bodyMatch:
       ctx.captures = savedCaps
-      return cont(ctx)
+      return runCont(ctx, cont)
     false
   of lkNegAhead:
     let stackSnap = saveStackLens(ctx)
     let saved = save(ctx)
-    let bodyMatch = matchWithCont(ctx, node.lookBody, trueCont)
+    let bodyMatch = matchWithCont(ctx, node.lookBody, TrueCont)
     restore(ctx, saved)
     restoreStackLens(ctx, stackSnap)
     if not bodyMatch:
-      return cont(ctx)
+      return runCont(ctx, cont)
     false
   of lkBehind:
     let targetEnd = ctx.pos
@@ -1179,15 +1345,15 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
             ctx.pos = st
-            let te = targetEnd
-            let endCheck = proc(tryCtx: MatchContext): bool =
-              tryCtx.pos == te
-            if matchWithCont(ctx, alt, endCheck):
+            let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+            let bodyMatch = matchWithCont(ctx, alt, fid)
+            ctx.frames.setLen(fid)
+            if bodyMatch:
               let savedCaps = ctx.captures
               restore(ctx, saved)
               restoreStackLens(ctx, stackSnap)
               ctx.captures = savedCaps
-              if cont(ctx):
+              if runCont(ctx, cont):
                 return true
             else:
               restore(ctx, saved)
@@ -1205,15 +1371,15 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
             ctx.pos = startTry
-            let te = targetEnd
-            let endCheck = proc(tryCtx: MatchContext): bool =
-              tryCtx.pos == te
-            if matchWithCont(ctx, alt, endCheck):
+            let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+            let bodyMatch = matchWithCont(ctx, alt, fid)
+            ctx.frames.setLen(fid)
+            if bodyMatch:
               let savedCaps = ctx.captures
               restore(ctx, saved)
               restoreStackLens(ctx, stackSnap)
               ctx.captures = savedCaps
-              return cont(ctx) # shortest priority: commit
+              return runCont(ctx, cont) # shortest priority: commit
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
             if startTry == 0:
@@ -1237,14 +1403,15 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       let stackSnap = saveStackLens(ctx)
       let saved = save(ctx)
       ctx.pos = startTry
-      let endCheck = proc(tryCtx: MatchContext): bool =
-        tryCtx.pos == targetEnd
-      if matchWithCont(ctx, body, endCheck):
+      let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+      let bodyMatch = matchWithCont(ctx, body, fid)
+      ctx.frames.setLen(fid)
+      if bodyMatch:
         let savedCaps = ctx.captures
         restore(ctx, saved)
         restoreStackLens(ctx, stackSnap)
         ctx.captures = savedCaps
-        return cont(ctx) # shortest priority: commit to this match
+        return runCont(ctx, cont) # shortest priority: commit to this match
       restore(ctx, saved)
       restoreStackLens(ctx, stackSnap)
       if startTry == 0:
@@ -1266,10 +1433,9 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
             ctx.pos = st
-            let te = targetEnd
-            let endCheck = proc(tryCtx: MatchContext): bool =
-              tryCtx.pos == te
-            let matched = matchWithCont(ctx, alt, endCheck)
+            let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+            let matched = matchWithCont(ctx, alt, fid)
+            ctx.frames.setLen(fid)
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
             if matched:
@@ -1286,10 +1452,9 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
             ctx.pos = startTry
-            let te = targetEnd
-            let endCheck = proc(tryCtx: MatchContext): bool =
-              tryCtx.pos == te
-            let matched = matchWithCont(ctx, alt, endCheck)
+            let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+            let matched = matchWithCont(ctx, alt, fid)
+            ctx.frames.setLen(fid)
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
             if matched:
@@ -1299,7 +1464,7 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
             dec startTry
             while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
               dec startTry
-      return cont(ctx)
+      return runCont(ctx, cont)
     let fbl = fixedByteLen(body)
     if fbl >= 0:
       return matchNegLookbehindFixed(ctx, body, targetEnd, fbl, cont)
@@ -1315,9 +1480,9 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       let stackSnap = saveStackLens(ctx)
       let saved = save(ctx)
       ctx.pos = startTry
-      let endCheck = proc(tryCtx: MatchContext): bool =
-        tryCtx.pos == targetEnd
-      let matched = matchWithCont(ctx, body, endCheck)
+      let fid = pushFrame(ctx, endCheckFrame(targetEnd))
+      let matched = matchWithCont(ctx, body, fid)
+      ctx.frames.setLen(fid)
       restore(ctx, saved)
       restoreStackLens(ctx, stackSnap)
       if matched:
@@ -1327,23 +1492,23 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       dec startTry
       while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
         dec startTry
-    cont(ctx)
+    runCont(ctx, cont)
 
-proc matchAtomic(ctx: MatchContext, body: Node, cont: MatchCont): bool =
+proc matchAtomic(ctx: MatchContext, body: Node, cont: ContId): bool =
   let saved = save(ctx)
-  if matchWithCont(ctx, body, trueCont):
+  if matchWithCont(ctx, body, TrueCont):
     # Body matched — commit, no backtracking into body
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
   restore(ctx, saved)
   false
 
-proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
+proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
   case node.absentKind
   of abClear:
     # (?~) or (?~|) - always matches empty, restore subject end
     ctx.subjectEnd = ctx.subject.len
-    return cont(ctx)
+    return runCont(ctx, cont)
   of abFunction:
     # (?~pattern) - match longest text not containing pattern
     let startPos = ctx.pos
@@ -1353,10 +1518,12 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     while checkPos < ctx.subjectEnd:
       let saved = save(ctx)
       ctx.pos = checkPos
-      let cp = checkPos
-      let nonZeroCont = proc(ctx: MatchContext): bool =
-        ctx.pos > cp # only accept non-zero-width matches
-      if matchWithCont(ctx, node.absentBody, nonZeroCont):
+      let fid = pushFrame(
+        ctx, Frame(kind: ckNonZeroPos, parent: TrueCont, nzpStartPos: checkPos)
+      )
+      let bodyMatch = matchWithCont(ctx, node.absentBody, fid)
+      ctx.frames.setLen(fid)
+      if bodyMatch:
         firstAbsentPos = checkPos
         restore(ctx, saved)
         break
@@ -1365,7 +1532,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       fastRuneAt(ctx.subject, checkPos, r, true)
     # Match from startPos to firstAbsentPos (longest text before absent)
     ctx.pos = firstAbsentPos
-    if cont(ctx):
+    if runCont(ctx, cont):
       return true
     # If continuation fails, try shorter matches
     var tryPos = firstAbsentPos - 1
@@ -1375,7 +1542,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
         dec tryPos
         continue
       ctx.pos = tryPos
-      if cont(ctx):
+      if runCont(ctx, cont):
         return true
       dec tryPos
     ctx.pos = startPos
@@ -1391,7 +1558,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       while checkPos < ctx.subjectEnd:
         let saved = save(ctx)
         ctx.pos = checkPos
-        if matchWithCont(ctx, absentBody, trueCont):
+        if matchWithCont(ctx, absentBody, TrueCont):
           absentPos = checkPos
           restore(ctx, saved)
           break findAbsent
@@ -1404,13 +1571,17 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     let savedEnd = ctx.subjectEnd
     ctx.pos = startPos
     ctx.subjectEnd = absentPos
-    let restoreCont = proc(ctx: MatchContext): bool =
-      ctx.subjectEnd = savedEnd
-      let ok = cont(ctx)
-      if not ok:
-        ctx.subjectEnd = absentPos
-      ok
-    let ok = matchWithCont(ctx, node.absentExpr, restoreCont)
+    let fid = pushFrame(
+      ctx,
+      Frame(
+        kind: ckRestoreSubjectEnd,
+        parent: cont,
+        reSavedEnd: savedEnd,
+        reAbsentPos: absentPos,
+      ),
+    )
+    let ok = matchWithCont(ctx, node.absentExpr, fid)
+    ctx.frames.setLen(fid)
     ctx.subjectEnd = savedEnd
     return ok
   of abRange:
@@ -1422,7 +1593,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       while checkPos < ctx.subjectEnd:
         let saved = save(ctx)
         ctx.pos = checkPos
-        if matchWithCont(ctx, absentBody, trueCont):
+        if matchWithCont(ctx, absentBody, TrueCont):
           absentPos = checkPos
           restore(ctx, saved)
           break findAbsent
@@ -1433,12 +1604,12 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: MatchCont): bool =
         fastRuneAt(ctx.subject, checkPos, r, true)
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
-    let ok = cont(ctx)
+    let ok = runCont(ctx, cont)
     if not ok:
       ctx.subjectEnd = savedEnd # restore only on failure
     return ok
 
-proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
+proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
   inc ctx.steps
   if ctx.stepLimit > 0 and ctx.steps > ctx.stepLimit:
     raise newException(RegexLimitError, "match step limit exceeded")
@@ -1456,7 +1627,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
   of nkString:
     matchString(ctx, node.runes, cont)
   of nkConcat:
-    matchSeqCont(ctx, node.children, 0, cont)
+    matchSeqCont(ctx, node, 0, cont)
   of nkAlternation:
     for alt in node.alternatives:
       # Save pos, captures, keepStart — but NOT flags.
@@ -1477,14 +1648,10 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
   of nkGroup:
     # Groups save/restore flags — isolated flag groups inside don't leak out
     let savedFlags = ctx.flags
-    let groupCont = proc(ctx: MatchContext): bool =
-      let modFlags = ctx.flags
-      ctx.flags = savedFlags
-      let ok = cont(ctx)
-      if not ok:
-        ctx.flags = modFlags
-      ok
-    let ok = matchWithCont(ctx, node.groupBody, groupCont)
+    let fid =
+      pushFrame(ctx, Frame(kind: ckGroup, parent: cont, grpSavedFlags: savedFlags))
+    let ok = matchWithCont(ctx, node.groupBody, fid)
+    ctx.frames.setLen(fid)
     if not ok:
       ctx.flags = savedFlags
     ok
@@ -1505,24 +1672,21 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       ctx.flags = ctx.flags + node.flagsOn - node.flagsOff
       if node.graphemeMode != gmNone:
         ctx.graphemeMode = node.graphemeMode
-      cont(ctx)
+      runCont(ctx, cont)
     else:
       let savedFlags = ctx.flags
       let savedGM = ctx.graphemeMode
-      let modifiedFlags = ctx.flags + node.flagsOn - node.flagsOff
-      ctx.flags = modifiedFlags
+      ctx.flags = ctx.flags + node.flagsOn - node.flagsOff
       if node.graphemeMode != gmNone:
         ctx.graphemeMode = node.graphemeMode
-      let flagCont = proc(ctx: MatchContext): bool =
-        ctx.flags = savedFlags
-        ctx.graphemeMode = savedGM
-        let ok = cont(ctx)
-        if not ok:
-          ctx.flags = modifiedFlags
-          if node.graphemeMode != gmNone:
-            ctx.graphemeMode = node.graphemeMode
-        ok
-      let ok = matchWithCont(ctx, node.flagBody, flagCont)
+      let fid = pushFrame(
+        ctx,
+        Frame(
+          kind: ckFlagGroup, parent: cont, fgSavedFlags: savedFlags, fgSavedGM: savedGM
+        ),
+      )
+      let ok = matchWithCont(ctx, node.flagBody, fid)
+      ctx.frames.setLen(fid)
       if not ok:
         ctx.flags = savedFlags
         ctx.graphemeMode = savedGM
@@ -1530,11 +1694,11 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
   of nkAnchor:
     if node.anchor == akWordBoundary:
       if matchWordBoundary(ctx):
-        return cont(ctx)
+        return runCont(ctx, cont)
       return false
     elif node.anchor == akNotWordBoundary:
       if not matchWordBoundary(ctx):
-        return cont(ctx)
+        return runCont(ctx, cont)
       return false
     else:
       matchAnchor(ctx, node.anchor, cont)
@@ -1648,7 +1812,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
           # we still need to preserve captures from the body match.
           let stackSnap = saveStackLens(ctx)
           let saved = save(ctx)
-          let bodyMatch = matchWithCont(ctx, node.condBody.lookBody, trueCont)
+          let bodyMatch = matchWithCont(ctx, node.condBody.lookBody, TrueCont)
           let capsAfterBody = ctx.captures
           restore(ctx, saved)
           restoreStackLens(ctx, stackSnap)
@@ -1660,7 +1824,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
         else:
           let stackSnap = saveStackLens(ctx)
           let saved = save(ctx)
-          if matchWithCont(ctx, node.condBody, trueCont):
+          if matchWithCont(ctx, node.condBody, TrueCont):
             # Condition matched — condMet = true, pos is advanced past condition
             condMet = true
           else:
@@ -1673,7 +1837,8 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     elif node.condKind in {ckBackref, ckNamedRef}:
       false # backref condition false with no else-branch → fail
     else:
-      cont(ctx) # regex/other condition false with no else-branch → empty match
+      runCont(ctx, cont)
+        # regex/other condition false with no else-branch → empty match
   of nkAbsent:
     matchAbsent(ctx, node, cont)
   of nkCalloutMax:
@@ -1682,7 +1847,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     if cur >= node.maxCount:
       return false
     ctx.calloutCounters[tag] = cur + 1
-    let ok = cont(ctx)
+    let ok = runCont(ctx, cont)
     if not ok:
       ctx.calloutCounters[tag] = cur # backtrack
     ok
@@ -1690,7 +1855,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
     let tag = node.countTag
     let cur = ctx.calloutCounters.getOrDefault(tag, 0)
     ctx.calloutCounters[tag] = cur + 1
-    let ok = cont(ctx)
+    let ok = runCont(ctx, cont)
     if not ok:
       ctx.calloutCounters[tag] = cur # backtrack
     ok
@@ -1714,11 +1879,89 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: MatchCont): bool =
       else:
         false
     if cmpResult:
-      return cont(ctx)
+      return runCont(ctx, cont)
     false
 
 proc matchNode(ctx: MatchContext, node: Node): bool =
-  matchWithCont(ctx, node, trueCont)
+  matchWithCont(ctx, node, TrueCont)
+
+proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.}
+
+proc runCont(ctx: MatchContext, cont: ContId): bool =
+  ## Execute the chained continuation identified by ``cont``.  Each
+  ## ``Frame`` encodes one closure's worth of post-match work plus a
+  ## ``parent`` link; this proc walks that chain.  ``TrueCont`` is the
+  ## sentinel ``-1`` meaning "no further work, succeed".
+  if cont < 0:
+    return true
+  case ctx.frames[cont].kind
+  of ckSeqContinue:
+    let parentNode = ctx.frames[cont].sNode
+    let idx = int(ctx.frames[cont].sIdx)
+    let parent = ctx.frames[cont].parent
+    matchSeqCont(ctx, parentNode, idx, parent)
+  of ckCapture:
+    runCapture(ctx, cont)
+  of ckGroup:
+    let savedFlags = ctx.frames[cont].grpSavedFlags
+    let parent = ctx.frames[cont].parent
+    let modFlags = ctx.flags
+    ctx.flags = savedFlags
+    let ok = runCont(ctx, parent)
+    if not ok:
+      ctx.flags = modFlags
+    ok
+  of ckFlagGroup:
+    let savedFlags = ctx.frames[cont].fgSavedFlags
+    let savedGM = ctx.frames[cont].fgSavedGM
+    let parent = ctx.frames[cont].parent
+    let modFlags = ctx.flags
+    let modGM = ctx.graphemeMode
+    ctx.flags = savedFlags
+    ctx.graphemeMode = savedGM
+    let ok = runCont(ctx, parent)
+    if not ok:
+      ctx.flags = modFlags
+      ctx.graphemeMode = modGM
+    ok
+  of ckQuantGreedyMore:
+    runQuantGreedyMore(ctx, cont)
+  of ckQuantLazyMore:
+    runQuantLazyMore(ctx, cont)
+  of ckRestoreSubjectEnd:
+    let savedEnd = ctx.frames[cont].reSavedEnd
+    let absentPos = ctx.frames[cont].reAbsentPos
+    let parent = ctx.frames[cont].parent
+    ctx.subjectEnd = savedEnd
+    let ok = runCont(ctx, parent)
+    if not ok:
+      ctx.subjectEnd = absentPos
+    ok
+  of ckEndCheckPos:
+    ctx.pos == ctx.frames[cont].ecpTargetPos
+  of ckNonZeroPos:
+    ctx.pos > ctx.frames[cont].nzpStartPos
+  of ckCapturesChanged:
+    # Compare current captures against the side-stack snapshot.
+    # ``ctx.captures.len`` is fixed for a given regex, so the snapshot
+    # length always equals ``ctx.captures.len`` (no length check needed).
+    let snapStart = int(ctx.frames[cont].ccSnapshotStart)
+    var changed = false
+    for i in 0 ..< ctx.captures.len:
+      if ctx.captureSnapshots[snapStart + i] != ctx.captures[i]:
+        changed = true
+        break
+    changed
+  of ckFindLongestRec:
+    let sp = ctx.frames[cont].flStartPos
+    let mLen = ctx.pos - sp
+    if mLen > ctx.flBestLen:
+      ctx.flBestLen = mLen
+      writeFoundCopy(ctx.flBestMatch, ctx.captures)
+      ctx.flBestMatch.boundaries[0] = span(sp, ctx.pos)
+      if ctx.keepStart != sp:
+        ctx.flBestMatch.boundaries[0].a = ctx.keepStart
+    false # force backtracking for more alternatives
 
 proc newMatchContext*(maxCapCount: int = 0): MatchContext =
   ## Allocate a reusable matcher scratch buffer.  Pre-sizing ``maxCapCount``
@@ -1780,6 +2023,8 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.subjectEnd = ctx.subject.len
   ctx.recursionDepth = 0
   ctx.callDepth = 0
+  ctx.frames.setLen(0)
+  ctx.captureSnapshots.setLen(0)
   for i in 0 ..< ctx.captures.len:
     ctx.captures[i] = UnsetSpan
   for i in 0 ..< ctx.groupRecursionDepth.len:
@@ -1795,21 +2040,12 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
 proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.} =
   ## Fill ``m`` in place from a capture vector, reusing ``m.boundaries``'
   ## existing capacity when possible.  Used when ``captures`` is still
-  ## live (e.g. inside the findLongest closure, which may re-enter).
+  ## live (e.g. inside the findLongest frame, which may re-enter and
+  ## mutate ``ctx.captures``).
   m.found = true
   m.boundaries.setLen(captures.len)
   for i in 0 ..< captures.len:
     m.boundaries[i] = captures[i]
-
-proc writeFoundMove(m: var Match, captures: var seq[Span]) {.inline.} =
-  ## Fill ``m`` by moving ``captures`` into ``m.boundaries``.  The caller
-  ## must guarantee ``captures`` is no longer used (typically the
-  ## MatchContext is about to go out of scope).  Saves both a heap copy
-  ## of the span vector and — on the common ``search`` return path — the
-  ## separate allocation the compiler would otherwise make for the
-  ## value-returned Match's ``boundaries``.
-  m.found = true
-  m.boundaries = move(captures)
 
 proc writeNotFound(m: var Match) {.inline.} =
   m.found = false
@@ -1829,11 +2065,10 @@ proc searchImplInto*(
   ## captureStacks) and ``m.boundaries``' capacity across calls.  The
   ## ``ctx`` is assumed to be caller-owned and single-threaded.
   let findLongest = rfFindLongest in regex.flags
-  var bestLen = -1
-  # ``m`` is a ``var`` parameter and cannot be captured by the findLongest
-  # closure (Nim would reject it for memory safety). Use a local ``Match``
-  # for that path and copy into ``m`` at the end.
-  var bestMatch: Match
+  if findLongest:
+    ctx.flBestLen = -1
+    ctx.flBestMatch.found = false
+    ctx.flBestMatch.boundaries.setLen(0)
   writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence
   let rb = regex.requiredByte
@@ -1879,20 +2114,13 @@ proc searchImplInto*(
 
     if findLongest:
       # Find longest: try all match alternatives at this position.  The
-      # closure re-enters and mutates ctx.captures, so we must copy (not
-      # move) out of it here.
-      let sp = startPos
-      var matchCont: MatchCont
-      matchCont = proc(ctx: MatchContext): bool =
-        let mLen = ctx.pos - sp
-        if mLen > bestLen:
-          bestLen = mLen
-          writeFoundCopy(bestMatch, ctx.captures)
-          bestMatch.boundaries[0] = span(sp, ctx.pos)
-          if ctx.keepStart != sp:
-            bestMatch.boundaries[0].a = ctx.keepStart
-        false # return false to force backtracking for more alternatives
-      discard matchWithCont(ctx, regex.ast, matchCont)
+      # ckFindLongestRec frame mutates ``ctx.flBestMatch`` whenever a
+      # longer match is found and returns false to force backtracking.
+      let fid = pushFrame(
+        ctx, Frame(kind: ckFindLongestRec, parent: TrueCont, flStartPos: startPos)
+      )
+      discard matchWithCont(ctx, regex.ast, fid)
+      ctx.frames.setLen(fid)
     else:
       if matchNode(ctx, regex.ast):
         ctx.captures[0] = span(startPos, ctx.pos)
@@ -1909,9 +2137,10 @@ proc searchImplInto*(
     while startPos < subject.len and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
       inc startPos
 
-  if findLongest and bestMatch.found:
-    # bestMatch is a local that dies here — its seq can be moved.
-    writeFoundMove(m, bestMatch.boundaries)
+  if findLongest and ctx.flBestMatch.found:
+    # ctx.flBestMatch lives on the reusable context.  Copy its
+    # boundaries into ``m`` so the next call may overwrite the slot.
+    writeFoundCopy(m, ctx.flBestMatch.boundaries)
 
 proc searchImpl*(
     subject: string,
