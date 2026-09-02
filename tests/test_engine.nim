@@ -2321,3 +2321,45 @@ suite "MatchContext-based API":
   test "searchBackward rejects start < -1":
     expect ValueError:
       discard searchBackward("abc", re("a"), start = -2)
+
+suite "captureStacks isolation across lookaround":
+  # A lookaround body's recursion-level capture frames must not survive the
+  # zero-width boundary.  The result must not depend on whether an earlier
+  # group in the same attempt happened to push a frame first, which is what
+  # decides whether the length snapshot is taken eagerly or skipped.
+  test "level backref cannot see a frame pushed inside a lookahead":
+    check not search("aa", re("(?=(a))\\k<1+1>")).found
+    check not search("aa", re("(a)(?=(a))\\k<2+1>")).found
+
+  test "level backref cannot see a frame pushed inside a fixed lookbehind":
+    check not search("aa", re("(?<=(a))\\k<1+1>")).found
+    check not search("aa", re("(a)(?<=(a))\\k<2+1>")).found
+
+  test "level backref cannot see a frame pushed inside an alternation lookbehind":
+    check not search("aa", re("(?<=(a)|(bb))\\k<1+1>")).found
+    check not search("xaa", re("(x)(?<=(a)|(bb))\\k<2+1>")).found
+
+  test "level backref cannot see a frame pushed inside a variable lookbehind":
+    check not search("aa", re("(?<=(a+))\\k<1+1>")).found
+    check not search("xaa", re("(x)(?<=(a+))\\k<2+1>")).found
+
+  test "level-0 backrefs still see lookaround captures":
+    let m1 = search("aa", re("(?<=(a))\\k<1>"))
+    check m1.found
+    check m1.matchSpan == 1 .. 2
+    let m2 = search("aa", re("(a)(?<=(a))\\k<2>"))
+    check m2.found
+    check m2.matchSpan == 0 .. 2
+    let m3 = search("aa", re("(?=(a))\\k<1>"))
+    check m3.found
+    check m3.matchSpan == 0 .. 1
+
+  test "isolation holds when the same ctx is reused":
+    let ctx = newMatchContext()
+    var m: Match
+    let leaky = re("(?<=(a))\\k<1+1>")
+    let plain = re("(?<=(a))\\k<1>")
+    for _ in 0 .. 2:
+      check not searchIntoCtx(ctx, "aa", leaky, m)
+      check searchIntoCtx(ctx, "aa", plain, m)
+      check m.matchSpan == 1 .. 2
