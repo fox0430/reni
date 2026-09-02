@@ -190,8 +190,10 @@ proc saveStackLens(ctx: MatchContext): seq[int] =
   ## boundary; saving lengths is enough because ``matchCapture`` already
   ## restores in-place values on its own failure path, so the only way
   ## state visibly changes through a lookaround is via length growth.
-  ## When ``captureStacksDirty`` is false the snapshot is empty (and the
-  ## restore is a no-op).
+  ## When ``captureStacksDirty`` is false the snapshot is left empty to
+  ## skip the allocation: by the flag's invariant every stack is empty at
+  ## that point, so ``restoreStackLens`` reads the empty snapshot as
+  ## "trim everything back to zero" rather than "nothing to do".
   if ctx.captureStacksDirty:
     result = newSeq[int](ctx.captureStacks.len)
     for i in 0 ..< ctx.captureStacks.len:
@@ -199,8 +201,14 @@ proc saveStackLens(ctx: MatchContext): seq[int] =
 
 proc restoreStackLens(ctx: MatchContext, savedLens: sink seq[int]) =
   ## Trim each ``captureStacks[i]`` back to its saved length, leaving the
-  ## inner ``seq`` capacity intact for reuse.
+  ## inner ``seq`` capacity intact for reuse.  An empty snapshot means the
+  ## stacks were all empty when it was taken (see ``saveStackLens``), so
+  ## anything the lookaround body pushed still has to be trimmed away.
   if savedLens.len == 0:
+    if ctx.captureStacksDirty:
+      for i in 0 ..< ctx.captureStacks.len:
+        ctx.captureStacks[i].setLen(0)
+      ctx.captureStacksDirty = false
     return
   for i in 0 ..< savedLens.len:
     if i < ctx.captureStacks.len:
