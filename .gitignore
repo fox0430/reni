@@ -11,3 +11,6 @@ tests/test_*
 tools/port_*
 !tools/*.nim
 !tools/*.py
+
+bench/bench_*
+!bench/*.nim
