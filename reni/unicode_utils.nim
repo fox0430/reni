@@ -2,8 +2,10 @@
 
 import std/[unicode, strutils]
 
-import
-  pkg/unicodedb/[properties, casing, scripts, scripts_data, blocks_data, segmentation]
+import pkg/unicodedb/[scripts, scripts_data, blocks_data, segmentation]
+# Both are wrapped below with a guard against non-code-points.
+import pkg/unicodedb/properties except unicodeCategory
+import pkg/unicodedb/casing except simpleCaseFold
 
 import types
 
@@ -376,6 +378,36 @@ const
     (0xFB05'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬅ → st
     (0xFB06'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬆ → st
   ]
+
+const MaxCodePoint = 0x0010FFFF'i32
+
+proc isCodePoint*(r: Rune): bool {.inline.} =
+  ## Whether ``r`` is a code point at all.  The subject is never validated and
+  ## ``fastRuneAt`` decodes a malformed five- or six-byte sequence into a value
+  ## far above U+10FFFF, which every ``unicodedb`` lookup rejects with
+  ## ``doAssert`` — no build flag removes those.  Such a value is treated as
+  ## unassigned: no category, no script, no block, and it folds to itself.
+  int32(r) >= 0'i32 and int32(r) <= MaxCodePoint
+
+proc unicodeCategory(r: Rune): UnicodeCategory {.inline.} =
+  if r.isCodePoint:
+    properties.unicodeCategory(r)
+  else:
+    ctgCn
+
+proc simpleCaseFold(r: Rune): Rune {.inline.} =
+  if r.isCodePoint:
+    casing.simpleCaseFold(r)
+  else:
+    r
+
+iterator caseFoldVariants*(r: Rune): Rune =
+  ## Every code point sharing ``r``'s simple case fold, ``r`` included.
+  if r.isCodePoint:
+    for variant in resolveCaseFold(r):
+      yield variant
+  else:
+    yield r
 
 proc inRangeTable*(cp: int32, table: openArray[(int32, int32)]): bool =
   ## Binary search a sorted table of (start, end) ranges.
@@ -830,6 +862,8 @@ proc matchUnicodeProp*(r: Rune, propName: string, flags: RegexFlags = {}): bool 
           return int32(r) in blockRanges[i]
       return false
     # Try as script name
+    if not r.isCodePoint:
+      return false
     let script = unicodeScript(r)
     return matchScript(script, name)
 

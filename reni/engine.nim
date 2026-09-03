@@ -5,8 +5,6 @@
 
 import std/[unicode, tables]
 
-import pkg/unicodedb/casing
-
 import types, unicode_utils
 
 type
@@ -822,7 +820,7 @@ proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
           false
       else:
         # Check if any case variant of r falls in the original range
-        for variant in resolveCaseFold(r):
+        for variant in caseFoldVariants(r):
           if int32(variant) >= lo and int32(variant) <= hi:
             return true
         false
@@ -904,11 +902,11 @@ proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
     case atom.kind
     of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp:
       # Check case-fold variants
-      for variant in resolveCaseFold(r):
+      for variant in caseFoldVariants(r):
         if variant != r and matchCcAtom(variant, atom, flags):
           return true
     of ccNestedClass:
-      for variant in resolveCaseFold(r):
+      for variant in caseFoldVariants(r):
         if variant != r and matchCcAtom(variant, atom, flags):
           return true
     else:
