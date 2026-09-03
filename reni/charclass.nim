@@ -1,6 +1,6 @@
 import std/unicode
 
-import types
+import types, unicode_utils
 
 type CcParser* = object
   src: string
@@ -342,9 +342,13 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.expect('}')
       # \p{^Prop} = negated property
       if name.len > 1 and name[0] == '^':
-        CcAtom(kind: ccNegUnicodeProp, propName: name[1 ..^ 1])
+        CcAtom(
+          kind: ccNegUnicodeProp,
+          propName: name[1 ..^ 1],
+          prop: resolveUnicodeProp(name[1 ..^ 1]),
+        )
       else:
-        CcAtom(kind: ccUnicodeProp, propName: name)
+        CcAtom(kind: ccUnicodeProp, propName: name, prop: resolveUnicodeProp(name))
     else:
       if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
         p.error("invalid Unicode property name")
@@ -353,7 +357,7 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.advance()
       if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
         p.error("invalid Unicode property '" & name & "'")
-      CcAtom(kind: ccUnicodeProp, propName: name)
+      CcAtom(kind: ccUnicodeProp, propName: name, prop: resolveUnicodeProp(name))
   of 'P':
     p.advance()
     if p.peek == '{':
@@ -367,9 +371,13 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.expect('}')
       # \P{^Prop} = double negation = positive
       if name.len > 1 and name[0] == '^':
-        CcAtom(kind: ccUnicodeProp, propName: name[1 ..^ 1])
+        CcAtom(
+          kind: ccUnicodeProp,
+          propName: name[1 ..^ 1],
+          prop: resolveUnicodeProp(name[1 ..^ 1]),
+        )
       else:
-        CcAtom(kind: ccNegUnicodeProp, propName: name)
+        CcAtom(kind: ccNegUnicodeProp, propName: name, prop: resolveUnicodeProp(name))
     else:
       if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
         p.error("invalid Unicode property name")
@@ -378,7 +386,7 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.advance()
       if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
         p.error("invalid Unicode property '" & name & "'")
-      CcAtom(kind: ccNegUnicodeProp, propName: name)
+      CcAtom(kind: ccNegUnicodeProp, propName: name, prop: resolveUnicodeProp(name))
   else:
     # Literal escape: \], \-, \\, \[, etc.
     let r = p.advanceRune()

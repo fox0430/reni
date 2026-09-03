@@ -1,7 +1,7 @@
 import std/unicode
 from std/strutils import toUpperAscii, find, parseInt
 
-import types, charclass
+import types, charclass, unicode_utils
 
 type Parser* = object
   src: string
@@ -550,13 +550,20 @@ proc parseEscape(p: var Parser): Node =
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccNegUnicodeProp, propName: name[1 ..^ 1])],
+        atoms: @[
+          CcAtom(
+            kind: ccNegUnicodeProp,
+            propName: name[1 ..^ 1],
+            prop: resolveUnicodeProp(name[1 ..^ 1]),
+          )
+        ],
       )
     else:
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccUnicodeProp, propName: name)],
+        atoms:
+          @[CcAtom(kind: ccUnicodeProp, propName: name, prop: resolveUnicodeProp(name))],
       )
   of 'P':
     p.advance()
@@ -582,13 +589,21 @@ proc parseEscape(p: var Parser): Node =
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccUnicodeProp, propName: name[1 ..^ 1])],
+        atoms: @[
+          CcAtom(
+            kind: ccUnicodeProp,
+            propName: name[1 ..^ 1],
+            prop: resolveUnicodeProp(name[1 ..^ 1]),
+          )
+        ],
       )
     else:
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccNegUnicodeProp, propName: name)],
+        atoms: @[
+          CcAtom(kind: ccNegUnicodeProp, propName: name, prop: resolveUnicodeProp(name))
+        ],
       )
   of 'k':
     p.advance()

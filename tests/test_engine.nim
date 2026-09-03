@@ -2386,3 +2386,164 @@ suite "malformed UTF-8 above U+10FFFF":
 
   test "grapheme matching does not abort":
     check search(OverMax, re("\\X")).matchSpan == 0 .. 6
+
+suite "simple quantifier fast paths restore matcher state":
+  # The single-code-point fast paths (matchQuantGreedySimple and friends) must
+  # roll back pos, captures and keepStart between attempts.  A failed
+  # continuation can leave all three dirty — matchQuantPossessive in
+  # particular used to return with pos still advanced.
+
+  test "greedy char-type body before a possessive group":
+    let m = search("aab", re(".*\\X?+b"))
+    check m.found
+    check m.matchSpan == 0 .. 3
+
+  test "greedy char-class body before a possessive capture":
+    let m = search("zayxa", re(".*(a)*+z"))
+    check m.found
+    check m.matchSpan == 0 .. 1
+
+  test "greedy fast path does not leak captures from a failed attempt":
+    let m = search("xayz", re(".*?(a)*+z"))
+    check m.found
+    check m.boundaries[1].a == -1
+    check m.boundaries[1].b == -1
+
+  test "lazy fast path does not leak captures from a failed attempt":
+    let m = search("xayz", re("\\w*?(a)*+z"))
+    check m.found
+    check m.boundaries[1].a == -1
+    check m.boundaries[1].b == -1
+
+  test "possessive fast path restores keepStart after a failed \\K":
+    # A \K inside a repetition that ultimately fails must not shift the
+    # reported match start — least of all past the match end.
+    let m = search("0B", re("(?:\\w{1,3}\\K\\d)?+"))
+    check m.found
+    check m.boundaries[0].a == 0
+    check m.boundaries[0].b == 0
+    check m.boundaries[0].a <= m.boundaries[0].b
+
+  test "possessive fast path restores keepStart with a trailing literal":
+    let m = search("abx", re("(?:\\w{1,3}\\Kz)?+x"))
+    check m.found
+    check m.matchSpan == 2 .. 3
+
+suite "extractFirstChar does not look past a consuming ^ subtree":
+  # A subtree such as (^a*) reports fcLineStart yet can consume input, so the
+  # following child's byte is not the pattern's first byte.  Using it as a
+  # scan hint skipped every valid start position.
+
+  test "capture containing ^ and a quantifier still matches":
+    let m = search("aab", re("(^a*)b"))
+    check m.found
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1].a == 0
+    check m.boundaries[1].b == 2
+
+  test "hint is fcLineStart, not the byte after the subtree":
+    let r = re("(^a*)b")
+    check r.firstCharInfo.kind == fcLineStart
+
+  test "per-alternative hints are sound too":
+    let m = search("aab", re("z|(^a*)b"))
+    check m.found
+    check m.matchSpan == 0 .. 3
+
+  test "a bare ^ is still looked past for a byte hint":
+    let r = re("^(a)b")
+    check r.firstCharInfo.kind == fcByte
+    check r.firstCharInfo.byte == uint8('a')
+
+suite "first-byte hints never skip malformed UTF-8":
+  # The subject is never validated, and fastRuneAt decodes a byte that begins
+  # no well-formed sequence as a lone code point (0x80..0xBF and 0xFE..0xFF as
+  # themselves, 0xF8..0xFD as U+FFFD).  Such a byte is non-ASCII, so any hint
+  # that admits non-ASCII must admit it too, or the scan skips a start
+  # position the matcher would have accepted.
+
+  test "character types match a lone 0xFF":
+    check search("\xFF", re("\\w")).matchSpan == 0 .. 1
+    check search("\xFF", re("\\D")).matchSpan == 0 .. 1
+    check search("\xFF", re("\\S")).matchSpan == 0 .. 1
+    check search("\xFF", re("\\H")).matchSpan == 0 .. 1
+    check search("\xFF", re("\\N")).matchSpan == 0 .. 1
+
+  test "character types match a lone continuation byte":
+    check search("\x80", re("\\W")).matchSpan == 0 .. 1
+    check search("\x80", re("\\D")).matchSpan == 0 .. 1
+    check search("\x80", re("\\S")).matchSpan == 0 .. 1
+    check search("\x80", re("\\N")).matchSpan == 0 .. 1
+
+  test "character types match a byte that decodes to U+FFFD":
+    check search("\xF8", re("\\W")).matchSpan == 0 .. 1
+    check search("\xF8", re("\\H")).matchSpan == 0 .. 1
+    check search("\xF8", re("\\N")).matchSpan == 0 .. 1
+
+  test "\\R matches a lone 0x85 (NEL)":
+    check search("\x85", re("\\R")).matchSpan == 0 .. 1
+
+  test "negated class matches a malformed byte":
+    check search("\xFF", re("[^a]")).matchSpan == 0 .. 1
+    check search("\x80", re("[^a]")).matchSpan == 0 .. 1
+    check search("\xF8", re("[^a]")).matchSpan == 0 .. 1
+
+  test "range reaching past U+007F matches a malformed byte":
+    # 0xFF decodes to U+00FF, which the range covers.
+    check search("\xFF", re("[a-\xC3\xBF]")).matchSpan == 0 .. 1
+
+  test "the hint still skips ASCII bytes that cannot match":
+    check search("!\xFF", re("\\w")).matchSpan == 1 .. 2
+    check search("ab\x80", re("\\W")).matchSpan == 2 .. 3
+
+  test "searchBackward finds a malformed byte too":
+    check searchBackward("a\xFF", re("\\w")).matchSpan == 1 .. 2
+
+  test "byte-set hints cover every non-ASCII byte":
+    for pattern in ["\\w", "\\W", "\\D", "\\S", "\\H", "\\N", "\\R", "[^a]"]:
+      let r = re(pattern)
+      check r.firstCharInfo.kind == fcByteSet
+      for b in 0x80'u8 .. 0xFF'u8:
+        check b in r.firstCharInfo.bytes
+
+suite "greedy give-back over malformed UTF-8":
+  # A stray 0x80..0xBF byte decodes as a code point of its own, so walking
+  # back over it as if it were a continuation byte gave back two characters
+  # at once.  That desynchronised the repetition count from the position it
+  # counts, which reported the wrong match and then walked pos past the start
+  # of the run into an out-of-range index.
+
+  test "give-back lands on the malformed byte, not before it":
+    let m = search("\x0A\x85", re("[^a]*(.)"))
+    check m.found
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1].a == 1
+    check m.boundaries[1].b == 2
+
+  test "give-back past a possessive quantifier does not crash":
+    let m = search("\x0A\x85", re("[^a]*\\h*+(.)"))
+    check m.found
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1].a == 1
+    check m.boundaries[1].b == 2
+
+  test "two malformed bytes in a row are given back one at a time":
+    let m = search("\x80\x80", re("\\W*(\\S)"))
+    check m.found
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1].a == 1
+    check m.boundaries[1].b == 2
+
+  test "a run mixing malformed and well-formed code points":
+    let m = search("\x85\xE3\x81\x82x", re("[^a]*(x)"))
+    check m.found
+    check m.matchSpan == 0 .. 5
+    check m.boundaries[1].a == 4
+    check m.boundaries[1].b == 5
+
+  test "well-formed multibyte give-back is unchanged":
+    let m = search("\xE3\x81\x82\xE3\x81\x84", re("[^a]*(.)"))
+    check m.found
+    check m.matchSpan == 0 .. 6
+    check m.boundaries[1].a == 3
+    check m.boundaries[1].b == 6

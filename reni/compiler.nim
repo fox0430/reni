@@ -556,6 +556,38 @@ proc mergeLiterals(node: Node): Node =
   else:
     node
 
+proc annotateCharClasses(node: Node) =
+  ## Precompute the ASCII membership bitmap of every character class so the
+  ## matcher can answer ASCII input without walking the atom list.
+  if node == nil:
+    return
+  if node.kind == nkCharClass:
+    var ascii: set[uint8]
+    var nonAscii, predicate: bool
+    if classAsciiMatches(node, ascii, nonAscii, predicate):
+      node.asciiSet =
+        if node.negated:
+          AllAsciiBytes - ascii
+        else:
+          ascii
+      node.asciiSetOk = true
+  for child in node.childNodes:
+    annotateCharClasses(child)
+
+proc annotateAlternations(node: Node, flags: RegexFlags) =
+  ## Record each alternative's first-byte hint so the matcher can skip the
+  ## branches that cannot start at the current position.  ``flags`` carries
+  ## ``rfIgnoreCase`` unconditionally: case folding only widens the hint, so
+  ## the result stays valid even if ``(?i)`` is switched on at match time.
+  if node == nil:
+    return
+  if node.kind == nkAlternation:
+    node.altFirst = newSeq[FirstCharInfo](node.alternatives.len)
+    for i, alt in node.alternatives:
+      node.altFirst[i] = extractFirstChar(alt, flags)
+  for child in node.childNodes:
+    annotateAlternations(child, flags)
+
 proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateUtf8(pattern)
   var p = initParser(pattern, flags)
@@ -602,6 +634,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
   let finalFlags = flags + (p.currentFlags * {rfFindLongest})
+  annotateAlternations(ast, finalFlags + {rfIgnoreCase})
+  annotateCharClasses(ast)
   initRegex(
     pattern = pattern,
     ast = ast,
@@ -612,4 +646,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     groupFlags = groupFlags,
     firstCharInfo = extractFirstChar(ast, finalFlags),
     requiredByte = extractRequiredByte(ast, finalFlags),
+    levelBackrefs = usesLevelBackrefs(ast),
   )

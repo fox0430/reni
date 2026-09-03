@@ -424,37 +424,39 @@ proc inRangeTable*(cp: int32, table: openArray[(int32, int32)]): bool =
       return true
   return false
 
-proc isWordChar*(r: Rune, asciiOnly: bool): bool =
+proc isWordChar*(r: Rune, asciiOnly: bool): bool {.inline.} =
   ## \w: Letter, Mark, Number, Connector_Punctuation, or underscore
+  let c = int32(r)
+  if c < 128:
+    return asciiHas(c, acWord)
   if asciiOnly:
-    let c = int32(r)
-    return
-      (c >= ord('a') and c <= ord('z')) or (c >= ord('A') and c <= ord('Z')) or
-      (c >= ord('0') and c <= ord('9')) or c == ord('_')
+    return false
   let cat = unicodeCategory(r)
   cat in ctgL or cat in ctgM or cat in ctgN or cat == ctgPc
 
-proc isDigitChar*(r: Rune, asciiOnly: bool): bool =
+proc isDigitChar*(r: Rune, asciiOnly: bool): bool {.inline.} =
   ## \d: Decimal digit
+  let c = int32(r)
+  if c < 128:
+    return asciiHas(c, acDigit)
   if asciiOnly:
-    let c = int32(r)
-    return c >= ord('0') and c <= ord('9')
+    return false
   unicodeCategory(r) == ctgNd
 
-proc isSpaceChar*(r: Rune, asciiOnly: bool): bool =
+proc isSpaceChar*(r: Rune, asciiOnly: bool): bool {.inline.} =
   ## \s: Whitespace
+  let c = int32(r)
+  if c < 128:
+    return asciiHas(c, acSpace)
   if asciiOnly:
-    let c = int32(r)
-    return c == 0x20 or c == 0x09 or c == 0x0A or c == 0x0D or c == 0x0C or c == 0x0B
+    return false
   let cat = unicodeCategory(r)
-  cat in ctgZ or int32(r) == 0x09 or int32(r) == 0x0A or int32(r) == 0x0B or
-    int32(r) == 0x0C or int32(r) == 0x0D or int32(r) == 0x85
+  cat in ctgZ or c == 0x85
 
-proc isHexDigitChar*(r: Rune): bool =
+proc isHexDigitChar*(r: Rune): bool {.inline.} =
   ## \h: Hex digit (always ASCII)
   let c = int32(r)
-  (c >= ord('0') and c <= ord('9')) or (c >= ord('a') and c <= ord('f')) or
-    (c >= ord('A') and c <= ord('F'))
+  c < 128 and asciiHas(c, acXdigit)
 
 proc simpleFold*(r: Rune): Rune =
   ## Simple case fold for case-insensitive matching
@@ -558,6 +560,38 @@ proc posixAsciiOnly*(cls: PosixClassName, flags: RegexFlags): bool =
 
 proc matchPosixClass*(r: Rune, cls: PosixClassName, asciiOnly: bool): bool =
   let c = int32(r)
+  if c < 128:
+    # ASCII: the table already agrees with both readings of every class.
+    return
+      case cls
+      of pcAlnum:
+        asciiHas(c, acAlnum)
+      of pcAlpha:
+        asciiHas(c, acAlpha)
+      of pcAscii:
+        true
+      of pcBlank:
+        asciiHas(c, acBlank)
+      of pcCntrl:
+        asciiHas(c, acCntrl)
+      of pcDigit:
+        asciiHas(c, acDigit)
+      of pcGraph:
+        asciiHas(c, acGraph)
+      of pcLower:
+        asciiHas(c, acLower)
+      of pcPrint:
+        asciiHas(c, acPrint)
+      of pcPunct:
+        asciiHas(c, acPunct)
+      of pcSpace:
+        asciiHas(c, acSpace)
+      of pcUpper:
+        asciiHas(c, acUpper)
+      of pcXdigit:
+        asciiHas(c, acXdigit)
+      of pcWord:
+        asciiHas(c, acWord)
   case cls
   of pcAlnum:
     if asciiOnly:
@@ -622,250 +656,319 @@ proc matchPosixClass*(r: Rune, cls: PosixClassName, asciiOnly: bool): bool =
   of pcWord:
     isWordChar(r, asciiOnly)
 
-proc matchScript(script: UnicodeScript, name: string): bool =
+proc resolveScriptId(name: string): int32 =
+  ## Map a lower-cased script name to its ``UnicodeScript`` value, or -1
+  ## when the name is not a script reni knows about.
   case name
   of "common":
-    return script == sptCommon
+    int32(sptCommon)
   of "latin":
-    return script == sptLatin
+    int32(sptLatin)
   of "greek":
-    return script == sptGreek
+    int32(sptGreek)
   of "cyrillic":
-    return script == sptCyrillic
+    int32(sptCyrillic)
   of "armenian":
-    return script == sptArmenian
+    int32(sptArmenian)
   of "hebrew":
-    return script == sptHebrew
+    int32(sptHebrew)
   of "arabic":
-    return script == sptArabic
+    int32(sptArabic)
   of "han":
-    return script == sptHan
+    int32(sptHan)
   of "hiragana":
-    return script == sptHiragana
+    int32(sptHiragana)
   of "katakana":
-    return script == sptKatakana
+    int32(sptKatakana)
   of "hangul":
-    return script == sptHangul
+    int32(sptHangul)
   of "thai":
-    return script == sptThai
+    int32(sptThai)
   of "devanagari":
-    return script == sptDevanagari
+    int32(sptDevanagari)
   of "bengali":
-    return script == sptBengali
+    int32(sptBengali)
   of "tamil":
-    return script == sptTamil
+    int32(sptTamil)
   of "georgian":
-    return script == sptGeorgian
+    int32(sptGeorgian)
   of "ethiopic":
-    return script == sptEthiopic
+    int32(sptEthiopic)
   of "tibetan":
-    return script == sptTibetan
+    int32(sptTibetan)
   of "myanmar":
-    return script == sptMyanmar
+    int32(sptMyanmar)
   of "bopomofo":
-    return script == sptBopomofo
+    int32(sptBopomofo)
   of "inherited":
-    return script == sptInherited
+    int32(sptInherited)
   of "coptic":
-    return script == sptCoptic
+    int32(sptCoptic)
   of "syriac":
-    return script == sptSyriac
+    int32(sptSyriac)
   of "khmer":
-    return script == sptKhmer
+    int32(sptKhmer)
   of "mongolian":
-    return script == sptMongolian
+    int32(sptMongolian)
   else:
-    return false
+    -1'i32
 
-proc matchUnicodeProp*(r: Rune, propName: string, flags: RegexFlags = {}): bool =
-  ## Match \p{PropertyName}. Supports General Category and Script names.
-  let name = propName.toLowerAscii()
-  # Check ASCII-restriction flags for word/digit/space properties
-  # Both individual flags (W/D/S) and the general P flag restrict to ASCII
-  if name in ["word"]:
-    if rfAsciiWord in flags or rfAsciiPosix in flags:
-      return isWordChar(r, true)
-  elif name in ["digit"]:
-    if rfAsciiDigit in flags or rfAsciiPosix in flags:
-      return isDigitChar(r, true)
-  elif name in ["space", "white_space"]:
-    if rfAsciiSpace in flags or rfAsciiPosix in flags:
-      return isSpaceChar(r, true)
-  elif name in [
-    "alpha", "alnum", "upper", "lower", "print", "graph", "blank", "cntrl", "xdigit",
-    "punct", "ascii",
-  ]:
-    if rfAsciiPosix in flags:
-      return matchPosixClass(
-        r,
-        (
-          case name
-          of "alpha": pcAlpha
-          of "alnum": pcAlnum
-          of "upper": pcUpper
-          of "lower": pcLower
-          of "print": pcPrint
-          of "graph": pcGraph
-          of "blank": pcBlank
-          of "cntrl": pcCntrl
-          of "xdigit": pcXdigit
-          of "punct": pcPunct
-          of "ascii": pcAscii
-          else: pcAlpha
-        ),
-        true,
-      )
-  # Single-letter general categories
+proc catProp(bits: UnicodeCategorySet): UniProp =
+  UniProp(kind: upCategory, catBits: int32(bits))
+
+proc catProp(cat: UnicodeCategory): UniProp =
+  UniProp(kind: upCategory, catBits: int32(cat))
+
+proc posixProp(cls: PosixClassName): UniProp =
+  UniProp(kind: upPosix, posixCls: cls)
+
+proc resolveBlock(name: string): UniProp =
+  ## Resolve an ``In<Block>`` name to an index into ``blockRanges``.
+  let query = name[2 ..^ 1].replace(" ", "").replace("-", "").replace("_", "")
+  for i, bn in blockNames.pairs:
+    let normalBn = bn.toLowerAscii().replace(" ", "").replace("-", "").replace("_", "")
+    if normalBn == query:
+      return UniProp(kind: upBlock, blockIdx: int32(i))
+  UniProp(kind: upNever)
+
+proc resolvePropBody(name: string): UniProp =
+  ## Resolve the flag-independent half of a ``\p{...}`` name.
   case name
+  # Single-letter general categories
   of "l", "letter":
-    return unicodeCategory(r) in ctgL
+    catProp(ctgL)
   of "m", "mark":
-    return unicodeCategory(r) in ctgM
+    catProp(ctgM)
   of "n", "number":
-    return unicodeCategory(r) in ctgN
+    catProp(ctgN)
   of "p", "punct", "punctuation":
-    return unicodeCategory(r) in ctgP
+    catProp(ctgP)
   of "s", "symbol":
-    return unicodeCategory(r) in ctgS
+    catProp(ctgS)
   of "z", "separator":
-    return unicodeCategory(r) in ctgZ
+    catProp(ctgZ)
   of "c", "other":
-    return unicodeCategory(r) in ctgC
+    catProp(ctgC)
   # Two-letter subcategories
   of "lu", "uppercase_letter":
-    return unicodeCategory(r) == ctgLu
+    catProp(ctgLu)
   of "ll", "lowercase_letter":
-    return unicodeCategory(r) == ctgLl
+    catProp(ctgLl)
   of "lt", "titlecase_letter":
-    return unicodeCategory(r) == ctgLt
+    catProp(ctgLt)
   of "lm", "modifier_letter":
-    return unicodeCategory(r) == ctgLm
+    catProp(ctgLm)
   of "lo", "other_letter":
-    return unicodeCategory(r) == ctgLo
+    catProp(ctgLo)
   of "mn", "nonspacing_mark":
-    return unicodeCategory(r) == ctgMn
+    catProp(ctgMn)
   of "mc", "spacing_mark":
-    return unicodeCategory(r) == ctgMc
+    catProp(ctgMc)
   of "me", "enclosing_mark":
-    return unicodeCategory(r) == ctgMe
+    catProp(ctgMe)
   of "nd", "decimal_number":
-    return unicodeCategory(r) == ctgNd
+    catProp(ctgNd)
   of "nl", "letter_number":
-    return unicodeCategory(r) == ctgNl
+    catProp(ctgNl)
   of "no", "other_number":
-    return unicodeCategory(r) == ctgNo
+    catProp(ctgNo)
   of "pc", "connector_punctuation":
-    return unicodeCategory(r) == ctgPc
+    catProp(ctgPc)
   of "pd", "dash_punctuation":
-    return unicodeCategory(r) == ctgPd
+    catProp(ctgPd)
   of "ps", "open_punctuation":
-    return unicodeCategory(r) == ctgPs
+    catProp(ctgPs)
   of "pe", "close_punctuation":
-    return unicodeCategory(r) == ctgPe
+    catProp(ctgPe)
   of "pi", "initial_punctuation":
-    return unicodeCategory(r) == ctgPi
+    catProp(ctgPi)
   of "pf", "final_punctuation":
-    return unicodeCategory(r) == ctgPf
+    catProp(ctgPf)
   of "po", "other_punctuation":
-    return unicodeCategory(r) == ctgPo
+    catProp(ctgPo)
   of "sm", "math_symbol":
-    return unicodeCategory(r) == ctgSm
+    catProp(ctgSm)
   of "sc", "currency_symbol":
-    return unicodeCategory(r) == ctgSc
+    catProp(ctgSc)
   of "sk", "modifier_symbol":
-    return unicodeCategory(r) == ctgSk
+    catProp(ctgSk)
   of "so", "other_symbol":
-    return unicodeCategory(r) == ctgSo
+    catProp(ctgSo)
   of "zs", "space_separator":
-    return unicodeCategory(r) == ctgZs
+    catProp(ctgZs)
   of "zl", "line_separator":
-    return unicodeCategory(r) == ctgZl
+    catProp(ctgZl)
   of "zp", "paragraph_separator":
-    return unicodeCategory(r) == ctgZp
+    catProp(ctgZp)
   of "cc", "control":
-    return unicodeCategory(r) == ctgCc
+    catProp(ctgCc)
   of "cf", "format":
-    return unicodeCategory(r) == ctgCf
+    catProp(ctgCf)
   of "cs", "surrogate":
-    return unicodeCategory(r) == ctgCs
+    catProp(ctgCs)
   of "co", "private_use":
-    return unicodeCategory(r) == ctgCo
+    catProp(ctgCo)
   of "cn", "unassigned":
-    return unicodeCategory(r) == ctgCn
+    catProp(ctgCn)
   # Common property aliases
   of "any":
-    return true
+    UniProp(kind: upAlways)
   of "ascii":
-    return int32(r) >= 0 and int32(r) <= 127
+    UniProp(kind: upAscii)
   of "print":
-    return matchPosixClass(r, pcPrint, false)
+    posixProp(pcPrint)
   of "graph":
-    return matchPosixClass(r, pcGraph, false)
+    posixProp(pcGraph)
   of "alpha":
-    return unicodeCategory(r) in ctgL
+    catProp(ctgL)
   of "alnum":
-    let cat = unicodeCategory(r)
-    return cat in ctgL or cat in ctgN
+    catProp(ctgL + ctgN)
   of "digit":
-    return unicodeCategory(r) == ctgNd
+    catProp(ctgNd)
   of "space", "white_space":
-    return isSpaceChar(r, false)
+    posixProp(pcSpace)
   of "word":
-    return isWordChar(r, false)
+    posixProp(pcWord)
   of "blank":
-    return int32(r) == 0x20 or int32(r) == 0x09
+    UniProp(kind: upBlank)
   of "cntrl":
-    return unicodeCategory(r) == ctgCc
+    catProp(ctgCc)
   of "xdigit":
-    return isHexDigitChar(r)
+    posixProp(pcXdigit)
   of "posixpunct":
-    return matchPosixClass(r, pcPunct, false)
+    posixProp(pcPunct)
   of "posixalnum":
-    return matchPosixClass(r, pcAlnum, false)
+    posixProp(pcAlnum)
   of "posixalpha":
-    return matchPosixClass(r, pcAlpha, false)
+    posixProp(pcAlpha)
   of "posixblank":
-    return matchPosixClass(r, pcBlank, false)
+    posixProp(pcBlank)
   of "posixcntrl":
-    return matchPosixClass(r, pcCntrl, false)
+    posixProp(pcCntrl)
   of "posixdigit":
-    return matchPosixClass(r, pcDigit, false)
+    posixProp(pcDigit)
   of "posixgraph":
-    return matchPosixClass(r, pcGraph, false)
+    posixProp(pcGraph)
   of "posixlower":
-    return matchPosixClass(r, pcLower, false)
+    posixProp(pcLower)
   of "posixprint":
-    return matchPosixClass(r, pcPrint, false)
+    posixProp(pcPrint)
   of "posixspace":
-    return matchPosixClass(r, pcSpace, false)
+    posixProp(pcSpace)
   of "posixupper":
-    return matchPosixClass(r, pcUpper, false)
+    posixProp(pcUpper)
   of "posixxdigit":
-    return matchPosixClass(r, pcXdigit, false)
+    posixProp(pcXdigit)
   of "posixword":
-    return matchPosixClass(r, pcWord, false)
+    posixProp(pcWord)
   # Emoji binary properties (Unicode 15.1)
   of "emoji":
-    return inRangeTable(int32(r), EmojiRanges)
+    UniProp(kind: upEmoji)
   of "extended_pictographic", "extpict":
-    return inRangeTable(int32(r), ExtPictRanges)
+    UniProp(kind: upExtPict)
   else:
-    # Try "In" prefix for Unicode block names
     if name.len > 2 and name.startsWith("in"):
-      let blockName = name[2 ..^ 1]
-      for i, bn in blockNames.pairs:
-        # Normalize: remove spaces, underscores, hyphens and compare
-        let normalBn =
-          bn.toLowerAscii().replace(" ", "").replace("-", "").replace("_", "")
-        let normalQuery = blockName.replace(" ", "").replace("-", "").replace("_", "")
-        if normalBn == normalQuery:
-          return int32(r) in blockRanges[i]
-      return false
-    # Try as script name
-    if not r.isCodePoint:
-      return false
-    let script = unicodeScript(r)
-    return matchScript(script, name)
+      # Unicode block names take the "In" prefix and never fall through to
+      # the script table.
+      resolveBlock(name)
+    else:
+      let sid = resolveScriptId(name)
+      if sid >= 0:
+        UniProp(kind: upScript, scriptId: sid)
+      else:
+        UniProp(kind: upNever)
+
+proc resolveUnicodeProp*(propName: string): UniProp =
+  ## Resolve a ``\p{...}`` name once, at pattern compile time, so that
+  ## matching never has to lower-case or compare strings.
+  let name = propName.toLowerAscii()
+  result = resolvePropBody(name)
+  # The ASCII-restriction flags (?W)/(?D)/(?S) and the blanket (?P) replace
+  # some properties with their ASCII-only POSIX equivalent.
+  case name
+  of "word":
+    result.restrict = uarWord
+    result.restrictCls = pcWord
+  of "digit":
+    result.restrict = uarDigit
+    result.restrictCls = pcDigit
+  of "space", "white_space":
+    result.restrict = uarSpace
+    result.restrictCls = pcSpace
+  of "alpha":
+    result.restrict = uarPosix
+    result.restrictCls = pcAlpha
+  of "alnum":
+    result.restrict = uarPosix
+    result.restrictCls = pcAlnum
+  of "upper":
+    result.restrict = uarPosix
+    result.restrictCls = pcUpper
+  of "lower":
+    result.restrict = uarPosix
+    result.restrictCls = pcLower
+  of "print":
+    result.restrict = uarPosix
+    result.restrictCls = pcPrint
+  of "graph":
+    result.restrict = uarPosix
+    result.restrictCls = pcGraph
+  of "blank":
+    result.restrict = uarPosix
+    result.restrictCls = pcBlank
+  of "cntrl":
+    result.restrict = uarPosix
+    result.restrictCls = pcCntrl
+  of "xdigit":
+    result.restrict = uarPosix
+    result.restrictCls = pcXdigit
+  of "punct":
+    result.restrict = uarPosix
+    result.restrictCls = pcPunct
+  of "ascii":
+    result.restrict = uarPosix
+    result.restrictCls = pcAscii
+  else:
+    discard
+
+proc asciiRestricted(p: UniProp, flags: RegexFlags): bool {.inline.} =
+  case p.restrict
+  of uarNone:
+    false
+  of uarWord:
+    rfAsciiWord in flags or rfAsciiPosix in flags
+  of uarDigit:
+    rfAsciiDigit in flags or rfAsciiPosix in flags
+  of uarSpace:
+    rfAsciiSpace in flags or rfAsciiPosix in flags
+  of uarPosix:
+    rfAsciiPosix in flags
+
+proc matchUnicodeProp*(r: Rune, p: UniProp, flags: RegexFlags = {}): bool =
+  ## Match a resolved ``\p{...}`` property.  See ``resolveUnicodeProp``.
+  if p.restrict != uarNone and asciiRestricted(p, flags):
+    return matchPosixClass(r, p.restrictCls, true)
+  case p.kind
+  of upNever:
+    false
+  of upAlways:
+    true
+  of upCategory:
+    unicodeCategory(r) in UnicodeCategorySet(p.catBits)
+  of upPosix:
+    matchPosixClass(r, p.posixCls, false)
+  of upAscii:
+    int32(r) <= 127
+  of upBlank:
+    int32(r) == 0x20 or int32(r) == 0x09
+  of upEmoji:
+    inRangeTable(int32(r), EmojiRanges)
+  of upExtPict:
+    inRangeTable(int32(r), ExtPictRanges)
+  of upBlock:
+    int32(r) in blockRanges[int(p.blockIdx)]
+  of upScript:
+    r.isCodePoint and int(unicodeScript(r)) == int(p.scriptId)
 
 proc graphemeBreakProp*(r: Rune): GcbProp =
   let cp = int32(r)
