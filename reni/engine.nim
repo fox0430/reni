@@ -73,6 +73,19 @@ type
     of ckFindLongestRec:
       flStartPos: int
 
+  Subject = object
+    ## Non-owning view of the subject string.  ``MatchContext`` holds one
+    ## of these instead of a ``string`` so that starting a search does not
+    ## copy the subject: a findAll-style loop performs one search per
+    ## match, and copying an n-byte subject on each of them would make
+    ## scanning quadratic in the subject size.
+    ##
+    ## The view borrows the caller's buffer and is only valid for the
+    ## duration of a single matcher entry point (``searchImplInto`` and
+    ## friends), which is where it is installed.
+    data: ptr UncheckedArray[char]
+    size: int
+
   MatchContext* {.acyclic.} = ref object
     ## Caller-owned scratch buffer used by the matcher.  Fields are
     ## engine-private; user code should only allocate via
@@ -91,7 +104,7 @@ type
     ## is ``Table[string, int]`` with no refs, and ``captureStacks``
     ## is ``seq[seq[Span]]`` where ``Span`` is a plain object — the
     ## cycle collector can skip tracking.
-    subject: string
+    subject: Subject
     pos: int
     flags: RegexFlags
     captures: seq[Span]
@@ -132,6 +145,27 @@ type
     keepStart: int
     subjectEnd: int
     graphemeMode: GraphemeMode
+
+var emptySubjectByte: char
+  ## Target for the ``data`` pointer of an empty subject, so a ``Subject``
+  ## view never holds a nil pointer.
+
+proc toSubject(s: string): Subject {.inline.} =
+  ## Borrow ``s``'s buffer.  The result must not outlive ``s``.
+  if s.len > 0:
+    Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[0]), size: s.len)
+  else:
+    Subject(data: cast[ptr UncheckedArray[char]](addr emptySubjectByte), size: 0)
+
+template len(s: Subject): int =
+  s.size
+
+template `[]`(s: Subject, i: int): char =
+  s.data[i]
+
+template oa(s: Subject): untyped =
+  ## The view as an ``openArray[char]``, for the Unicode helpers.
+  toOpenArray(s.data, 0, s.size - 1)
 
 const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 
@@ -258,7 +292,7 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject, checkPos, r, true)
+        fastRuneAt(ctx.subject.oa, checkPos, r, true)
     ctx.pos = rangeStart
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
@@ -289,7 +323,7 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       if reverses.len > 0:
         let savedPos = ctx.pos
         var sr: Rune
-        fastRuneAt(ctx.subject, ctx.pos, sr, true)
+        fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
         let srFold = simpleFold(sr)
         for i in 0 ..< reverses.len:
           if srFold == simpleFold(reverses.runes[i]):
@@ -321,7 +355,7 @@ proc matchLiteral(ctx: MatchContext, target: Rune, cont: ContId): bool =
     return false
   let savedPos = ctx.pos
   var r: Rune
-  fastRuneAt(ctx.subject, ctx.pos, r, true)
+  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
   if r == target or caseInsensitiveMatch(r, target, ctx.flags):
     if runCont(ctx, cont):
       return true
@@ -338,7 +372,7 @@ proc matchLiteral(ctx: MatchContext, target: Rune, cont: ContId): bool =
           matched = false
           break
         var sr: Rune
-        fastRuneAt(ctx.subject, ctx.pos, sr, true)
+        fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
         if not caseInsensitiveMatch(sr, fold.runes[i], ctx.flags):
           matched = false
           break
@@ -357,7 +391,7 @@ proc matchString(ctx: MatchContext, runes: seq[Rune], cont: ContId): bool =
     let target = runes[i]
     let posBeforeSubjChar = ctx.pos
     var r: Rune
-    fastRuneAt(ctx.subject, ctx.pos, r, true)
+    fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
     let posAfterSubjChar = ctx.pos
     if r == target or caseInsensitiveMatch(r, target, ctx.flags):
       inc i
@@ -374,7 +408,7 @@ proc matchString(ctx: MatchContext, runes: seq[Rune], cont: ContId): bool =
             matched = false
             break
           var sr: Rune
-          fastRuneAt(ctx.subject, ctx.pos, sr, true)
+          fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
           if not caseInsensitiveMatch(sr, fold.runes[j], ctx.flags):
             matched = false
             break
@@ -407,7 +441,7 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: ContId): bool =
     return false
   let savedPos = ctx.pos
   var r: Rune
-  fastRuneAt(ctx.subject, ctx.pos, r, true)
+  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
   # Grapheme cluster: \X or . in grapheme/word mode
   if ct == ctGraphemeCluster or
       (ct == ctDot and ctx.graphemeMode in {gmGrapheme, gmWord}):
@@ -419,9 +453,9 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: ContId): bool =
     ctx.pos = savedPos
     let clusterEnd =
       if ctx.graphemeMode == gmWord:
-        nextWordSegmentEnd(ctx.subject, savedPos)
+        nextWordSegmentEnd(ctx.subject.oa, savedPos)
       else:
-        nextGraphemeClusterEnd(ctx.subject, savedPos)
+        nextGraphemeClusterEnd(ctx.subject.oa, savedPos)
     if clusterEnd > savedPos:
       ctx.pos = clusterEnd
       if runCont(ctx, cont):
@@ -501,14 +535,14 @@ proc matchAnchor(ctx: MatchContext, kind: AnchorKind, cont: ContId): bool =
       false # handled in matchWithCont dispatch before reaching here
     of akGraphemeBoundary:
       if ctx.graphemeMode == gmWord:
-        isWordBoundaryUax29(ctx.subject, ctx.pos)
+        isWordBoundaryUax29(ctx.subject.oa, ctx.pos)
       else:
-        isGraphemeBoundary(ctx.subject, ctx.pos)
+        isGraphemeBoundary(ctx.subject.oa, ctx.pos)
     of akNotGraphemeBoundary:
       if ctx.graphemeMode == gmWord:
-        not isWordBoundaryUax29(ctx.subject, ctx.pos)
+        not isWordBoundaryUax29(ctx.subject.oa, ctx.pos)
       else:
-        not isGraphemeBoundary(ctx.subject, ctx.pos)
+        not isGraphemeBoundary(ctx.subject.oa, ctx.pos)
   if matched:
     if kind == akKeep:
       ctx.keepStart = ctx.pos
@@ -905,7 +939,7 @@ proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: ContId): bool =
         ok = false
         break
       var subjRune: Rune
-      fastRuneAt(ctx.subject, p, subjRune, true)
+      fastRuneAt(ctx.subject.oa, p, subjRune, true)
       let expRune = Rune(expCP[i])
       if subjRune != expRune and simpleFold(subjRune) != simpleFold(expRune):
         ok = false
@@ -927,7 +961,7 @@ proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
       return true
   let savedPos = ctx.pos
   var r: Rune
-  fastRuneAt(ctx.subject, ctx.pos, r, true)
+  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
 
   var anyMatch = false
   for atom in node.atoms:
@@ -949,7 +983,7 @@ proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
   ctx.pos = savedPos
   false
 
-proc prevRune(s: string, pos: int): Rune =
+proc prevRune(s: openArray[char], pos: int): Rune =
   ## Decode the rune ending just before `pos`.
   if pos <= 0:
     return Rune(0)
@@ -965,14 +999,14 @@ proc matchWordBoundary(ctx: MatchContext): bool =
   let asciiOnly = rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags
   let prevIsWord =
     if ctx.pos > 0:
-      isWordChar(prevRune(ctx.subject, ctx.pos), asciiOnly)
+      isWordChar(prevRune(ctx.subject.oa, ctx.pos), asciiOnly)
     else:
       false
   let nextIsWord =
     if ctx.pos < ctx.subjectEnd:
       var p = ctx.pos
       var r: Rune
-      fastRuneAt(ctx.subject, p, r, true)
+      fastRuneAt(ctx.subject.oa, p, r, true)
       isWordChar(r, asciiOnly)
     else:
       false
@@ -1006,8 +1040,8 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
         return false
       let mpBefore = mp
       var sr, mr: Rune
-      fastRuneAt(ctx.subject, sp, sr, true)
-      fastRuneAt(ctx.subject, mp, mr, true)
+      fastRuneAt(ctx.subject.oa, sp, sr, true)
+      fastRuneAt(ctx.subject.oa, mp, mr, true)
       if sr == mr or caseInsensitiveMatch(sr, mr, ctx.flags):
         continue
       let asciiOnly = rfIgnoreCaseAscii in ctx.flags
@@ -1025,7 +1059,7 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
             ok = false
             break
           var tr: Rune
-          fastRuneAt(ctx.subject, tp, tr, true)
+          fastRuneAt(ctx.subject.oa, tp, tr, true)
           if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
             ok = false
             break
@@ -1048,7 +1082,7 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
             ok = false
             break
           var tr: Rune
-          fastRuneAt(ctx.subject, tp, tr, true)
+          fastRuneAt(ctx.subject.oa, tp, tr, true)
           if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
             ok = false
             break
@@ -1537,7 +1571,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         break
       restore(ctx, saved)
       var r: Rune
-      fastRuneAt(ctx.subject, checkPos, r, true)
+      fastRuneAt(ctx.subject.oa, checkPos, r, true)
     # Match from startPos to firstAbsentPos (longest text before absent)
     ctx.pos = firstAbsentPos
     if runCont(ctx, cont):
@@ -1574,7 +1608,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject, checkPos, r, true)
+        fastRuneAt(ctx.subject.oa, checkPos, r, true)
     # Limit matching range to [startPos, absentPos)
     let savedEnd = ctx.subjectEnd
     ctx.pos = startPos
@@ -1609,7 +1643,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject, checkPos, r, true)
+        fastRuneAt(ctx.subject.oa, checkPos, r, true)
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
     let ok = runCont(ctx, cont)
@@ -1989,7 +2023,7 @@ proc resetForRegex(
     maxRecursionDepth: int,
 ) =
   ## Reset per-regex buffers, reusing ``ctx``'s existing seq capacity.
-  ctx.subject = subject
+  ctx.subject = toSubject(subject)
   ctx.flags = regex.flags
   ctx.regex = regex
   ctx.subjectEnd = subject.len
