@@ -2363,3 +2363,26 @@ suite "captureStacks isolation across lookaround":
       check not searchIntoCtx(ctx, "aa", leaky, m)
       check searchIntoCtx(ctx, "aa", plain, m)
       check m.matchSpan == 1 .. 2
+
+suite "malformed UTF-8 above U+10FFFF":
+  # fastRuneAt turns a malformed five- or six-byte sequence into a value far
+  # above U+10FFFF; every unicodedb lookup used to abort on one.
+  const OverMax = "\xFD\xBF\xBF\xBF\xBF\xBF" # decodes to 0xFFFFFF
+
+  test "property lookups do not abort":
+    check not search(OverMax, re("\\p{L}")).found
+    check not search(OverMax, re("\\p{Latin}")).found
+    check not search(OverMax, re("\\p{InBasicLatin}")).found
+    check not search(OverMax, re("[[:alpha:]]")).found
+    check not search(OverMax, re("\\w")).found
+
+  test "it counts as an unassigned code point":
+    check search(OverMax, re("\\p{Cn}")).matchSpan == 0 .. 6
+    check search(OverMax, re("\\W")).matchSpan == 0 .. 6
+
+  test "case folding does not abort":
+    check search(OverMax & "a", re("(?i)\\w+")).matchSpan == 6 .. 7
+    check search("1\xF8\xE3\x81\x82z", re("(?i)\\N{1,3}[a-z]++\\w+")).found == false
+
+  test "grapheme matching does not abort":
+    check search(OverMax, re("\\X")).matchSpan == 0 .. 6
