@@ -892,7 +892,7 @@ proc graphemeBreakProp*(r: Rune): GcbProp =
     return gcbExtend
   gcbOther
 
-proc isGraphemeBoundary*(subject: string, pos: int): bool =
+proc isGraphemeBoundary*(subject: openArray[char], pos: int): bool =
   ## Determine if there is a grapheme cluster boundary at byte position `pos`
   ## in `subject`. Returns true at string boundaries and at grapheme breaks.
   ## Implements UAX #29 grapheme cluster boundary rules (simplified).
@@ -982,7 +982,7 @@ proc isGraphemeBoundary*(subject: string, pos: int): bool =
   # GB999: Otherwise, break
   true
 
-proc nextGraphemeClusterEnd*(subject: string, pos: int): int =
+proc nextGraphemeClusterEnd*(subject: openArray[char], pos: int): int =
   ## Return the byte position just past the end of the grapheme cluster
   ## starting at `pos`.
   if pos >= subject.len:
@@ -997,7 +997,7 @@ proc nextGraphemeClusterEnd*(subject: string, pos: int): int =
     fastRuneAt(subject, p, r, true)
   p
 
-proc isWordBoundaryUax29*(subject: string, pos: int): bool =
+proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
   ## Determine if there is a word boundary at byte position `pos`
   ## per UAX #29 word break rules. Returns true at string boundaries.
   if pos <= 0 or pos >= subject.len:
@@ -1192,7 +1192,7 @@ proc isWordBoundaryUax29*(subject: string, pos: int): bool =
   # WB999: Otherwise, break
   return true
 
-proc nextWordSegmentEnd*(subject: string, pos: int): int =
+proc nextWordSegmentEnd*(subject: openArray[char], pos: int): int =
   ## Return the byte position just past the end of the word segment
   ## starting at `pos` (per UAX #29 word boundaries).
   if pos >= subject.len:
