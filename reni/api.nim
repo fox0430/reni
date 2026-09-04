@@ -28,10 +28,9 @@ proc searchIntoCtx*(
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ): bool {.discardable.} =
-  ## Allocation-reusing search.  Writes the result into ``m`` and
-  ## reuses the scratch buffers in ``ctx`` across calls — after the
-  ## first call, no further heap allocations are incurred by the
-  ## matcher itself.  ``ctx`` must not be shared across threads.
+  ## Allocation-reusing search.  Writes the result into ``m`` and reuses
+  ## ``ctx``'s scratch buffers, so after the first call the matcher itself
+  ## allocates nothing.  ``ctx`` must not be shared across threads.
   ##
   ## Returns ``m.found`` for ``if searchIntoCtx(...): ...`` usage.
   if start < 0 or start > subject.len:

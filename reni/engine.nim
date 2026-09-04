@@ -62,46 +62,28 @@ type
       nzpStartPos: int
     of ckCapturesChanged:
       ccSnapshotStart: int32
-        ## Start offset into ``ctx.captureSnapshots`` of this frame's
-        ## snapshot.  The length is ``ctx.captureSnapshots.len -
-        ## start`` at push time and the snapshot is popped together
-        ## with the frame.  Stored as a flat int32 here so the variant
-        ## doesn't carry a seq[Span] field, which would inflate every
-        ## Frame and trigger per-pop destructors on the cold path.
+        ## Start offset of this frame's snapshot in ``ctx.captureSnapshots``.
+        ## A flat int32 keeps ``seq[Span]`` out of the variant, which would
+        ## inflate every Frame.
     of ckFindLongestRec:
       flStartPos: int
 
   Subject = object
-    ## Non-owning view of the subject string.  ``MatchContext`` holds one
-    ## of these instead of a ``string`` so that starting a search does not
-    ## copy the subject: a findAll-style loop performs one search per
-    ## match, and copying an n-byte subject on each of them would make
-    ## scanning quadratic in the subject size.
-    ##
-    ## The view borrows the caller's buffer and is only valid for the
-    ## duration of a single matcher entry point (``searchImplInto`` and
-    ## friends), which is where it is installed.
+    ## Non-owning view of the subject string: starting a search must not
+    ## copy it, or a findAll loop turns quadratic.  Borrows the caller's
+    ## buffer and is only valid for one matcher entry point call.
     data: ptr UncheckedArray[char]
     size: int
 
   MatchContext* {.acyclic.} = ref object
-    ## Caller-owned scratch buffer used by the matcher.  Fields are
-    ## engine-private; user code should only allocate via
-    ## ``newMatchContext`` and pass the result to ``searchIntoCtx`` etc.
-    ##
-    ## Reusing a single ``MatchContext`` across many searches avoids
-    ## the per-call allocations of ``captures`` / ``groupRecursionDepth``
-    ## / ``captureStacks`` — the seqs are resized with ``setLen`` and
-    ## their capacity is preserved between calls.
+    ## Caller-owned scratch buffer for the matcher.  Fields are
+    ## engine-private; allocate via ``newMatchContext`` and pass the result
+    ## to ``searchIntoCtx`` etc.  Reusing one context across searches keeps
+    ## the internal seqs' capacity (they are only ``setLen``-resized).
     ##
     ## **Not thread-safe.** One ``MatchContext`` per thread.
     ##
-    ## ``{.acyclic.}``: the engine never links a ``MatchContext`` back
-    ## into its own reachable graph.  ``frames`` holds plain values
-    ## (Node refs are themselves ``{.acyclic.}``), ``calloutCounters``
-    ## is ``Table[string, int]`` with no refs, and ``captureStacks``
-    ## is ``seq[seq[Span]]`` where ``Span`` is a plain object — the
-    ## cycle collector can skip tracking.
+    ## ``{.acyclic.}``: nothing reachable from a context links back to it.
     subject: Subject
     pos: int
     flags: RegexFlags
@@ -121,18 +103,15 @@ type
     calloutCounters: Table[string, int] ## (*COUNT) / (*MAX) tag counters
     callDepth: int ## matchWithCont recursion depth for stack overflow protection
     captureStacksDirty: bool
-      ## true when at least one ``captureStacks[i]`` is non-empty.  The
-      ## common case (no recursion-level backrefs, no subexpression
-      ## calls touching the stack) leaves the whole vector untouched
-      ## so ``resetForPosition`` can skip the per-group ``setLen(0)``
-      ## loop entirely.
+      ## true when at least one ``captureStacks[i]`` is non-empty, letting
+      ## ``resetForPosition`` skip the per-group ``setLen(0)`` loop in the
+      ## common case.
     frames: seq[Frame]
       ## Continuation frame stack.  Reused across calls; only
       ## ``setLen`` is used so the underlying capacity persists.
     captureSnapshots: seq[Span]
-      ## Side stack used by ``ckCapturesChanged`` to store full
-      ## ``ctx.captures`` snapshots without inflating the ``Frame``
-      ## variant.  Push/pop is LIFO with ``frames``.
+      ## Side stack of ``ctx.captures`` snapshots for ``ckCapturesChanged``,
+      ## pushed and popped LIFO with ``frames``.
     flBestLen: int ## findLongest: best match length so far (-1 if none)
     flBestMatch: Match ## findLongest: deepest match recorded
 
@@ -169,9 +148,8 @@ const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 
 const MaxQuantRepetitions = 10_000
 const MaxCallDepth* = 400
-  ## Guard against stack overflow. Each concat node uses ~4 real call frames
-  ## (matchSeqCont + matchWithCont + matchLiteral + runCont), so this must be
-  ## well below Nim's debug call depth limit (2000) to catch deep recursion.
+  ## Stack-overflow guard: each concat node costs ~4 real call frames, so
+  ## this stays well below Nim's debug call-depth limit of 2000.
 
 # Forward declarations
 proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool
@@ -187,10 +165,8 @@ proc matchQuantLazy(
 proc runCont(ctx: MatchContext, cont: ContId): bool
 
 proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
-  ## Push a frame and return its index.  The frame must be popped by
-  ## the pusher (``ctx.frames.setLen(fid)``) before returning to the
-  ## caller, so that frames pushed during recursive matching are
-  ## reclaimed deterministically.
+  ## Push a frame and return its index.  The pusher must pop it
+  ## (``ctx.frames.setLen(fid)``) before returning to its caller.
   result = ctx.frames.len.int32
   ctx.frames.add(frame)
 
@@ -205,10 +181,8 @@ proc save(ctx: MatchContext): SavedState =
   )
 
 proc restore(ctx: MatchContext, s: sink SavedState) =
-  ## ``s`` is consumed: move its ``captures`` buffer into ``ctx`` instead
-  ## of copying.  Callers that pass an lvalue still live after the call
-  ## (e.g. indexing into a ``seq[SavedState]`` that's reused) see a
-  ## compiler-synthesized copy fall back automatically.
+  ## ``s`` is consumed: its ``captures`` buffer is moved into ``ctx``.
+  ## Callers passing a still-live lvalue get a synthesized copy instead.
   ctx.pos = s.pos
   ctx.captures = move(s.captures)
   ctx.flags = s.flags
@@ -217,25 +191,20 @@ proc restore(ctx: MatchContext, s: sink SavedState) =
   ctx.graphemeMode = s.graphemeMode
 
 proc saveStackLens(ctx: MatchContext): seq[int] =
-  ## Snapshot the per-group ``captureStacks[i].len``.  Lookaround bodies
-  ## must not leak recursion-level capture frames across the zero-width
-  ## boundary; saving lengths is enough because ``matchCapture`` already
-  ## restores in-place values on its own failure path, so the only way
-  ## state visibly changes through a lookaround is via length growth.
-  ## When ``captureStacksDirty`` is false the snapshot is left empty to
-  ## skip the allocation: by the flag's invariant every stack is empty at
-  ## that point, so ``restoreStackLens`` reads the empty snapshot as
-  ## "trim everything back to zero" rather than "nothing to do".
+  ## Snapshot the per-group ``captureStacks[i].len`` so a lookaround body
+  ## cannot leak recursion-level capture frames.  Lengths suffice:
+  ## ``matchCapture`` already restores in-place values on failure, so only
+  ## growth is visible.  When the stacks are clean the snapshot is left
+  ## empty — ``restoreStackLens`` then trims everything back to zero.
   if ctx.captureStacksDirty:
     result = newSeq[int](ctx.captureStacks.len)
     for i in 0 ..< ctx.captureStacks.len:
       result[i] = ctx.captureStacks[i].len
 
 proc restoreStackLens(ctx: MatchContext, savedLens: sink seq[int]) =
-  ## Trim each ``captureStacks[i]`` back to its saved length, leaving the
-  ## inner ``seq`` capacity intact for reuse.  An empty snapshot means the
-  ## stacks were all empty when it was taken (see ``saveStackLens``), so
-  ## anything the lookaround body pushed still has to be trimmed away.
+  ## Trim each ``captureStacks[i]`` back to its saved length, keeping the
+  ## inner ``seq`` capacity.  An empty snapshot means "trim everything"
+  ## (see ``saveStackLens``).
   if savedLens.len == 0:
     if ctx.captureStacksDirty:
       for i in 0 ..< ctx.captureStacks.len:
@@ -548,12 +517,10 @@ proc matchAnchor(ctx: MatchContext, kind: AnchorKind, cont: ContId): bool =
   false
 
 proc tryCaptureChangingMatch(ctx: MatchContext, body: Node): bool {.inline.} =
-  ## Snapshot ``ctx.captures`` onto the side stack, attempt ``body`` and
-  ## accept only if captures changed (via ``ckCapturesChanged``).  The
-  ## frame and snapshot are popped before returning so the caller does
-  ## not see any leftover state on either stack.  Used by zero-width
-  ## quantifier subloops to force the body to pick a different
-  ## alternative on each iteration.
+  ## Attempt ``body`` and accept only if captures changed (via
+  ## ``ckCapturesChanged``), popping the frame and snapshot before
+  ## returning.  Lets zero-width quantifier subloops force the body to
+  ## pick a different alternative each iteration.
   let snapStart = ctx.captureSnapshots.len.int32
   for c in ctx.captures:
     ctx.captureSnapshots.add(c)
@@ -829,17 +796,20 @@ proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
   of ccCharType:
     case atom.charType
     of ctWord:
-      isWordChar(r, rfAsciiWord in flags)
+      # Inside [...] Oniguruma uses the raw CR_Word ranges: no Latin-1 extras.
+      isWordChar(r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false)
     of ctNotWord:
-      not isWordChar(r, rfAsciiWord in flags)
+      not isWordChar(
+        r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false
+      )
     of ctDigit:
-      isDigitChar(r, rfAsciiDigit in flags)
+      isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
     of ctNotDigit:
-      not isDigitChar(r, rfAsciiDigit in flags)
+      not isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
     of ctSpace:
-      isSpaceChar(r, rfAsciiSpace in flags)
+      isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
     of ctNotSpace:
-      not isSpaceChar(r, rfAsciiSpace in flags)
+      not isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
     of ctHexDigit:
       isHexDigitChar(r)
     of ctNotHexDigit:
@@ -1928,10 +1898,9 @@ proc matchNode(ctx: MatchContext, node: Node): bool =
 proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.}
 
 proc runCont(ctx: MatchContext, cont: ContId): bool =
-  ## Execute the chained continuation identified by ``cont``.  Each
-  ## ``Frame`` encodes one closure's worth of post-match work plus a
-  ## ``parent`` link; this proc walks that chain.  ``TrueCont`` is the
-  ## sentinel ``-1`` meaning "no further work, succeed".
+  ## Walk the continuation chain starting at ``cont``: each ``Frame``
+  ## holds one step of post-match work plus a ``parent`` link.
+  ## ``TrueCont`` (-1) means "no further work, succeed".
   if cont < 0:
     return true
   case ctx.frames[cont].kind
@@ -2033,12 +2002,9 @@ proc resetForRegex(
   ctx.recursionDepth = 0
   ctx.callDepth = 0
   let capCount = regex.captureCount
-  # ``captures`` must be sized exactly because it is copied wholesale into
-  # ``Match.boundaries``.  ``groupRecursionDepth`` and ``captureStacks``
-  # are purely internal: grow on demand but never shrink, so the inner
-  # ``seq[Span]`` capacity in ``captureStacks`` survives a switch to a
-  # smaller-capture-count regex.  ``resetForPosition`` clears stale state
-  # to ``setLen(0)`` regardless of length.
+  # ``captures`` is sized exactly (it is copied into ``Match.boundaries``).
+  # The internal buffers only grow, so their capacity survives a switch to
+  # a regex with fewer captures; ``resetForPosition`` clears stale state.
   ctx.captures.setLen(capCount + 1)
   if capCount > ctx.groupRecursionDepth.len:
     ctx.groupRecursionDepth.setLen(capCount)
@@ -2078,10 +2044,9 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.graphemeMode = gmNone
 
 proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.} =
-  ## Fill ``m`` in place from a capture vector, reusing ``m.boundaries``'
-  ## existing capacity when possible.  Used when ``captures`` is still
-  ## live (e.g. inside the findLongest frame, which may re-enter and
-  ## mutate ``ctx.captures``).
+  ## Fill ``m`` from a capture vector, reusing ``m.boundaries``' capacity.
+  ## Used while ``captures`` is still live (e.g. in the findLongest frame,
+  ## which may re-enter and mutate ``ctx.captures``).
   m.found = true
   m.boundaries.setLen(captures.len)
   for i in 0 ..< captures.len:
@@ -2100,10 +2065,9 @@ proc searchImplInto*(
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
-  ## In-place variant of ``searchImpl``. Writes the result into ``m``,
-  ## reusing ``ctx``'s internal buffers (captures, groupRecursionDepth,
-  ## captureStacks) and ``m.boundaries``' capacity across calls.  The
-  ## ``ctx`` is assumed to be caller-owned and single-threaded.
+  ## In-place variant of ``searchImpl``: writes into ``m``, reusing
+  ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
+  ## ``ctx`` must be caller-owned and single-threaded.
   let findLongest = rfFindLongest in regex.flags
   if findLongest:
     ctx.flBestLen = -1

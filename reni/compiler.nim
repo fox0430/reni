@@ -231,9 +231,8 @@ proc hasRecursiveCycle(
     visiting: var HashSet[int],
 ): bool =
   ## Return true when evaluating ``node`` unconditionally reaches ``startIdx``
-  ## through a subexpression-call chain without consuming any input. Detects
-  ## both direct (``(?<a>(?&a))``) and mutual recursion
-  ## (``(?<a>(?&b))(?<b>(?&a))``).
+  ## through a subexpression-call chain without consuming input — direct
+  ## (``(?<a>(?&a))``) or mutual (``(?<a>(?&b))(?<b>(?&a))``) recursion.
   if node == nil:
     return false
   case node.kind

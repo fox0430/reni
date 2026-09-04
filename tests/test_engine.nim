@@ -1,4 +1,4 @@
-import std/[unittest, strutils, options]
+import std/[unittest, strutils, options, unicode]
 
 import ../reni
 
@@ -1236,6 +1236,48 @@ suite "Grapheme features":
     let m = search("ab", re("a\\yb"))
     check m.found
 
+  test "\\X breaks before the Mc characters that are not SpacingMark":
+    # 31 Mc code points are neither Grapheme_Extend nor SpacingMark, so their
+    # GCB is Other and a cluster ends in front of them.  Deriving Extend from
+    # the general category instead of GraphemeBreakProperty.txt misses these.
+    for cp in [0x102B, 0x1038, 0x1064, 0x108F, 0x109A, 0x1A61, 0xAA7B, 0x11720]:
+      let s = $Rune(0x1000) & $Rune(cp)
+      let m = search(s, re("^\\X$"))
+      check(not m.found)
+
+  test "\\X breaks around GCB=Control characters":
+    # Cf is not uniformly Extend: these are Control and break on both sides.
+    for cp in [0x202A, 0x202E, 0xFFF9, 0xFFFB, 0x1D173, 0x1D17A, 0xE0001]:
+      let s = "a" & $Rune(cp)
+      let m = search(s, re("^\\X$"))
+      check(not m.found)
+
+  test "\\X uses the GCB jamo ranges, not the composition ranges":
+    # GCB=V starts at U+1160 (jungseong filler) and GCB=T runs to U+11FF;
+    # the AC00 composition constants cover neither.
+    check search($Rune(0x1100) & $Rune(0x1160), re("^\\X$")).found
+    check search($Rune(0xAC00) & $Rune(0x1160), re("^\\X$")).found
+    check search($Rune(0x1160) & $Rune(0x11A8), re("^\\X$")).found
+
+  test "(?y{w}) applies WB4 before the look-back rules":
+    # Each pair is one word segment only if the rule that joins it looks past
+    # the Extend/Format run at the character *before* it (WB7, WB11, WB15).
+    for s in [
+      "a" & $Rune(0x3A) & $Rune(0x0308) & "b", # WB7  AHLetter MidLetter x AHLetter
+      "a" & $Rune(0x27) & $Rune(0x2060) & "b", # WB7  with a Format
+      "1" & $Rune(0x2E) & $Rune(0x2060) & "1", # WB11 Numeric MidNum x Numeric
+      $Rune(0x1F1E6) & $Rune(0x0308) & $Rune(0x1F1E6), # WB15 RI pair across an Extend
+    ]:
+      check search(s, re("^(?y{w})\\X$")).found
+
+  test "\\X joins GCB=Extend characters that are not marks":
+    # Emoji_Modifier and the halfwidth voiced sound marks are Extend without
+    # being in any M* general category.
+    for cp in [0x1F3FB, 0x1F3FF, 0xFF9E, 0xFF9F]:
+      let s = "a" & $Rune(cp)
+      let m = search(s, re("^\\X$"))
+      check m.found
+
 suite "Special escapes":
   test "\\K resets match start":
     let m = search("ab", re("a\\Kb"))
@@ -1448,6 +1490,19 @@ suite "Grapheme mode (?y{w})":
     # Sanity check: \y (grapheme boundary) matches between two base chars
     let m = search("ab", re("a\\yb"))
     check m.found
+
+  test "(?y{w}) letters that are also Extended_Pictographic stay one word":
+    # U+1F170 and U+1F171 are Word_Break=ALetter as well as
+    # Extended_Pictographic; WB5 keeps them in one segment.
+    let m = search("\u{1F170}\u{1F171}", re("(?y{w})."))
+    check m.found
+    check m.boundaries[0] == 0 .. 8
+
+  test "(?y{w}) WB3c holds for ALetter Extended_Pictographic":
+    # ZWJ x Extended_Pictographic: no boundary after the ZWJ.
+    let m = search("\u200D\u{1F170}", re("(?y{w})."))
+    check m.found
+    check m.boundaries[0] == 0 .. 7
 
 suite "ASCII flag modifiers":
   test "(?W) makes \\w ASCII-only":

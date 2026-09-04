@@ -104,8 +104,8 @@ type
     upCategory ## ``unicodeCategory(r)`` intersects ``catBits``
     upTypeMask ## ``unicodeTypes(r)`` shares *any* bit with ``typeBits``
     upPosix ## ``matchPosixClass(r, posixCls, false)``
+    upWord ## bare ``\w`` / ``\p{Word}``: ``isWordChar(r, false)``
     upAscii ## code point <= U+007F
-    upBlank ## space or tab
     upEmoji
     upExtPict
     upBlock ## code point inside ``blockRanges[blockIdx]``
@@ -166,10 +166,8 @@ type
       interRightNeg*: bool
 
   NodeKind* = enum
-    ## **Internal API.** The AST node tag set is an implementation detail
-    ## exposed only so tests inside this repository can inspect parsed trees.
-    ## User code MUST NOT depend on individual node kinds — they may be
-    ## renamed, merged, or removed at any time without notice.
+    ## **Internal API.** Exposed only so this repository's tests can inspect
+    ## parsed trees; node kinds may change at any time without notice.
     nkLiteral ## single rune
     nkEscapedLiteral ## \n, \t, \x{HHHH}, etc.
     nkConcat ## sequence of nodes
@@ -202,17 +200,12 @@ type
     ckRegexCond ## (?(regex)...) - bare name that's not a capture group
 
   Node* {.acyclic.} = ref object
-    ## **Internal API.** The parsed / compiled AST is not part of the public
-    ## contract. Fields are exported only so that `compiler` and `engine`
-    ## (which live in separate modules) can walk the tree. User code MUST
-    ## NOT read or mutate Node fields; the shape is subject to change
-    ## without notice, and mutating a Node on a compiled `Regex` will
-    ## corrupt the matcher state.
+    ## **Internal API.** Fields are exported only so `compiler` and `engine`
+    ## can walk the tree. The shape may change without notice, and mutating
+    ## a Node on a compiled `Regex` corrupts the matcher state.
     ##
-    ## ``{.acyclic.}``: the parser constructs trees strictly top-down and
-    ## the compiler never splices a node back into its own subtree.
-    ## ``nkSubexpCall`` resolves by index/name at match time, never by
-    ## pointer back-edge.
+    ## ``{.acyclic.}``: trees are built strictly top-down and never spliced
+    ## into themselves; ``nkSubexpCall`` resolves by index/name at match time.
     case kind*: NodeKind
     of nkLiteral:
       rune*: Rune
@@ -339,10 +332,8 @@ proc pattern*(r: Regex): string {.inline.} =
   r.pattern
 
 proc ast*(r: Regex): Node {.inline.} =
-  ## **Internal API.** Returns the compiled AST root. Exposed only for
-  ## parser/engine tests inside this repository. User code MUST NOT depend
-  ## on this accessor or on ``Node`` — both are implementation details
-  ## and WILL be removed or restricted in a future release. Use the
+  ## **Internal API.** Returns the compiled AST root, for this repository's
+  ## parser/engine tests only — it WILL be removed or restricted. Use the
   ## documented API (``captureText``, ``captureSpan``, ``captureIndex``,
   ## ``captureCount``, ``namedCaptures``, ``pattern``) instead.
   r.ast
