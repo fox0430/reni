@@ -2799,6 +2799,41 @@ suite "captureStacks isolation across lookaround":
       check searchIntoCtx(ctx, "aa", plain, m)
       check m.matchSpan == 1 .. 2
 
+suite "levelBackrefs gates the capture history":
+  # ``Regex.levelBackrefs`` is what lets the matcher skip the per-group
+  # capture history, and a recursion-level backreference is its only reader.
+  # The isolation suite above asserts that level backrefs do *not* match, so
+  # it stays green even if the flag were never set at all; these tests pin
+  # the positive side: the flag itself, and a match that can only succeed
+  # while the history is being written.
+  test "a level backref matches through a recursion":
+    # ``+1`` reads what the enclosing recursion level captured, which lives
+    # only in the capture history.
+    let numbered = re("(([a-z])\\g<1>?\\k<2+1>)")
+    check levelBackrefs(numbered)
+    check search("aa", numbered).matchSpan == 0 .. 2
+    check search("abba", numbered).matchSpan == 1 .. 3
+    check not search("abcd", numbered).found
+
+    let named = re("(?<e>(?<n>[a-z])\\g<e>?\\k<n+1>)")
+    check levelBackrefs(named)
+    check search("aa", named).matchSpan == 0 .. 2
+    check search("abba", named).matchSpan == 1 .. 3
+    check not search("abcd", named).found
+
+  test "the flag is set wherever the backref sits":
+    for pattern in [
+      "(a)(?=\\k<1+1>)", "(a)(?<=\\k<1+1>)", "(a)(?:x|\\k<1+1>)", "(a)(?>\\k<1+1>)",
+      "(a)(?(1)\\k<1+1>)", "(a)(?~\\k<1+1>)", "(a)(\\k<1+1>)*", "(?<c>a)(?=\\k<c+1>)",
+    ]:
+      check levelBackrefs(re(pattern))
+
+  test "the flag stays clear without a level backref":
+    check not levelBackrefs(re("(a)\\1"))
+    check not levelBackrefs(re("(?<c>a)\\k<c>"))
+    check not levelBackrefs(re("(a)\\k<1+0>"))
+    check not levelBackrefs(re("(?<c>a)\\k<c+0>"))
+
 suite "malformed UTF-8 above U+10FFFF":
   # A lead byte of 0xF5 or more begins no character at all: it is one byte on
   # its own, the way Oniguruma's length table has it.  0xF4 does lead four

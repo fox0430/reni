@@ -99,6 +99,13 @@ type
       ## and only past ``resetForRegex``: an entry point's quick-reject
       ## return runs before the reset and has to read the parameter
       ## directly.
+    trackCaptureStacks: bool
+      ## Mirror of ``Regex.levelBackrefs``: when false, both capture-history
+      ## write sites -- ``runCapture`` and the ``ckCapture`` arm of
+      ## ``runMachine``, which is the path the common case actually runs --
+      ## skip the per-group history entirely.  The two have to stay in step:
+      ## each records ``-1`` for the stack depth so ``chUndoCapture`` skips
+      ## the matching restore.
     subjectEnd: int ## effective end of subject (for absent expression limiting)
     recursionDepth: int ## for detecting never-ending recursion
     captureStacks: seq[seq[Span]]
@@ -1343,7 +1350,8 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
   let savedCap = ctx.captures[capIdx]
   ctx.captures[capIdx] = span(startPos, endPos)
   var savedStackEntry = UnsetSpan
-  if myDepth >= 0:
+  let trackStacks = ctx.trackCaptureStacks and myDepth >= 0
+  if trackStacks:
     if index >= ctx.captureStacks.len:
       ctx.captureStacks.setLen(index + 1)
     if myDepth >= ctx.captureStacks[index].len:
@@ -1357,7 +1365,7 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
   if not ok:
     ctx.captures[capIdx] = savedCap
     ctx.flags = modFlags
-    if myDepth >= 0:
+    if trackStacks:
       ctx.captureStacks[index][myDepth] = savedStackEntry
   ok
 
@@ -2735,7 +2743,12 @@ proc runMachine(
         let savedCap = ctx.captures[capIdx]
         ctx.captures[capIdx] = span(startPos, ctx.pos)
         var savedStackEntry = UnsetSpan
-        if myDepth >= 0:
+        # ``-1`` is the established "no history entry" marker, so recording it
+        # in the choice point is what makes ``chUndoCapture`` skip the restore
+        # in step with the write skipped here.
+        var stackDepth = -1
+        if ctx.trackCaptureStacks and myDepth >= 0:
+          stackDepth = myDepth
           if index >= ctx.captureStacks.len:
             ctx.captureStacks.setLen(index + 1)
           if myDepth >= ctx.captureStacks[index].len:
@@ -2747,7 +2760,7 @@ proc runMachine(
           kind: chUndoCapture,
           ucCapIdx: int32(capIdx),
           ucIndex: int32(index),
-          ucMyDepth: int32(myDepth),
+          ucMyDepth: int32(stackDepth),
           ucSavedCap: savedCap,
           ucSavedStackEntry: savedStackEntry,
           ucFlags: ctx.flags,
@@ -3194,6 +3207,7 @@ proc resetForRegex(
   ctx.subject = toSubject(subject)
   ctx.flags = regex[].flags
   ctx.regex = regex
+  ctx.trackCaptureStacks = regex[].levelBackrefs
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth

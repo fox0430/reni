@@ -613,6 +613,9 @@ type
       ## Upper bound on the bytes a match consumes, or -1 when unbounded.
       ## Oniguruma's ``anchor_dmax``: how far left of the anchor a match may
       ## still start.
+    levelBackrefs: bool
+      ## The pattern uses a recursion-level backreference, so the matcher has
+      ## to maintain the per-group capture history.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -666,6 +669,12 @@ proc semiEndAnchored*(r: Regex): bool {.inline.} =
 proc semiEndDMax*(r: Regex): int {.inline.} =
   r.semiEndDMax
 
+proc levelBackrefs*(r: Regex): bool {.inline.} =
+  ## Whether the pattern uses a recursion-level backreference
+  ## (``\k<name+1>``).  Only then does the matcher maintain the per-group
+  ## capture history, which costs a write on every capture.
+  r.levelBackrefs
+
 proc initRegex*(
     pattern: string,
     ast: Node,
@@ -679,6 +688,7 @@ proc initRegex*(
     requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
     semiEndAnchored: bool = false,
     semiEndDMax: int = -1,
+    levelBackrefs: bool = true,
 ): Regex =
   Regex(
     pattern: pattern,
@@ -693,6 +703,7 @@ proc initRegex*(
     requiredByte: requiredByte,
     semiEndAnchored: semiEndAnchored,
     semiEndDMax: semiEndDMax,
+    levelBackrefs: levelBackrefs,
   )
 
 proc span*(a, b: int): Span {.inline.} =
