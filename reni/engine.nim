@@ -4,6 +4,7 @@
 ## quantifiers, and flag groups without per-call closure allocations.
 
 import std/[unicode, tables]
+from std/strutils import find
 
 import types, unicode_utils, stackguard
 
@@ -274,6 +275,15 @@ type
     ## (``rewind`` rolls back without releasing, to replay the snapshot).
     scalars: ScalarState
     capOff: int32
+
+proc indexOfByte(s: string, start: int, b: uint8): int {.inline.} =
+  ## Index of the first ``b`` at or after a non-negative ``start``, or -1.
+  ## Goes through ``strutils.find``, which is libc's vectorized ``memchr``
+  ## on the C backend and a byte loop everywhere else.
+  if start >= s.len:
+    -1
+  else:
+    find(s, char(b), start)
 
 var emptySubjectByte: char
   ## Target for the ``data`` pointer of an empty subject, so a ``Subject``
@@ -3270,15 +3280,9 @@ proc searchImplInto*(
   # literal, and such a literal is compared byte for byte, so the byte has to
   # occur literally for any match to exist.
   let rb = regex.requiredByte
-  if rb.valid:
-    var found = false
-    for i in start ..< subject.len:
-      if subject[i].uint8 == rb.byte:
-        found = true
-        break
-    if not found:
-      noteScratchUsage(ctx)
-      return
+  if rb.valid and indexOfByte(subject, start, rb.byte) < 0:
+    noteScratchUsage(ctx)
+    return
   resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   # A case-sensitive literal prefix is looked for as raw bytes, the way
@@ -3307,29 +3311,27 @@ proc searchImplInto*(
         # jump to the next line.  ``nl + 1`` is a target for
         # [advanceChainTo], not a position to jump onto.
         while startPos > 0 and subject[startPos - 1] != '\n':
-          var nl = -1
-          for i in startPos ..< subject.len:
-            if subject[i] == '\n':
-              nl = i
-              break
+          let nl = indexOfByte(subject, startPos, uint8('\n'))
           if nl < 0:
             exhausted = true
             break
           startPos = advanceChainTo(subject, startPos, nl + 1, byteScan)
       of fcByte:
         # Scan forward to the next candidate whose lead byte is the one the
-        # pattern needs, stepping with ``nextScanPos``: a byte inside a
-        # character the walk steps over is not a start position.
+        # pattern needs.  [advanceChainTo] turns a hit into a scan position,
+        # since a byte inside a character the walk steps over is not a start
+        # position.
         var found = false
         while startPos < subject.len:
+          let hit = indexOfByte(subject, startPos, fc.byte)
+          if hit < 0:
+            break
+          startPos = advanceChainTo(subject, startPos, hit, byteScan)
+          if startPos >= subject.len:
+            break
           if subject[startPos].uint8 == fc.byte:
             found = true
             break
-          startPos =
-            if byteScan:
-              startPos + 1
-            else:
-              nextScanPos(subject, startPos)
         if not found:
           exhausted = true
       of fcByteSet:
@@ -3421,15 +3423,9 @@ proc searchBackwardImplInto*(
   # literal, and such a literal is compared byte for byte, so the byte has to
   # occur literally for any match to exist.
   let rb = regex.requiredByte
-  if rb.valid:
-    var found = false
-    for i in 0 ..< subject.len:
-      if subject[i].uint8 == rb.byte:
-        found = true
-        break
-    if not found:
-      noteScratchUsage(ctx)
-      return
+  if rb.valid and indexOfByte(subject, 0, rb.byte) < 0:
+    noteScratchUsage(ctx)
+    return
   resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   var startPos =
