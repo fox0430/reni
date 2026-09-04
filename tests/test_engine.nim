@@ -3739,3 +3739,131 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
 
   test "grapheme repetition still steps by grapheme":
     check search("áb", re("\\X*b")).found
+
+suite "the ASCII class bitset and the atom walk agree by construction":
+  # ``classHasByte`` answers a one-byte class member test from a bitset the
+  # compiler precomputed, instead of walking the class's atoms.  The bitset is
+  # sound only because of one claim, made by [classAsciiMatches]: below U+0080
+  # every atom reads the same whatever the ASCII-restriction flags say, so the
+  # set is *exact* there and a negated class may complement it.  That claim is
+  # the whole safety argument, and it is the kind that decays quietly -- an
+  # atom kind added to ``classAsciiMatches`` later that does read a flag below
+  # U+0080 breaks it with every existing test still green.
+  #
+  # So the invariant is checked against the walk the bitset replaced, using a
+  # property of ``classAsciiMatches`` itself: it gives up on a nested class,
+  # leaving ``asciiSetOk`` false.  ``[[C]]`` therefore matches exactly what
+  # ``[C]`` does while taking the atom walk, which makes the pair a
+  # same-semantics differential over the two paths.  The pairing is asserted
+  # below, not assumed: a change that starts annotating nested classes would
+  # otherwise turn this whole suite into a tautology.
+
+  const ClassBodies = [
+    "a",
+    "az",
+    "a-z",
+    "0-9",
+    "A-Za-z0-9_",
+    " ",
+    " \\n",
+    "\\t\\r\\f\\v",
+    "-",
+    "\\d",
+    "\\D",
+    "\\w",
+    "\\W",
+    "\\s",
+    "\\S",
+    "\\h",
+    "\\H",
+    "[:alpha:]",
+    "[:^alpha:]",
+    "[:alnum:]",
+    "[:space:]",
+    "[:punct:]",
+    "[:ascii:]",
+    "[:^ascii:]",
+    "[:xdigit:]",
+    "[:upper:]",
+    "[:lower:]",
+    "[:word:]",
+    "[:cntrl:]",
+    "[:graph:]",
+    "[:print:]",
+    "[:blank:]",
+    "\\w\\s",
+    "0-9[:alpha:]",
+    "a-z\\d_",
+    "\\D\\S",
+    # Ranges that cross the ASCII boundary: the byte container fills to 0xFF,
+    # not to 0x7F, and the low half still has to read the same both ways.
+    "a-\xC3\xBF",
+    "\x00-\xC2\x85",
+    "\\x{41}-\\x{5A}",
+  ]
+
+  const FlagPrefixes = [
+    "", "(?i)", "(?I)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
+    "(?i)(?W)(?D)(?S)(?P)",
+  ]
+    ## Every flag a class atom can read.  ``(?W)``/``(?D)``/``(?S)``/``(?P)``
+    ## are the ASCII restrictions the exactness claim is about; ``(?i)``/``(?I)``
+    ## are the ones the fast path steps aside for.
+    ##
+    ## ``(?i)`` and ``(?I)`` together are deliberately absent: the two spellings
+    ## already disagree there without any of this -- on ``(?i)(?I)``, ``[A-Z]``
+    ## rejects ``y`` while ``[[A-Z]]`` accepts it, and that predates the bitset
+    ## (it reproduces with the fast path removed entirely).  The pair is not a
+    ## same-semantics oracle under those flags, so it cannot say anything about
+    ## this invariant; adding the combination here only re-reports that separate
+    ## bug.  Fix that first, then this axis can come back.
+
+  proc firstCharClass(node: Node): Node =
+    ## The first ``nkCharClass`` in the tree, or nil.
+    if node == nil:
+      return nil
+    if node.kind == nkCharClass:
+      return node
+    for child in node.childNodes:
+      let found = firstCharClass(child)
+      if found != nil:
+        return found
+    nil
+
+  test "the paired patterns really do take the two different paths":
+    # Guards the differential below: if either half stops holding, the
+    # comparison still passes while comparing nothing.
+    for body in ClassBodies:
+      for caret in ["", "^"]:
+        let fast = firstCharClass(re("[" & caret & body & "]").ast)
+        let slow = firstCharClass(re("[" & caret & "[" & body & "]]").ast)
+        require fast != nil
+        require slow != nil
+        check fast.asciiSetOk
+        check not slow.asciiSetOk
+
+  test "every ASCII byte reads the same through the bitset and through the atoms":
+    for prefix in FlagPrefixes:
+      for body in ClassBodies:
+        for caret in ["", "^"]:
+          let fast = re(prefix & "[" & caret & body & "]")
+          let slow = re(prefix & "[" & caret & "[" & body & "]]")
+          for b in 0 .. 127:
+            let subject = $chr(b)
+            let viaBitset = search(subject, fast).found
+            let viaAtoms = search(subject, slow).found
+            if viaBitset != viaAtoms:
+              checkpoint(
+                "prefix=" & prefix & " body=" & body & " caret=" & caret & " byte=" & $b
+              )
+            check viaBitset == viaAtoms
+
+  test "a class the bitset answers still reads non-ASCII through the atoms":
+    # The bitset covers only b < 0x80; everything above it has to keep
+    # reaching the range walk, negation included.
+    check search("é", re("[^a-z]")).found
+    check search("é", re("[a-\xC3\xBF]")).found
+    check not search("\xC3\xBF", re("[a-z]")).found
+    check search("日", re("[^\\d]")).found
+    check search("日", re("[[:^ascii:]]")).found
+    check not search("日", re("[[:ascii:]]")).found

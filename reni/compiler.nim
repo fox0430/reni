@@ -660,6 +660,22 @@ proc markQuantBodyPure(node: Node): bool =
     # writes nothing, so it is exactly the body's verdict.
     node.quantBodyPure = not result
 
+proc annotateTree(node: Node) =
+  ## Single post-parse walk over the finished AST: precomputes each character
+  ## class's ASCII membership bitmap, so the matcher can answer ASCII input
+  ## with one bit test instead of walking the atoms.  Stored before negation,
+  ## which ``matchCharClassAt`` applies to the lookup's answer.
+  if node == nil:
+    return
+  if node.kind == nkCharClass:
+    var ascii: set[uint8]
+    var nonAscii, predicate: bool
+    if classAsciiMatches(node, ascii, nonAscii, predicate):
+      node.asciiSet = ascii
+      node.asciiSetOk = true
+  for child in node.childNodes:
+    annotateTree(child)
+
 proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateUtf8(pattern)
   var p = initParser(pattern, flags)
@@ -719,6 +735,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   bodies = @[]
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
+  annotateTree(ast)
   initRegex(
     pattern = pattern,
     ast = ast,

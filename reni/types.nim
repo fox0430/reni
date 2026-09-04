@@ -252,6 +252,15 @@ type
       negated*: bool
       atoms*: seq[CcAtom]
       bracketClass*: bool ## true when from [...] syntax (enables case-fold matching)
+      asciiSet*: set[uint8]
+        ## The ASCII bytes the class's atoms match, *before* negation — the
+        ## same contract as ``classHasByte``, whose caller applies ``negated``.
+        ## Filled in by the compiler when ``asciiSetOk``; the matcher then
+        ## answers ASCII input with one bit test instead of walking the atoms.
+      asciiSetOk*: bool
+        ## ``asciiSet`` is exact.  Only true for classes whose atoms all read
+        ## the same below U+0080 whatever the ASCII-restriction flags say;
+        ## under (?i) the matcher still falls back to the atoms.
     of nkAnchor:
       anchor*: AnchorKind
     of nkCharType:
