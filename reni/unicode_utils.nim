@@ -1341,17 +1341,17 @@ proc isAlphaChar*(r: Rune, cat: UnicodeCategory): bool {.inline.} =
 proc isAlphaChar*(r: Rune): bool {.inline.} =
   isAlphaChar(r, unicodeCategory(r))
 
-proc isWordChar*(r: Rune, asciiOnly: bool, latin1Digits = true): bool =
+proc isWordChar*(r: Rune, asciiOnly: bool, latin1Digits = true): bool {.inline.} =
   ## \w / Word: Alpha ∪ M ∪ Nd ∪ Pc ∪ six Latin-1 No digits (² ³ ¹ ¼ ½ ¾).
   ##
   ## Those six come from Oniguruma's ISO-8859-1 ctype override, which applies
   ## to a bare ``\w`` / ``\p{Word}`` only; ``[[:word:]]`` and any spelling
   ## inside ``[...]`` use the raw ``CR_Word`` ranges (``latin1Digits = false``).
   let c = int32(r)
+  if c >= 0 and c < 128:
+    return asciiHas(c, acWord)
   if asciiOnly:
-    return
-      (c >= ord('a') and c <= ord('z')) or (c >= ord('A') and c <= ord('Z')) or
-      (c >= ord('0') and c <= ord('9')) or c == ord('_')
+    return false
   if latin1Digits and c < 0x0100 and (
     c == 0x00B2 or c == 0x00B3 or c == 0x00B9 or c == 0x00BC or c == 0x00BD or
     c == 0x00BE
@@ -1363,27 +1363,29 @@ proc isWordChar*(r: Rune, asciiOnly: bool, latin1Digits = true): bool =
   cat in ctgL or cat in ctgM or cat == ctgNd or cat == ctgPc or cat == ctgNl or
     isOtherAlphabetic(r)
 
-proc isDigitChar*(r: Rune, asciiOnly: bool): bool =
+proc isDigitChar*(r: Rune, asciiOnly: bool): bool {.inline.} =
   ## \d: Decimal digit
+  let c = int32(r)
+  if c >= 0 and c < 128:
+    return asciiHas(c, acDigit)
   if asciiOnly:
-    let c = int32(r)
-    return c >= ord('0') and c <= ord('9')
+    return false
   unicodeCategory(r) == ctgNd
 
-proc isSpaceChar*(r: Rune, asciiOnly: bool): bool =
+proc isSpaceChar*(r: Rune, asciiOnly: bool): bool {.inline.} =
   ## \s: Whitespace
+  let c = int32(r)
+  if c >= 0 and c < 128:
+    return asciiHas(c, acSpace)
   if asciiOnly:
-    let c = int32(r)
-    return c == 0x20 or c == 0x09 or c == 0x0A or c == 0x0D or c == 0x0C or c == 0x0B
+    return false
   let cat = unicodeCategory(r)
-  cat in ctgZ or int32(r) == 0x09 or int32(r) == 0x0A or int32(r) == 0x0B or
-    int32(r) == 0x0C or int32(r) == 0x0D or int32(r) == 0x85
+  cat in ctgZ or c == 0x85
 
-proc isHexDigitChar*(r: Rune): bool =
+proc isHexDigitChar*(r: Rune): bool {.inline.} =
   ## \h: Hex digit (always ASCII)
   let c = int32(r)
-  (c >= ord('0') and c <= ord('9')) or (c >= ord('a') and c <= ord('f')) or
-    (c >= ord('A') and c <= ord('F'))
+  asciiHas(c, acXdigit)
 
 proc simpleFold*(r: Rune): Rune =
   ## Simple case fold for case-insensitive matching
@@ -1485,6 +1487,38 @@ proc posixAsciiOnly*(cls: PosixClassName, flags: RegexFlags): bool =
 
 proc matchPosixClass*(r: Rune, cls: PosixClassName, asciiOnly: bool): bool =
   let c = int32(r)
+  if c >= 0 and c < 128:
+    # ASCII: the table already agrees with both readings of every class.
+    return
+      case cls
+      of pcAlnum:
+        asciiHas(c, acAlnum)
+      of pcAlpha:
+        asciiHas(c, acAlpha)
+      of pcAscii:
+        true
+      of pcBlank:
+        asciiHas(c, acBlank)
+      of pcCntrl:
+        asciiHas(c, acCntrl)
+      of pcDigit:
+        asciiHas(c, acDigit)
+      of pcGraph:
+        asciiHas(c, acGraph)
+      of pcLower:
+        asciiHas(c, acLower)
+      of pcPrint:
+        asciiHas(c, acPrint)
+      of pcPunct:
+        asciiHas(c, acPunct)
+      of pcSpace:
+        asciiHas(c, acSpace)
+      of pcUpper:
+        asciiHas(c, acUpper)
+      of pcXdigit:
+        asciiHas(c, acXdigit)
+      of pcWord:
+        asciiHas(c, acWord)
   case cls
   of pcAlnum:
     if asciiOnly:
