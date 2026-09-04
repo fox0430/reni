@@ -859,9 +859,9 @@ proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
   of ccNegPosix:
     not matchPosixClass(r, atom.posixClass, posixAsciiOnly(atom.posixClass, flags))
   of ccUnicodeProp:
-    matchUnicodeProp(r, atom.propName, flags)
+    matchUnicodeProp(r, atom.prop, flags)
   of ccNegUnicodeProp:
-    not matchUnicodeProp(r, atom.propName, flags)
+    not matchUnicodeProp(r, atom.prop, flags)
   of ccNestedClass:
     var anyMatch = false
     for nested in atom.nestedAtoms:

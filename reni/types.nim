@@ -97,6 +97,42 @@ type
     pcXdigit
     pcWord
 
+  UniPropKind* = enum
+    ## How a ``\p{...}`` property, resolved at compile time, is evaluated.
+    upNever ## unknown name: matches nothing
+    upAlways ## \p{Any}
+    upCategory ## ``unicodeCategory(r)`` intersects ``catBits``
+    upTypeMask ## ``unicodeTypes(r)`` shares *any* bit with ``typeBits``
+    upPosix ## ``matchPosixClass(r, posixCls, false)``
+    upAscii ## code point <= U+007F
+    upBlank ## space or tab
+    upEmoji
+    upExtPict
+    upBlock ## code point inside ``blockRanges[blockIdx]``
+    upScript ## ``unicodeScript(r)`` equals ``scriptId``
+
+  UniAsciiRestrict* = enum
+    ## Which flag downgrades a property to its ASCII-only POSIX equivalent
+    ## (``restrictCls``).  ``rfAsciiPosix`` implies all of them.
+    uarNone
+    uarWord ## (?W) or (?P)
+    uarDigit ## (?D) or (?P)
+    uarSpace ## (?S) or (?P)
+    uarPosix ## (?P) only
+
+  UniProp* = object
+    ## A ``\p{...}`` property resolved to a flag-independent matcher plus an
+    ## optional ASCII restriction.  ``catBits``, ``typeBits`` and ``scriptId``
+    ## hold ``unicodedb`` values as plain integers to keep it out of this module.
+    kind*: UniPropKind
+    catBits*: int32
+    typeBits*: int32 ## OR, not AND: matches a rune having *any* of these bits.
+    posixCls*: PosixClassName
+    blockIdx*: int32
+    scriptId*: int32
+    restrict*: UniAsciiRestrict
+    restrictCls*: PosixClassName
+
   CcAtomKind* = enum
     ccLiteral ## single code point
     ccRange ## a-z
@@ -119,7 +155,7 @@ type
     of ccCharType:
       charType*: CharTypeKind
     of ccUnicodeProp, ccNegUnicodeProp:
-      propName*: string
+      prop*: UniProp ## ``\p{...}`` name resolved at compile time
     of ccNestedClass:
       nestedAtoms*: seq[CcAtom]
       nestedNegated*: bool

@@ -704,6 +704,19 @@ suite "Isolated flags and chaining":
     let m = search("A", re("\\p{InBasicLatin}"))
     check m.found
 
+  test "\\p{Inherited} script property":
+    # "In"-prefixed names try the block table first, but Inherited is a script
+    # name, not a block, so it must fall through instead of matching nothing.
+    let m = search("\u0301", re("\\p{Inherited}"))
+    check m.found
+    check not search("a", re("\\p{Inherited}")).found
+
+  test "\\p{InHiragana} block wins over the Hiragana script":
+    # U+3099 lives in the Hiragana block but belongs to the Inherited script.
+    check search("\u3099", re("\\p{InHiragana}")).found
+    check not search("\u3099", re("\\p{Hiragana}")).found
+    check search("\u3042", re("\\p{Hiragana}")).found
+
   test "\\p{PosixPunct}":
     let m = search("$", re("\\p{PosixPunct}"))
     check m.found
@@ -1569,6 +1582,50 @@ suite "Nested character classes and Unicode properties":
     check search("$", re("\\p{Sc}")).found
     check not search("a", re("\\p{Sc}")).found
 
+  test "\\p{Upper} matches the derived Uppercase property":
+    check search("A", re("\\p{Upper}")).found
+    check search("\u00c0", re("\\p{Upper}")).found # LATIN CAPITAL LETTER A WITH GRAVE
+    # Other_Uppercase, i.e. uppercase but not category Lu
+    check search("\u2160", re("\\p{Upper}")).found # ROMAN NUMERAL ONE (Nl)
+    check search("\u24b6", re("\\p{Upper}")).found # CIRCLED LATIN CAPITAL A (So)
+    check not search("a", re("\\p{Upper}")).found
+    check not search("\u2170", re("\\p{Upper}")).found # SMALL ROMAN NUMERAL ONE
+    check not search("\u01c5", re("\\p{Upper}")).found # Dz WITH CARON (Lt)
+    check not search("1", re("\\p{Upper}")).found
+
+  test "\\p{Lower} matches the derived Lowercase property":
+    check search("a", re("\\p{Lower}")).found
+    check search("\u00e0", re("\\p{Lower}")).found # LATIN SMALL LETTER A WITH GRAVE
+    # Other_Lowercase, i.e. lowercase but not category Ll
+    check search("\u2170", re("\\p{Lower}")).found # SMALL ROMAN NUMERAL ONE (Nl)
+    check search("\u00aa", re("\\p{Lower}")).found # FEMININE ORDINAL INDICATOR (Lo)
+    check search("\u02b0", re("\\p{Lower}")).found # MODIFIER LETTER SMALL H (Lm)
+    check not search("A", re("\\p{Lower}")).found
+    check not search("\u2160", re("\\p{Lower}")).found # ROMAN NUMERAL ONE
+    check not search("\u01c5", re("\\p{Lower}")).found # Dz WITH CARON (Lt)
+    check not search("1", re("\\p{Lower}")).found
+
+  test "\\P{Upper} is the complement of \\p{Upper}":
+    check search("a", re("\\P{Upper}")).found
+    check not search("A", re("\\P{Upper}")).found
+
+  test "\\P{Lower} is the complement of \\p{Lower}":
+    check search("A", re("\\P{Lower}")).found
+    check not search("a", re("\\P{Lower}")).found
+
+  test "(?P) restricts \\p{Upper}/\\p{Lower} to ASCII":
+    check search("A", re("(?P:\\p{Upper})")).found
+    check not search("\u00c0", re("(?P:\\p{Upper})")).found
+    check search("a", re("(?P:\\p{Lower})")).found
+    check not search("\u00e0", re("(?P:\\p{Lower})")).found
+
+  test "\\p{Upper}/\\p{Lower} inside a character class":
+    check search("A", re("[\\p{Upper}]")).found
+    check not search("a", re("[\\p{Upper}]")).found
+    check search("a", re("[\\p{Lower}0-9]")).found
+    check search("5", re("[\\p{Lower}0-9]")).found
+    check not search("A", re("[\\p{Lower}0-9]")).found
+
 suite "Lookbehind edge cases":
   test "negative lookbehind at string start succeeds":
     let m = search("abc", re("(?<!x)abc"))
@@ -2373,6 +2430,8 @@ suite "malformed UTF-8 above U+10FFFF":
     check not search(OverMax, re("\\p{L}")).found
     check not search(OverMax, re("\\p{Latin}")).found
     check not search(OverMax, re("\\p{InBasicLatin}")).found
+    check not search(OverMax, re("\\p{Upper}")).found
+    check not search(OverMax, re("\\p{Lower}")).found
     check not search(OverMax, re("[[:alpha:]]")).found
     check not search(OverMax, re("\\w")).found
 

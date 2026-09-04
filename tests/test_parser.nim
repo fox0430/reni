@@ -2,6 +2,7 @@ import std/[unittest, unicode]
 
 import ../reni
 import ../reni/types
+import ../reni/unicode_utils
 
 suite "Step 1: Literals":
   test "single char":
@@ -341,13 +342,13 @@ suite "Step 6: Character classes":
     check r.ast.kind == nkCharClass
     check r.ast.atoms.len == 1
     check r.ast.atoms[0].kind == ccUnicodeProp
-    check r.ast.atoms[0].propName == "L"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("L")
 
   test "negated unicode property [\\P{Cc}]":
     let r = re("[\\P{Cc}]")
     check r.ast.kind == nkCharClass
     check r.ast.atoms[0].kind == ccNegUnicodeProp
-    check r.ast.atoms[0].propName == "Cc"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("Cc")
 
 suite "Step 7: Named captures and backreferences":
   test "named capture (?<name>...)":
@@ -567,30 +568,30 @@ suite "Step 10: Unicode properties and remaining features":
     check r.ast.negated == false
     check r.ast.atoms.len == 1
     check r.ast.atoms[0].kind == ccUnicodeProp
-    check r.ast.atoms[0].propName == "L"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("L")
 
   test "\\P{Cc} negated unicode property":
     let r = re("\\P{Cc}")
     check r.ast.kind == nkCharClass
     check r.ast.atoms.len == 1
     check r.ast.atoms[0].kind == ccNegUnicodeProp
-    check r.ast.atoms[0].propName == "Cc"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("Cc")
 
   test "\\p{Print} long property name":
     let r = re("\\p{Print}")
-    check r.ast.atoms[0].propName == "Print"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("Print")
 
   test "\\pL single-letter shorthand":
     let r = re("\\pL")
     check r.ast.kind == nkCharClass
     check r.ast.atoms[0].kind == ccUnicodeProp
-    check r.ast.atoms[0].propName == "L"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("L")
 
   test "\\PL single-letter negated shorthand":
     let r = re("\\PL")
     check r.ast.kind == nkCharClass
     check r.ast.atoms[0].kind == ccNegUnicodeProp
-    check r.ast.atoms[0].propName == "L"
+    check r.ast.atoms[0].prop == resolveUnicodeProp("L")
 
   test "\\p{} empty property raises":
     expect RegexError:
@@ -777,3 +778,14 @@ suite "Relative and numeric reference bounds":
   test "undefined \\k<name> raises":
     expect RegexError:
       discard re("\\k<foo>")
+
+suite "resolved \\p{...} property matching":
+  test "\\p{ascii} rejects out-of-range runes":
+    let p = resolveUnicodeProp("ascii")
+    check matchUnicodeProp(Rune(0), p)
+    check matchUnicodeProp(Rune(127), p)
+    check not matchUnicodeProp(Rune(128), p)
+    # Must agree with matchPosixClass, which the rfAsciiPosix path uses.
+    for cp in [int32(-1), int32(-128), low(int32)]:
+      check not matchUnicodeProp(Rune(cp), p)
+      check not matchPosixClass(Rune(cp), pcAscii, true)
