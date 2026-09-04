@@ -2,9 +2,10 @@
 
 import std/[unicode, strutils]
 
-import pkg/unicodedb/[scripts, scripts_data, blocks_data, segmentation]
+import pkg/unicodedb/[scripts, scripts_data, blocks_data]
+import pkg/unicodedb/segmentation except wordBreakProp
 import pkg/unicodedb/types as udbTypes except unicodeTypes
-# Both are wrapped below with a guard against non-code-points.
+# All four are wrapped below with a guard against non-code-points.
 import pkg/unicodedb/properties except unicodeCategory
 import pkg/unicodedb/casing except simpleCaseFold
 
@@ -1254,28 +1255,6 @@ const
     (0x16F51'i32, 0x16F87'i32),
   ]
 
-  MultiCharFolds*: array[17, (int32, array[3, int32], int)] = [
-    # (source_codepoint, expansion_codepoints, expansion_length)
-    (0x00DF'i32, [0x0073'i32, 0x0073'i32, 0'i32], 2), # ß → ss
-    (0x0130'i32, [0x0069'i32, 0x0307'i32, 0'i32], 2), # İ → i + combining dot above
-    (0x0149'i32, [0x02BC'i32, 0x006E'i32, 0'i32], 2), # ŉ → ʼn
-    (0x01F0'i32, [0x006A'i32, 0x030C'i32, 0'i32], 2), # ǰ → j + combining caron
-    (0x0390'i32, [0x03B9'i32, 0x0308'i32, 0x0301'i32], 3), # ΐ → ι + ̈ + ́
-    (0x03B0'i32, [0x03C5'i32, 0x0308'i32, 0x0301'i32], 3), # ΰ → υ + ̈ + ́
-    (0x0587'i32, [0x0565'i32, 0x0582'i32, 0'i32], 2), # և → եւ
-    (0x1E96'i32, [0x0068'i32, 0x0331'i32, 0'i32], 2),
-      # ẖ → h + combining macron below
-    (0x1E97'i32, [0x0074'i32, 0x0308'i32, 0'i32], 2), # ẗ → t + combining diaeresis
-    (0x1E98'i32, [0x0077'i32, 0x030A'i32, 0'i32], 2), # ẘ → w + combining ring above
-    (0x1E99'i32, [0x0079'i32, 0x030A'i32, 0'i32], 2), # ẙ → y + combining ring above
-    (0x1E9E'i32, [0x0073'i32, 0x0073'i32, 0'i32], 2), # ẞ → ss
-    (0xFB00'i32, [0x0066'i32, 0x0066'i32, 0'i32], 2), # ﬀ → ff
-    (0xFB01'i32, [0x0066'i32, 0x0069'i32, 0'i32], 2), # ﬁ → fi
-    (0xFB02'i32, [0x0066'i32, 0x006C'i32, 0'i32], 2), # ﬂ → fl
-    (0xFB05'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬅ → st
-    (0xFB06'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬆ → st
-  ]
-
 const MaxCodePoint = 0x0010FFFF'i32
 
 proc isCodePoint*(r: Rune): bool {.inline.} =
@@ -1296,6 +1275,12 @@ proc unicodeTypes(r: Rune): int {.inline.} =
     udbTypes.unicodeTypes(r)
   else:
     0
+
+proc wordBreakProp(r: Rune): SgWord {.inline.} =
+  if r.isCodePoint:
+    segmentation.wordBreakProp(r)
+  else:
+    sgwOther
 
 proc simpleCaseFold(r: Rune): Rune {.inline.} =
   if r.isCodePoint:
@@ -1392,80 +1377,18 @@ proc simpleFold*(r: Rune): Rune =
   simpleCaseFold(r)
 
 proc getMultiCharFold*(r: Rune): RuneBuf =
-  ## Get multi-character case fold expansion for a character.
-  ## Returns len == 0 if no multi-char fold exists.
+  ## The multi-character case fold expansion of ``r``, or ``len == 0`` when it
+  ## has none.  Read straight out of [MultiCharFolds].
+  if not hasMultiCharFold(r):
+    return RuneBuf(runes: [Rune(0), Rune(0), Rune(0)], len: 0)
   let cp = int32(r)
-  case cp
-  of 0x00DF: # ß → ss
-    RuneBuf(runes: [Rune(0x0073), Rune(0x0073), Rune(0)], len: 2)
-  of 0x0130: # İ → i + dot above
-    RuneBuf(runes: [Rune(0x0069), Rune(0x0307), Rune(0)], len: 2)
-  of 0x01F0: # ǰ → j + combining caron
-    RuneBuf(runes: [Rune(0x006A), Rune(0x030C), Rune(0)], len: 2)
-  of 0x0390: # ΐ
-    RuneBuf(runes: [Rune(0x03B9), Rune(0x0308), Rune(0x0301)], len: 3)
-  of 0x03B0: # ΰ
-    RuneBuf(runes: [Rune(0x03C5), Rune(0x0308), Rune(0x0301)], len: 3)
-  of 0x0587: # և → եւ
-    RuneBuf(runes: [Rune(0x0565), Rune(0x0582), Rune(0)], len: 2)
-  of 0x1E96: # ẖ → h + combining macron below
-    RuneBuf(runes: [Rune(0x0068), Rune(0x0331), Rune(0)], len: 2)
-  of 0x1E97: # ẗ → t + diaeresis
-    RuneBuf(runes: [Rune(0x0074), Rune(0x0308), Rune(0)], len: 2)
-  of 0x1E98: # ẘ → w + ring above
-    RuneBuf(runes: [Rune(0x0077), Rune(0x030A), Rune(0)], len: 2)
-  of 0x1E99: # ẙ → y + ring above
-    RuneBuf(runes: [Rune(0x0079), Rune(0x030A), Rune(0)], len: 2)
-  of 0x1E9A: # ẚ → a + modifier letter right half ring
-    RuneBuf(runes: [Rune(0x0061), Rune(0x02BE), Rune(0)], len: 2)
-  of 0x1E9E: # ẞ → ss (capital sharp s)
-    RuneBuf(runes: [Rune(0x0073), Rune(0x0073), Rune(0)], len: 2)
-  of 0x1F50: # ὐ
-    RuneBuf(runes: [Rune(0x03C5), Rune(0x0313), Rune(0)], len: 2)
-  of 0xFB00: # ﬀ → ff
-    RuneBuf(runes: [Rune(0x0066), Rune(0x0066), Rune(0)], len: 2)
-  of 0xFB01: # ﬁ → fi
-    RuneBuf(runes: [Rune(0x0066), Rune(0x0069), Rune(0)], len: 2)
-  of 0xFB02: # ﬂ → fl
-    RuneBuf(runes: [Rune(0x0066), Rune(0x006C), Rune(0)], len: 2)
-  of 0xFB03: # ﬃ → ffi
-    RuneBuf(runes: [Rune(0x0066), Rune(0x0066), Rune(0x0069)], len: 3)
-  of 0xFB04: # ﬄ → ffl
-    RuneBuf(runes: [Rune(0x0066), Rune(0x0066), Rune(0x006C)], len: 3)
-  of 0xFB05: # ﬅ → st
-    RuneBuf(runes: [Rune(0x0073), Rune(0x0074), Rune(0)], len: 2)
-  of 0xFB06: # ﬆ → st
-    RuneBuf(runes: [Rune(0x0073), Rune(0x0074), Rune(0)], len: 2)
-  else:
-    RuneBuf(runes: [Rune(0), Rune(0), Rune(0)], len: 0)
-
-proc getReverseMultiCharFolds*(r1, r2: Rune): RuneBuf =
-  ## Given two consecutive characters, return characters that fold to this pair.
-  ## Used for matching subject "ss" against pattern "ß".
-  let cp1 = int32(r1)
-  let cp2 = int32(r2)
-  if cp1 == 0x0073 and cp2 == 0x0073: # ss → ß, ẞ
-    RuneBuf(runes: [Rune(0x00DF), Rune(0x1E9E), Rune(0)], len: 2)
-  elif cp1 == 0x0066 and cp2 == 0x0066: # ff → ﬀ
-    RuneBuf(runes: [Rune(0xFB00), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0066 and cp2 == 0x0069: # fi → ﬁ
-    RuneBuf(runes: [Rune(0xFB01), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0066 and cp2 == 0x006C: # fl → ﬂ
-    RuneBuf(runes: [Rune(0xFB02), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0073 and cp2 == 0x0074: # st → ﬅ, ﬆ
-    RuneBuf(runes: [Rune(0xFB05), Rune(0xFB06), Rune(0)], len: 2)
-  elif cp1 == 0x006A and cp2 == 0x030C: # j + caron → ǰ
-    RuneBuf(runes: [Rune(0x01F0), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0068 and cp2 == 0x0331: # h + macron below → ẖ
-    RuneBuf(runes: [Rune(0x1E96), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0074 and cp2 == 0x0308: # t + diaeresis → ẗ
-    RuneBuf(runes: [Rune(0x1E97), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0077 and cp2 == 0x030A: # w + ring → ẘ
-    RuneBuf(runes: [Rune(0x1E98), Rune(0), Rune(0)], len: 1)
-  elif cp1 == 0x0079 and cp2 == 0x030A: # y + ring → ẙ
-    RuneBuf(runes: [Rune(0x1E99), Rune(0), Rune(0)], len: 1)
-  else:
-    RuneBuf(runes: [Rune(0), Rune(0), Rune(0)], len: 0)
+  for f in MultiCharFolds:
+    if f.source == cp:
+      return RuneBuf(
+        runes: [Rune(f.expansion[0]), Rune(f.expansion[1]), Rune(f.expansion[2])],
+        len: f.len,
+      )
+  RuneBuf(runes: [Rune(0), Rune(0), Rune(0)], len: 0)
 
 proc posixAsciiOnly*(cls: PosixClassName, flags: RegexFlags): bool =
   ## Check if POSIX class should use ASCII-only matching based on flags.
@@ -2008,6 +1931,20 @@ proc graphemeBreakProp*(r: Rune): GcbProp =
     return gcbExtend
   gcbOther
 
+proc nextCharAt*(s: openArray[char], p: var int, r: var Rune) {.inline.} =
+  ## Decode the character at ``p`` and advance past it, under the same length
+  ## rule the matcher and the scan loops use.  A sequence truncated by the end
+  ## of ``s`` is not a character, so its lead byte stands for itself; the
+  ## segmentation algorithms below only need to keep making progress there.
+  var code: int32
+  var np: int
+  if decodeAt(s, p, code, np):
+    r = Rune(code)
+    p = np
+  else:
+    r = Rune(int32(s[p].uint8))
+    inc p
+
 proc isGraphemeBoundary*(subject: openArray[char], pos: int): bool =
   ## Determine if there is a grapheme cluster boundary at byte position `pos`
   ## in `subject`. Returns true at string boundaries and at grapheme breaks.
@@ -2015,16 +1952,12 @@ proc isGraphemeBoundary*(subject: openArray[char], pos: int): bool =
   if pos <= 0 or pos >= subject.len:
     return true
   # Decode the rune just before pos and at pos
-  var prevStart = pos - 1
-  while prevStart > 0 and (subject[prevStart].uint8 and 0xC0'u8) == 0x80'u8:
-    dec prevStart
-  var prevPos = prevStart
-  var prevRune: Rune
-  fastRuneAt(subject, prevPos, prevRune, true) # advances prevPos past the rune
+  var prevStart: int
+  let prevRune = Rune(prevCharAt(subject, pos, prevStart))
   var curPos = pos
   var curRune: Rune
   if curPos < subject.len:
-    fastRuneAt(subject, curPos, curRune, true)
+    nextCharAt(subject, curPos, curRune)
   else:
     return true
   let prev = graphemeBreakProp(prevRune)
@@ -2061,12 +1994,8 @@ proc isGraphemeBoundary*(subject: openArray[char], pos: int): bool =
     # Check that before the ZWJ there is ExtPict followed by zero or more Extends
     var scanPos = prevStart
     while scanPos > 0:
-      var sp = scanPos - 1
-      while sp > 0 and (subject[sp].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp
-      var r2: Rune
-      var sp2 = sp
-      fastRuneAt(subject, sp2, r2, true)
+      var sp: int
+      let r2 = Rune(prevCharAt(subject, scanPos, sp))
       let prop = graphemeBreakProp(r2)
       if prop == gcbExtend:
         scanPos = sp
@@ -2081,12 +2010,8 @@ proc isGraphemeBoundary*(subject: openArray[char], pos: int): bool =
     var riCount = 0
     var scanPos = prevStart
     while scanPos > 0:
-      var sp = scanPos - 1
-      while sp > 0 and (subject[sp].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp
-      var r2: Rune
-      var sp2 = sp
-      fastRuneAt(subject, sp2, r2, true)
+      var sp: int
+      let r2 = Rune(prevCharAt(subject, scanPos, sp))
       if graphemeBreakProp(r2) != gcbRegionalIndicator:
         break
       inc riCount
@@ -2105,12 +2030,12 @@ proc nextGraphemeClusterEnd*(subject: openArray[char], pos: int): int =
     return pos
   var p = pos
   var r: Rune
-  fastRuneAt(subject, p, r, true)
+  nextCharAt(subject, p, r)
   # Consume following characters that don't form a boundary
   while p < subject.len:
     if isGraphemeBoundary(subject, p):
       break
-    fastRuneAt(subject, p, r, true)
+    nextCharAt(subject, p, r)
   p
 
 const
@@ -2126,15 +2051,11 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
   if pos <= 0 or pos >= subject.len:
     return true
   # Decode runes before and at pos
-  var prevStart = pos - 1
-  while prevStart > 0 and (subject[prevStart].uint8 and 0xC0'u8) == 0x80'u8:
-    dec prevStart
-  var prevPos = prevStart
-  var prevRune: Rune
-  fastRuneAt(subject, prevPos, prevRune, true) # advances prevPos
+  var prevStart: int
+  let prevRune = Rune(prevCharAt(subject, pos, prevStart))
   var curPos = pos
   var curRune: Rune
-  fastRuneAt(subject, curPos, curRune, true)
+  nextCharAt(subject, curPos, curRune)
   let prev = wordBreakProp(prevRune)
   let cur = wordBreakProp(curRune)
   # WB3: Do not break between CR and LF
@@ -2162,12 +2083,8 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
   if effPrev in {sgwExtend, sgwFormat, sgwZwj}:
     var sp = prevStart
     while sp > 0:
-      var sp2 = sp - 1
-      while sp2 > 0 and (subject[sp2].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp2
-      var r2: Rune
-      var sp3 = sp2
-      fastRuneAt(subject, sp3, r2, true)
+      var sp2: int
+      let r2 = Rune(prevCharAt(subject, sp, sp2))
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         effPrev = p2
@@ -2189,7 +2106,7 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
     while np < subject.len:
       var r2: Rune
       var np2 = np
-      fastRuneAt(subject, np2, r2, true)
+      nextCharAt(subject, np2, r2)
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 in AHLetterProps:
@@ -2201,12 +2118,8 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
     # Look back further: is the char before effPrev an AHLetter?
     var sp = effPrevStart
     while sp > 0:
-      var sp2 = sp - 1
-      while sp2 > 0 and (subject[sp2].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp2
-      var r2: Rune
-      var sp3 = sp2
-      fastRuneAt(subject, sp3, r2, true)
+      var sp2: int
+      let r2 = Rune(prevCharAt(subject, sp, sp2))
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 in AHLetterProps:
@@ -2222,7 +2135,7 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
     while np < subject.len:
       var r2: Rune
       var np2 = np
-      fastRuneAt(subject, np2, r2, true)
+      nextCharAt(subject, np2, r2)
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 == sgwHebrewLetter:
@@ -2233,12 +2146,8 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
   if cur == sgwHebrewLetter and effPrev == sgwDoubleQuote:
     var sp = effPrevStart
     while sp > 0:
-      var sp2 = sp - 1
-      while sp2 > 0 and (subject[sp2].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp2
-      var r2: Rune
-      var sp3 = sp2
-      fastRuneAt(subject, sp3, r2, true)
+      var sp2: int
+      let r2 = Rune(prevCharAt(subject, sp, sp2))
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 == sgwHebrewLetter:
@@ -2258,12 +2167,8 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
   if cur == sgwNumeric and effPrev in {sgwMidNum, sgwMidNumLet, sgwSingleQuote}:
     var sp = effPrevStart
     while sp > 0:
-      var sp2 = sp - 1
-      while sp2 > 0 and (subject[sp2].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp2
-      var r2: Rune
-      var sp3 = sp2
-      fastRuneAt(subject, sp3, r2, true)
+      var sp2: int
+      let r2 = Rune(prevCharAt(subject, sp, sp2))
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 == sgwNumeric:
@@ -2276,7 +2181,7 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
     while np < subject.len:
       var r2: Rune
       var np2 = np
-      fastRuneAt(subject, np2, r2, true)
+      nextCharAt(subject, np2, r2)
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 == sgwNumeric:
@@ -2298,12 +2203,8 @@ proc isWordBoundaryUax29*(subject: openArray[char], pos: int): bool =
     var riCount = 0
     var sp = effPrevStart
     while sp > 0:
-      var sp2 = sp - 1
-      while sp2 > 0 and (subject[sp2].uint8 and 0xC0'u8) == 0x80'u8:
-        dec sp2
-      var r2: Rune
-      var sp3 = sp2
-      fastRuneAt(subject, sp3, r2, true)
+      var sp2: int
+      let r2 = Rune(prevCharAt(subject, sp, sp2))
       let p2 = wordBreakProp(r2)
       if p2 notin {sgwExtend, sgwFormat, sgwZwj}:
         if p2 != sgwRegionalIndicator:
@@ -2326,9 +2227,9 @@ proc nextWordSegmentEnd*(subject: openArray[char], pos: int): int =
     return pos
   var p = pos
   var r: Rune
-  fastRuneAt(subject, p, r, true)
+  nextCharAt(subject, p, r)
   while p < subject.len:
     if isWordBoundaryUax29(subject, p):
       break
-    fastRuneAt(subject, p, r, true)
+    nextCharAt(subject, p, r)
   return p

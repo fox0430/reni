@@ -165,6 +165,13 @@ type
       interRight*: seq[CcAtom]
       interRightNeg*: bool
 
+  LenBounds* = object
+    ## How much subject one AST node can consume, in bytes.  Both answers come
+    ## from one walk of [lengthBounds] so they cannot disagree about the same
+    ## facts — a case fold spanning two pattern characters, above all.
+    maxLen*: int ## Upper bound on the bytes consumed; -1 when unbounded or unknown.
+    fixedLen*: int ## The single length every match consumes; -1 when it varies.
+
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
     ## parsed trees; node kinds may change at any time without notice.
@@ -258,6 +265,16 @@ type
     of nkLookaround:
       lookKind*: LookaroundKind
       lookBody*: Node
+      lookBounds*: LenBounds
+        ## [lengthBounds] of ``lookBody`` (and of each alternative, in
+        ## ``lookAltBounds``), so a lookbehind need not rewalk the body's tree
+        ## at every position.  Filled in by ``annotateLookaroundBounds``; only
+        ## usable while ``lookBoundsFlags`` matches the flags in force, since a
+        ## subexpression call can reach the same lookaround under others.
+      lookAltBounds*: seq[LenBounds]
+      lookBoundsFlags*: RegexFlags
+      lookBoundsGm*: GraphemeMode
+      lookBoundsValid*: bool
     of nkAtomicGroup:
       atomicBody*: Node
     of nkConditional:
@@ -292,6 +309,7 @@ type
     fcByte ## pattern must start with this exact byte (ASCII, case-sensitive)
     fcByteSet ## pattern must start with one of these bytes
     fcAnchorStart ## pattern is anchored with \A — only try pos 0
+    fcLineStart ## pattern starts with ^ — only try line beginnings
 
   FirstCharInfo* = object
     case kind*: FirstCharKind
@@ -299,7 +317,7 @@ type
       byte*: uint8
     of fcByteSet:
       bytes*: set[uint8]
-    of fcNone, fcAnchorStart:
+    of fcNone, fcAnchorStart, fcLineStart:
       discard
 
 const
@@ -351,6 +369,181 @@ proc buildAsciiClassTable(): array[128, uint16] =
 
 const AsciiClassTable* = buildAsciiClassTable()
 
+proc asciiBytes(bits: uint16, present: bool): set[uint8] =
+  ## The ASCII bytes whose class bits do (or do not) intersect ``bits``.
+  for c in 0 .. 127:
+    if ((AsciiClassTable[c] and bits) != 0) == present:
+      result.incl(uint8(c))
+
+const
+  AllAsciiBytes* = {0'u8 .. 127'u8}
+  NonAsciiBytes* = {0x80'u8 .. 0xFF'u8}
+    ## Every byte a character above U+007F can start with.  A byte that
+    ## begins no well-formed sequence still stands for a character of its
+    ## own (``encLen`` gives it length 1), so none of these may be skipped.
+  WordAsciiBytes* = asciiBytes(acWord, true)
+  NotWordAsciiBytes* = asciiBytes(acWord, false)
+  DigitAsciiBytes* = asciiBytes(acDigit, true)
+  NotDigitAsciiBytes* = asciiBytes(acDigit, false)
+  SpaceAsciiBytes* = asciiBytes(acSpace, true)
+  NotSpaceAsciiBytes* = asciiBytes(acSpace, false)
+  ClassLeadBytes* = {0xC2'u8 .. 0xF4'u8}
+    ## Lead bytes of a character that can match a *positive* class member.
+    ## Such a member is either below U+0080, and then only a one-byte
+    ## character reaches it, or above, and then only a multi-byte one does
+    ## (``codeIsClassifiable``).  ``0xC0``/``0xC1`` are excluded because the
+    ## most they can decode to is U+007F, and ``0xF5`` and up are one-byte
+    ## characters above U+007F, which reach neither container.
+  XdigitAsciiBytes* = asciiBytes(acXdigit, true)
+  NotXdigitAsciiBytes* = asciiBytes(acXdigit, false)
+
+## Character decoding, following Oniguruma's UTF-8 encoding module.
+##
+## Oniguruma reads the length of a character straight out of a table indexed
+## by the lead byte and never checks that the bytes after it are continuation
+## bytes.  A subject is therefore never rejected as malformed; it is simply
+## cut into characters at the offsets that table dictates, and the code point
+## is the naive OR of the low bits.  Everything downstream — the matcher, the
+## scan loops, the first-byte hints — is defined in terms of these two procs
+## so the definitions cannot drift apart.
+
+const EncLenTable: array[256, uint8] = block:
+  var t: array[256, uint8]
+  for b in 0 .. 255:
+    t[b] =
+      if b < 0xC0:
+        1'u8 # ASCII, and every byte that leads nothing
+      elif b < 0xE0:
+        2'u8
+      elif b < 0xF0:
+        3'u8
+      elif b < 0xF5:
+        4'u8
+      else:
+        1'u8 # 0xF5..0xFF lead nothing
+  # 0xF4 still leads four bytes, and the naive OR below carries a continuation
+  # byte of 0x90 or more past U+10FFFF; every table lookup is guarded for it.
+  t
+
+const MaxCharByteLen* = 4 ## The longest character ``encLen`` yields.
+
+proc encLen*(b: uint8): int {.inline.} =
+  ## Bytes the character starting with lead byte ``b`` occupies.  A byte that
+  ## begins no well-formed sequence — a stray continuation byte, ``0xF5`` and
+  ## up — is a one-byte character of its own.
+  int(EncLenTable[b])
+
+proc decodeAt*(
+    s: openArray[char], p: int, code: var int32, next: var int
+): bool {.inline.} =
+  ## Decode the character at ``p``.  Returns false — and leaves ``code`` and
+  ## ``next`` untouched — when the length the lead byte declares runs past the
+  ## end of ``s``: a truncated sequence is not a character at all, and every
+  ## operation that consumes one fails there.
+  let n = encLen(s[p].uint8)
+  if p + n > s.len:
+    return false
+  next = p + n
+  case n
+  of 1:
+    code = int32(s[p].uint8)
+  of 2:
+    code = (int32(s[p].uint8 and 0x1F'u8) shl 6) or int32(s[p + 1].uint8 and 0x3F'u8)
+  of 3:
+    code =
+      (int32(s[p].uint8 and 0x0F'u8) shl 12) or (
+        int32(s[p + 1].uint8 and 0x3F'u8) shl 6
+      ) or int32(s[p + 2].uint8 and 0x3F'u8)
+  else:
+    code =
+      (int32(s[p].uint8 and 0x07'u8) shl 18) or
+      (int32(s[p + 1].uint8 and 0x3F'u8) shl 12) or
+      (int32(s[p + 2].uint8 and 0x3F'u8) shl 6) or int32(s[p + 3].uint8 and 0x3F'u8)
+  true
+
+proc utf8Encode*(code: int32, buf: var array[4, char]): int {.inline.} =
+  ## Encode a pattern code point into ``buf``, returning its length.  Used to
+  ## compare a literal against the subject byte for byte, the way Oniguruma
+  ## does: a literal carries the bytes it was written with, so an overlong
+  ## encoding of the same code point is a different string and does not match.
+  if code < 0x80:
+    buf[0] = char(code)
+    1
+  elif code < 0x800:
+    buf[0] = char(0xC0 or (code shr 6))
+    buf[1] = char(0x80 or (code and 0x3F))
+    2
+  elif code < 0x10000:
+    buf[0] = char(0xE0 or (code shr 12))
+    buf[1] = char(0x80 or ((code shr 6) and 0x3F))
+    buf[2] = char(0x80 or (code and 0x3F))
+    3
+  else:
+    buf[0] = char(0xF0 or (code shr 18))
+    buf[1] = char(0x80 or ((code shr 12) and 0x3F))
+    buf[2] = char(0x80 or ((code shr 6) and 0x3F))
+    buf[3] = char(0x80 or (code and 0x3F))
+    4
+
+proc prevCharStart*(s: openArray[char], pos: int): int {.inline.} =
+  ## The start of the character ending just before ``pos``.  ``pos`` must be
+  ## in ``1 .. s.len``.
+  ##
+  ## The place the engine steps back over a character: word boundaries,
+  ## lookbehind start candidates and the absent operator all go through it,
+  ## so they answer the same question the same way.  It walks back over
+  ## continuation bytes and then checks that the character found there
+  ## really does end at ``pos``; when it does not, the byte before ``pos``
+  ## is covered by nothing and stands for itself.
+  ##
+  ## This is Oniguruma's ``left_adjust_char_head``, and like it the result
+  ## is *not* guaranteed to lie on the forward ``encLen`` chain from offset
+  ## 0.  Only the one candidate the continuation-byte walk lands on is
+  ## checked, so on malformed input a byte that the forward walk would have
+  ## swallowed as part of an earlier character can be validated instead: in
+  ## ``"\xC0\xC3\xA9"`` the forward chain runs 0 -> 2 -> 3, yet
+  ## ``prevCharStart(s, 3)`` answers 1, because ``1 + encLen(0xC3) == 3``.
+  ## Callers get Oniguruma's answer, not the chain predecessor; nothing here
+  ## may be relied on to agree with a forward scan over invalid bytes.
+  var q = pos - 1
+  let lo = max(0, pos - MaxCharByteLen)
+  while q > lo and (s[q].uint8 and 0xC0'u8) == 0x80'u8:
+    dec q
+  if q + encLen(s[q].uint8) == pos:
+    q
+  else:
+    pos - 1
+
+proc prevCharAt*(s: openArray[char], pos: int, start: var int): int32 {.inline.} =
+  ## The code point of the character ending just before ``pos``, with its
+  ## start offset left in ``start``.  ``pos`` must be in ``1 .. s.len``.
+  ##
+  ## The read-back companion to `prevCharStart`, and the single place a
+  ## backward step turns bytes into a character: word boundaries, the
+  ## segmentation algorithms and the absent operator all go through it.  The
+  ## decoded character is accepted only when it ends exactly at ``pos``; a
+  ## lead byte whose sequence would run past ``pos`` is one of the bytes
+  ## `prevCharStart` reports as covered by nothing, and stands for itself.
+  start = prevCharStart(s, pos)
+  var code: int32
+  var next: int
+  if decodeAt(s, start, code, next) and next == pos:
+    return code
+  int32(s[start].uint8)
+
+proc codeIsClassifiable*(code: int32, byteLen: int): bool {.inline.} =
+  ## Whether a character reaches the container a class would look it up in.
+  ##
+  ## A compiled class keeps its members below U+0080 in a byte set and the
+  ## rest in a code-point range list, and picks the container by the
+  ## character's *encoded length*, not by its value.  A one-byte character is
+  ## looked up in the byte set, where nothing above 0x7F is ever recorded; a
+  ## longer one is looked up in the range list, which holds nothing below
+  ## U+0080.  So a stray ``0x80`` byte and an overlong ``"\xC0\xB1"`` both
+  ## land in a container that cannot hold them and match no class member —
+  ## before negation, which still applies.
+  (byteLen == 1) == (code < 0x80)
+
 proc asciiHas*(c: int32, bits: uint16): bool {.inline.} =
   ## Range-checked table lookup.  The guard lives here rather than at the call
   ## sites so a caller that forgets it cannot read out of bounds under
@@ -372,7 +565,14 @@ type
     groupBodies: seq[Node]
     groupFlags*: seq[RegexFlags] ## flags active when each group was defined
     firstCharInfo: FirstCharInfo
+    literalScan: bool
     requiredByte: RequiredByteInfo
+    semiEndAnchored: bool
+      ## Every match ends at ``\Z``, so the scan may jump straight to it.
+    semiEndDMax: int
+      ## Upper bound on the bytes a match consumes, or -1 when unbounded.
+      ## Oniguruma's ``anchor_dmax``: how far left of the anchor a match may
+      ## still start.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -417,6 +617,15 @@ proc firstCharInfo*(r: Regex): FirstCharInfo {.inline.} =
 proc requiredByte*(r: Regex): RequiredByteInfo {.inline.} =
   r.requiredByte
 
+proc literalScan*(r: Regex): bool {.inline.} =
+  r.literalScan
+
+proc semiEndAnchored*(r: Regex): bool {.inline.} =
+  r.semiEndAnchored
+
+proc semiEndDMax*(r: Regex): int {.inline.} =
+  r.semiEndDMax
+
 proc initRegex*(
     pattern: string,
     ast: Node,
@@ -426,7 +635,10 @@ proc initRegex*(
     groupBodies: seq[Node],
     groupFlags: seq[RegexFlags],
     firstCharInfo: FirstCharInfo,
+    literalScan: bool = false,
     requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
+    semiEndAnchored: bool = false,
+    semiEndDMax: int = -1,
 ): Regex =
   Regex(
     pattern: pattern,
@@ -437,7 +649,10 @@ proc initRegex*(
     groupBodies: groupBodies,
     groupFlags: groupFlags,
     firstCharInfo: firstCharInfo,
+    literalScan: literalScan,
     requiredByte: requiredByte,
+    semiEndAnchored: semiEndAnchored,
+    semiEndDMax: semiEndDMax,
   )
 
 proc span*(a, b: int): Span {.inline.} =
@@ -515,10 +730,12 @@ proc mergeFirstChar(a, b: FirstCharInfo): FirstCharInfo =
   ## Merge two FirstCharInfo for alternation (union of acceptable bytes).
   if a.kind == fcNone or b.kind == fcNone:
     return FirstCharInfo(kind: fcNone)
-  if a.kind == fcAnchorStart and b.kind == fcAnchorStart:
-    return FirstCharInfo(kind: fcAnchorStart)
-  if a.kind == fcAnchorStart or b.kind == fcAnchorStart:
-    return FirstCharInfo(kind: fcNone)
+  if a.kind in {fcAnchorStart, fcLineStart} or b.kind in {fcAnchorStart, fcLineStart}:
+    return
+      if a.kind == b.kind:
+        FirstCharInfo(kind: a.kind)
+      else:
+        FirstCharInfo(kind: fcNone)
   # Both are fcByte or fcByteSet
   let merged = a.toByteSet + b.toByteSet
   if merged.card == 1:
@@ -547,31 +764,95 @@ proc hasNonAsciiFoldEquiv(cp: int32): bool =
       cp
   lower == ord('s') or lower == ord('k') # ſ (U+017F) ↔ s, K (U+212A) ↔ k
 
-proc isMultiCharFoldPairStart(r1, r2: Rune): bool =
-  ## Check if two consecutive runes form a pair that is the expansion of
-  ## a multi-character case fold source (e.g., ss ← ß, st ← ﬆ).
-  let c1 = int32(r1)
-  let c2 = int32(r2)
-  let lc1 =
-    if c1 >= ord('A') and c1 <= ord('Z'):
-      c1 + 32
-    else:
-      c1
-  let lc2 =
-    if c2 >= ord('A') and c2 <= ord('Z'):
-      c2 + 32
-    else:
-      c2
-  (lc1 == 0x73 and lc2 == 0x73) or # ss → ß, ẞ
-  (lc1 == 0x73 and lc2 == 0x74) or # st → ﬅ, ﬆ
-  (lc1 == 0x66 and lc2 == 0x66) or # ff → ﬀ
-  (lc1 == 0x66 and lc2 == 0x69) or # fi → ﬁ
-  (lc1 == 0x66 and lc2 == 0x6C) or # fl → ﬂ
-  (lc1 == 0x6A and c2 == 0x030C) or # j+caron → ǰ
-  (lc1 == 0x68 and c2 == 0x0331) or # h+macron → ẖ
-  (lc1 == 0x74 and c2 == 0x0308) or # t+diaeresis → ẗ
-  (lc1 == 0x77 and c2 == 0x030A) or # w+ring → ẘ
-  (lc1 == 0x79 and c2 == 0x030A) # y+ring → ẙ
+const MultiCharFolds*:
+  array[21, tuple[source: int32, expansion: array[3, int32], len: int]] = [
+  ## Every character whose case fold is more than one character, and what it
+  ## folds to.  Single source of truth: the fold lookups and the length
+  ## analysis below are all derived from it, so none of them can drift.
+  (0x00DF'i32, [0x0073'i32, 0x0073'i32, 0'i32], 2), # ß → ss
+  (0x0130'i32, [0x0069'i32, 0x0307'i32, 0'i32], 2), # İ → i + combining dot above
+  (0x0149'i32, [0x02BC'i32, 0x006E'i32, 0'i32], 2), # ŉ → ʼn
+  (0x01F0'i32, [0x006A'i32, 0x030C'i32, 0'i32], 2), # ǰ → j + combining caron
+  (0x0390'i32, [0x03B9'i32, 0x0308'i32, 0x0301'i32], 3), # ΐ → ι + ̈ + ́
+  (0x03B0'i32, [0x03C5'i32, 0x0308'i32, 0x0301'i32], 3), # ΰ → υ + ̈ + ́
+  (0x0587'i32, [0x0565'i32, 0x0582'i32, 0'i32], 2), # և → եւ
+  (0x1E96'i32, [0x0068'i32, 0x0331'i32, 0'i32], 2), # ẖ → h + macron below
+  (0x1E97'i32, [0x0074'i32, 0x0308'i32, 0'i32], 2), # ẗ → t + diaeresis
+  (0x1E98'i32, [0x0077'i32, 0x030A'i32, 0'i32], 2), # ẘ → w + ring above
+  (0x1E99'i32, [0x0079'i32, 0x030A'i32, 0'i32], 2), # ẙ → y + ring above
+  (0x1E9A'i32, [0x0061'i32, 0x02BE'i32, 0'i32], 2), # ẚ → a + right half ring
+  (0x1E9E'i32, [0x0073'i32, 0x0073'i32, 0'i32], 2), # ẞ → ss
+  (0x1F50'i32, [0x03C5'i32, 0x0313'i32, 0'i32], 2), # ὐ → υ + comma above
+  (0xFB00'i32, [0x0066'i32, 0x0066'i32, 0'i32], 2), # ﬀ → ff
+  (0xFB01'i32, [0x0066'i32, 0x0069'i32, 0'i32], 2), # ﬁ → fi
+  (0xFB02'i32, [0x0066'i32, 0x006C'i32, 0'i32], 2), # ﬂ → fl
+  (0xFB03'i32, [0x0066'i32, 0x0066'i32, 0x0069'i32], 3), # ﬃ → ffi
+  (0xFB04'i32, [0x0066'i32, 0x0066'i32, 0x006C'i32], 3), # ﬄ → ffl
+  (0xFB05'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬅ → st
+  (0xFB06'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬆ → st
+]
+
+const MultiCharFoldStarts* = block:
+  ## The code points a fold expansion can begin with.  Hot-path lookups reject
+  ## through this first: one set test instead of a walk of the table.
+  var cps: set[uint16]
+  for f in MultiCharFolds:
+    cps.incl(uint16(f.expansion[0]))
+  cps
+
+const MultiCharFoldSources* = block:
+  ## The characters that have a multi-character fold at all.  Same purpose as
+  ## [MultiCharFoldStarts], for the forward direction.
+  var cps: set[uint16]
+  for f in MultiCharFolds:
+    cps.incl(uint16(f.source))
+  cps
+
+proc hasMultiCharFold*(r: Rune): bool {.inline.} =
+  ## Whether ``r`` folds to more than one character.
+  let cp = int32(r)
+  cp >= 0 and cp <= 0xFFFF and uint16(cp) in MultiCharFoldSources
+
+proc canStartFoldExpansion*(r: Rune): bool {.inline.} =
+  ## Whether a multi-character fold expansion can begin with ``r``.
+  let cp = int32(r)
+  cp >= 0 and cp <= 0xFFFF and uint16(cp) in MultiCharFoldStarts
+
+func asciiLowerCp(cp: int32): int32 {.inline.} =
+  if cp >= ord('A') and cp <= ord('Z'):
+    cp + 32
+  else:
+    cp
+
+proc isMultiCharFoldPairStart*(r1, r2: Rune): bool =
+  ## Whether ``r1`` and ``r2``, in that order, start some multi-character fold
+  ## expansion — so one subject character can match them both (``ss`` ← ß).
+  let c1 = asciiLowerCp(int32(r1))
+  let c2 = asciiLowerCp(int32(r2))
+  # Reject the common character with one set test instead of a table walk.
+  if not canStartFoldExpansion(Rune(c1)):
+    return false
+  for f in MultiCharFolds:
+    if f.expansion[0] == c1 and f.expansion[1] == c2:
+      return true
+  false
+
+const WidestUsefulHint = 200
+  ## Above this many bytes a hint skips too little to pay for the test it
+  ## costs at every position, so the scan is better off with no prefilter.
+
+proc byteSetInfo(bs: set[uint8]): FirstCharInfo =
+  if bs.card == 0:
+    FirstCharInfo(kind: fcNone)
+  elif bs.card > WidestUsefulHint:
+    FirstCharInfo(kind: fcNone)
+  elif bs.card == 1:
+    var b: uint8
+    for v in bs:
+      b = v
+    FirstCharInfo(kind: fcByte, byte: b)
+  else:
+    FirstCharInfo(kind: fcByteSet, bytes: bs)
 
 proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
   ## Build a FirstCharInfo from a code point, handling both ASCII and non-ASCII.
@@ -580,19 +861,198 @@ proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
     if rfIgnoreCase in flags:
       if hasNonAsciiFoldEquiv(cp):
         return FirstCharInfo(kind: fcNone)
-      let bs = asciiFoldBytes(b)
-      if bs.card == 1:
-        FirstCharInfo(kind: fcByte, byte: b)
-      else:
-        FirstCharInfo(kind: fcByteSet, bytes: bs)
+      byteSetInfo(asciiFoldBytes(b))
     else:
-      FirstCharInfo(kind: fcByte, byte: b)
+      byteSetInfo({b})
   elif rfIgnoreCase in flags:
     # Case-insensitive non-ASCII: skip optimization (fold targets may differ)
     FirstCharInfo(kind: fcNone)
   else:
     # Non-ASCII case-sensitive: use the UTF-8 lead byte for fast skip
-    FirstCharInfo(kind: fcByte, byte: utf8LeadByte(cp))
+    byteSetInfo({utf8LeadByte(cp)})
+
+proc charTypeBytes(ct: CharTypeKind): set[uint8] =
+  ## Bytes a character type can start with, or ``{}`` when it can start
+  ## with anything.  Always the widest (Unicode) reading: the ASCII-only
+  ## flags can be switched on at match time and only ever shrink the set, so
+  ## a superset stays sound.
+  case ct
+  of ctWord:
+    # ``\w`` and ``\W`` test the decoded code point directly instead of
+    # going through a class's containers, so a one-byte character above
+    # U+007F reaches them: U+00FE is a letter, and the byte 0xFE is it.
+    WordAsciiBytes + NonAsciiBytes
+  of ctNotWord:
+    NotWordAsciiBytes + NonAsciiBytes
+  of ctDigit:
+    DigitAsciiBytes + ClassLeadBytes
+  of ctNotDigit:
+    NotDigitAsciiBytes + NonAsciiBytes
+  of ctSpace:
+    SpaceAsciiBytes + ClassLeadBytes
+  of ctNotSpace:
+    NotSpaceAsciiBytes + NonAsciiBytes
+  of ctHexDigit:
+    # Every hex digit is below U+0080, and only a one-byte character is
+    # looked up against those, so no lead byte can start one.
+    XdigitAsciiBytes
+  of ctNotHexDigit:
+    NotXdigitAsciiBytes + NonAsciiBytes
+  of ctNotNewline:
+    (AllAsciiBytes - {0x0A'u8}) + NonAsciiBytes
+  of ctNewlineSeq:
+    # U+0085 and U+2028/U+2029 are also line separators, and a malformed byte
+    # can decode straight to one of them.
+    {0x0A'u8, 0x0B'u8, 0x0C'u8, 0x0D'u8} + NonAsciiBytes
+  of ctDot, ctAnyChar, ctGraphemeCluster:
+    {} # `.` follows (?m) at match time, the other two match anything
+
+proc posixBytes(cls: PosixClassName): set[uint8] =
+  ## ASCII members of a POSIX class.  ``matchPosixClass`` agrees with the
+  ## table below U+0080 whatever the ASCII-restriction flags say.
+  case cls
+  of pcAlnum:
+    asciiBytes(acAlnum, true)
+  of pcAlpha:
+    asciiBytes(acAlpha, true)
+  of pcAscii:
+    AllAsciiBytes
+  of pcBlank:
+    asciiBytes(acBlank, true)
+  of pcCntrl:
+    asciiBytes(acCntrl, true)
+  of pcDigit:
+    DigitAsciiBytes
+  of pcGraph:
+    asciiBytes(acGraph, true)
+  of pcLower:
+    asciiBytes(acLower, true)
+  of pcPrint:
+    asciiBytes(acPrint, true)
+  of pcPunct:
+    asciiBytes(acPunct, true)
+  of pcSpace:
+    SpaceAsciiBytes
+  of pcUpper:
+    asciiBytes(acUpper, true)
+  of pcXdigit:
+    XdigitAsciiBytes
+  of pcWord:
+    WordAsciiBytes
+
+const
+  SKFoldBytes = {uint8('s'), uint8('S'), uint8('k'), uint8('K')}
+    ## The only ASCII letters a non-ASCII rune folds to: ſ (U+017F) → s and
+    ## K (U+212A) → k.
+  MultiCharFoldLeadBytes = block:
+    ## First letters of the multi-character case-fold expansions (ß → "ss",
+    ## ﬁ → "fi", ẘ → "w"+ring, …), derived from [MultiCharFolds].  Under (?i) a
+    ## bracket class holding the source rune matches the expansion, so the
+    ## subject can start with any of these.
+    var bs: set[uint8]
+    for f in MultiCharFolds:
+      let cp = f.expansion[0]
+      if cp < 0x80:
+        bs.incl(uint8(cp))
+        if cp >= ord('a') and cp <= ord('z'):
+          bs.incl(uint8(cp - 32))
+    bs
+
+proc classAsciiMatches*(
+    node: Node, ascii: var set[uint8], nonAscii, predicate: var bool
+): bool =
+  ## Compute the ASCII bytes the class's atoms match *without* case folding,
+  ## whether it can reach beyond ASCII, and whether it uses a predicate atom
+  ## (``\w`` / POSIX).  Below U+0080 the atoms read the same whatever the
+  ## ASCII-restriction flags say, so the byte set is exact — which is what
+  ## lets a negated class complement it and the matcher use it directly.
+  ## Returns false when an atom is out of reach (``\p{...}``, nesting,
+  ## intersection).
+  ascii = {}
+  nonAscii = false
+  predicate = false
+  for atom in node.atoms:
+    case atom.kind
+    of ccLiteral:
+      let cp = int32(atom.rune)
+      if cp < 128:
+        ascii.incl(uint8(cp))
+      else:
+        nonAscii = true
+    of ccRange:
+      let lo = int32(atom.rangeFrom)
+      let hi = int32(atom.rangeTo)
+      if hi >= 128:
+        nonAscii = true
+      # A range written across the ASCII boundary fills the byte container up
+      # to 0xFF, not to 0x7F, so ``[a-ÿ]`` accepts a stray ``0xFF`` byte.
+      let top =
+        if lo < 128:
+          min(hi, 255)
+        else:
+          min(hi, 127)
+      for c in max(lo, 0) .. top:
+        ascii.incl(uint8(c))
+    of ccCharType:
+      predicate = true
+      case atom.charType
+      of ctDot, ctAnyChar, ctGraphemeCluster:
+        # These accept anything, so no byte set describes them.  Returning
+        # false is the only safe answer: ``ascii`` is an *under*-approximation
+        # that the negated branch complements, and widening it here would make
+        # ``[^.]`` claim it cannot start with an ASCII byte.
+        return false
+      else:
+        let bs = charTypeBytes(atom.charType)
+        ascii = ascii + (bs * AllAsciiBytes)
+        if (bs - AllAsciiBytes).card > 0:
+          nonAscii = true
+    of ccPosix:
+      ascii = ascii + posixBytes(atom.posixClass)
+      nonAscii = true # POSIX classes are Unicode-aware outside ASCII
+      predicate = true
+    of ccNegPosix:
+      ascii = ascii + (AllAsciiBytes - posixBytes(atom.posixClass))
+      nonAscii = true
+      predicate = true
+    else:
+      return false
+  true
+
+proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
+  ## Lead bytes a character class can start with — always a superset of the
+  ## truth, so the scan never skips a position the class could match.
+  var matched: set[uint8]
+  var nonAscii, predicate: bool
+  if not classAsciiMatches(node, matched, nonAscii, predicate):
+    return FirstCharInfo(kind: fcNone)
+  if node.negated:
+    # ``matched`` is exact below U+0080 and case folding only ever adds to
+    # it, so its complement is a superset of what the negated class accepts.
+    # Every byte above 0x7F stays in: a one-byte character above U+007F
+    # reaches no container, so it misses every member and the negation lets
+    # it through.
+    return byteSetInfo((AllAsciiBytes - matched) + NonAsciiBytes)
+  var ascii = matched
+  if rfIgnoreCase in flags:
+    if predicate or nonAscii:
+      # A fold variant of an ASCII byte can satisfy a predicate the byte
+      # itself does not ((?iW:[[:^word:]]) matching "s" through ſ), and a
+      # non-ASCII member can expand to arbitrary ASCII.  Give up.
+      return FirstCharInfo(kind: fcNone)
+    for b in matched:
+      ascii = ascii + asciiFoldBytes(b)
+    ascii = ascii + SKFoldBytes
+    if node.bracketClass:
+      ascii = ascii + MultiCharFoldLeadBytes
+    # ſ and K are the only characters above U+007F that fold onto an ASCII
+    # member, and both are multi-byte.
+    return byteSetInfo(ascii + ClassLeadBytes)
+  if nonAscii:
+    ascii = ascii + ClassLeadBytes
+  # Every member is ASCII, and only a one-byte character is looked up against
+  # them (``codeIsClassifiable``), so the ASCII set is the whole hint.
+  byteSetInfo(ascii)
 
 proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
   ## Extract optimization hint about the first character/anchor of a pattern.
@@ -600,9 +1060,13 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
     return FirstCharInfo(kind: fcNone)
   case node.kind
   of nkAnchor:
-    if node.anchor == akStringBegin:
-      return FirstCharInfo(kind: fcAnchorStart)
-    FirstCharInfo(kind: fcNone)
+    case node.anchor
+    of akStringBegin:
+      FirstCharInfo(kind: fcAnchorStart)
+    of akLineBegin:
+      FirstCharInfo(kind: fcLineStart)
+    else:
+      FirstCharInfo(kind: fcNone)
   of nkLiteral:
     firstCharFromRune(int32(node.rune), flags)
   of nkEscapedLiteral:
@@ -618,12 +1082,24 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
       FirstCharInfo(kind: fcNone)
   of nkConcat:
     var currentFlags = flags
+    var lineStart = false
     for child in node.children:
       # Accumulate flags from bare flag groups (e.g., (?i) sets case-insensitive)
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
         continue
       let info = extractFirstChar(child, currentFlags)
+      if info.kind == fcLineStart:
+        # ``^`` is zero-width: remember it, but keep looking for a byte hint,
+        # which skips over more of the subject than jumping line to line.
+        # Only a bare anchor is safe to look past.  A subtree such as
+        # ``(^a*)`` also reports ``fcLineStart`` yet can consume input, so the
+        # next child's byte is not the pattern's first byte and using it as a
+        # scan hint would skip valid start positions.
+        lineStart = true
+        if child.kind == nkAnchor:
+          continue
+        break
       if info.kind != fcNone:
         return info
       # Zero-width nodes: skip and try the next child
@@ -631,7 +1107,10 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
           {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
         continue
       break # Non-zero-width node that returned fcNone: give up
-    FirstCharInfo(kind: fcNone)
+    if lineStart:
+      FirstCharInfo(kind: fcLineStart)
+    else:
+      FirstCharInfo(kind: fcNone)
   of nkCapture:
     extractFirstChar(node.captureBody, flags)
   of nkNamedCapture:
@@ -661,44 +1140,71 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
     merged
   of nkAtomicGroup:
     extractFirstChar(node.atomicBody, flags)
+  of nkCharType:
+    byteSetInfo(charTypeBytes(node.charType))
   of nkCharClass:
-    if node.negated or not node.bracketClass:
-      return FirstCharInfo(kind: fcNone)
-    # Try to extract a byte set from simple ASCII-only character classes
-    var bs: set[uint8]
-    for atom in node.atoms:
-      case atom.kind
-      of ccLiteral:
-        let cp = int32(atom.rune)
-        if cp >= 128:
-          return FirstCharInfo(kind: fcNone)
-        if rfIgnoreCase in flags:
-          bs = bs + asciiFoldBytes(uint8(cp))
-        else:
-          bs.incl(uint8(cp))
-      of ccRange:
-        let lo = int32(atom.rangeFrom)
-        let hi = int32(atom.rangeTo)
-        if lo >= 128 or hi >= 128 or (hi - lo) > 64:
-          return FirstCharInfo(kind: fcNone)
-        for c in lo .. hi:
-          if rfIgnoreCase in flags:
-            bs = bs + asciiFoldBytes(uint8(c))
-          else:
-            bs.incl(uint8(c))
-      else:
-        return FirstCharInfo(kind: fcNone)
-    if bs.card == 0:
-      FirstCharInfo(kind: fcNone)
-    elif bs.card == 1:
-      var b: uint8
-      for v in bs:
-        b = v
-      FirstCharInfo(kind: fcByte, byte: b)
-    else:
-      FirstCharInfo(kind: fcByteSet, bytes: bs)
+    classFirstChar(node, flags)
   else:
     FirstCharInfo(kind: fcNone)
+
+proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
+  ## Whether the pattern begins with a case-sensitive literal.
+  ##
+  ## Oniguruma searches for such a prefix as raw bytes, which means the scan
+  ## can start in the middle of a character: ``/1/`` finds the ``0x31`` at
+  ## offset 1 of ``"\xC0\x31"``, where ``/[1]/`` — which gets no such
+  ## optimization and walks characters — finds nothing.  A literal is
+  ## compared byte for byte anyway (``matchBytes``), so a match found this way
+  ## is a real one; it is only the set of positions that widens.
+  if node == nil:
+    return false
+  case node.kind
+  of nkLiteral, nkEscapedLiteral, nkString:
+    rfIgnoreCase notin flags
+  of nkCapture:
+    hasLiteralPrefix(node.captureBody, flags)
+  of nkNamedCapture:
+    hasLiteralPrefix(node.namedCaptureBody, flags)
+  of nkGroup:
+    hasLiteralPrefix(node.groupBody, flags)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      hasLiteralPrefix(node.flagBody, flags + node.flagsOn - node.flagsOff)
+    else:
+      false
+  of nkQuantifier:
+    # An optional prefix leaves the literal no longer first, and Oniguruma
+    # does not reach past it either.
+    node.quantMin >= 1 and hasLiteralPrefix(node.quantBody, flags)
+  of nkConcat:
+    var currentFlags = flags
+    for child in node.children:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        currentFlags = currentFlags + child.flagsOn - child.flagsOff
+        continue
+      if child.kind in
+          {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
+        continue
+      return hasLiteralPrefix(child, currentFlags)
+    false
+  of nkAlternation:
+    # Only when every branch is the same literal, which is what lets
+    # Oniguruma reduce the alternation to one exact string.
+    if node.alternatives.len == 0:
+      return false
+    for alt in node.alternatives:
+      if not hasLiteralPrefix(alt, flags):
+        return false
+    let first = extractFirstChar(node.alternatives[0], flags)
+    if first.kind != fcByte:
+      return false
+    for i in 1 ..< node.alternatives.len:
+      let info = extractFirstChar(node.alternatives[i], flags)
+      if info.kind != fcByte or info.byte != first.byte:
+        return false
+    true
+  else:
+    false
 
 proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
   ## Extract a byte that must appear somewhere in any successful match.
@@ -761,3 +1267,292 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
     RequiredByteInfo(valid: false)
   else:
     RequiredByteInfo(valid: false)
+
+const MaxRuneBytes* = 4 ## Widest UTF-8 encoding of a single character.
+
+const MaxFoldExpansionRunes = 3
+  ## Longest multi-character case fold: ΐ, ΰ, ﬃ and ﬄ each fold to three
+  ## characters, and nothing folds to more.
+
+const MaxAsciiFoldEquivBytes = 3
+  ## Widest character whose fold reaches an ASCII one, on its own (U+212A →
+  ## ``k``) or through an expansion (ẞ, ﬀ…ﬆ, ẖ, ẗ, ẘ, ẙ, ẚ — all three bytes).
+
+proc runeMaxByteLen*(r: Rune, flags: RegexFlags): int =
+  ## Upper bound on the subject bytes one pattern character can consume.
+  ##
+  ## Under ``(?i)`` that is not the character's own width: it also matches a
+  ## fold equivalent with a wider encoding (``k`` ↔ U+212A), and a character
+  ## with a multi-character fold matches that whole expansion (``ΐ`` ↔
+  ## ``ι``+``◌̈``+``◌́``, six bytes), whose elements fold again in turn.
+  if rfIgnoreCase notin flags:
+    return r.size
+  let cp = int32(r)
+  if cp < 128:
+    # No ASCII character has a multi-character fold, and only ``s`` and ``k``
+    # have a non-ASCII fold equivalent.  Standing inside another character's
+    # expansion needs a neighbour, which is invisible here: [lengthBounds]
+    # adds that allowance where it can see the pair.
+    return if hasNonAsciiFoldEquiv(cp): MaxAsciiFoldEquivBytes else: 1
+  max(r.size, MaxFoldExpansionRunes * MaxRuneBytes)
+
+proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
+  ## The exact number of subject bytes one pattern character consumes, or -1
+  ## when case folding lets it match text of another width — a fold
+  ## equivalent with a wider encoding, or a multi-character fold expansion.
+  ## See [runeMaxByteLen] for the bound that replaces it in that case.
+  if rfIgnoreCase notin flags:
+    return r.size
+  let cp = int32(r)
+  if cp < 128 and not hasNonAsciiFoldEquiv(cp):
+    return 1
+  -1
+
+proc runeBounds(r: Rune, flags: RegexFlags): LenBounds {.inline.} =
+  LenBounds(maxLen: runeMaxByteLen(r, flags), fixedLen: runeFixedByteLen(r, flags))
+
+proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
+  ## Bound what ``node`` consumes.  See [LenBounds].
+  ##
+  ## ``flags`` and ``gm`` are the ones in force where ``node`` sits: case
+  ## folding and grapheme mode both change how much subject a node eats, and
+  ## a flag group anywhere above or beside it can have turned them on.
+  ##
+  ## Under ``(?i)`` one subject character can stand for two pattern characters
+  ## (``ﬀ`` for ``ff``).  The matcher only folds like that inside an
+  ## ``nkString``, so that is the only case handled below; ``mergeLiterals``
+  ## runs last in the compiler and leaves no two literals adjacent in a
+  ## concat, so summing concat children needs no allowance for a fold across
+  ## them.
+  if node == nil:
+    return LenBounds(maxLen: 0, fixedLen: 0)
+  case node.kind
+  of nkLiteral:
+    runeBounds(node.rune, flags)
+  of nkEscapedLiteral:
+    runeBounds(node.escapedRune, flags)
+  of nkString:
+    var total = 0
+    var fixed = 0
+    for i, r in node.runes:
+      total += runeMaxByteLen(r, flags)
+      if fixed >= 0:
+        let rl = runeFixedByteLen(r, flags)
+        if rl < 0:
+          fixed = -1
+        else:
+          fixed += rl
+      # One subject character can also match this pair (subject "ß" against
+      # pattern "ss"), so the length is not fixed.  It is at most
+      # ``MaxAsciiFoldEquivBytes`` wide and replaces two pattern characters of
+      # at least one byte each, hence at most one extra byte per pair.
+      if rfIgnoreCase in flags and i + 1 < node.runes.len and
+          isMultiCharFoldPairStart(r, node.runes[i + 1]):
+        fixed = -1
+        total += MaxAsciiFoldEquivBytes - 2
+    LenBounds(maxLen: total, fixedLen: fixed)
+  of nkConcat:
+    var total = 0
+    var fixed = 0
+    var currentFlags = flags
+    var currentGm = gm
+    for child in node.children:
+      # A bare flag group — (?i), (?y{g}) — applies to the rest of the concat
+      # rather than to a body of its own.
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        currentFlags = currentFlags + child.flagsOn - child.flagsOff
+        if child.graphemeMode != gmNone:
+          currentGm = child.graphemeMode
+        continue
+      let cb = lengthBounds(child, currentFlags, currentGm)
+      if fixed >= 0:
+        if cb.fixedLen < 0 or cb.fixedLen > int.high - fixed:
+          fixed = -1
+        else:
+          fixed += cb.fixedLen
+      if total >= 0:
+        if cb.maxLen < 0 or cb.maxLen > int.high - total:
+          total = -1
+        else:
+          total += cb.maxLen
+      if total < 0 and fixed < 0:
+        break
+    LenBounds(maxLen: total, fixedLen: fixed)
+  of nkAlternation:
+    if node.alternatives.len == 0:
+      return LenBounds(maxLen: 0, fixedLen: 0)
+    # ``maxLen`` maximizes over the branches while ``fixedLen`` needs them all
+    # to agree, so ``fixed`` is seeded from the first branch during the same
+    # walk: a second walk would be exponential in the alternation depth.
+    var best = 0
+    var fixed = 0
+    for i, alt in node.alternatives:
+      let ab = lengthBounds(alt, flags, gm)
+      if ab.maxLen < 0:
+        best = -1
+      elif best >= 0:
+        best = max(best, ab.maxLen)
+      if i == 0:
+        fixed = ab.fixedLen
+      elif ab.fixedLen != fixed:
+        fixed = -1
+    LenBounds(maxLen: best, fixedLen: fixed)
+  of nkQuantifier:
+    let bb = lengthBounds(node.quantBody, flags, gm)
+    var total = -1
+    if node.quantMax >= 0 and bb.maxLen >= 0:
+      if node.quantMax == 0 or bb.maxLen <= int.high div node.quantMax:
+        total = bb.maxLen * node.quantMax
+    var fixed = -1
+    if node.quantMin == node.quantMax and node.quantMin >= 0 and bb.fixedLen >= 0:
+      if node.quantMin == 0 or bb.fixedLen <= int.high div node.quantMin:
+        fixed = bb.fixedLen * node.quantMin
+    LenBounds(maxLen: total, fixedLen: fixed)
+  of nkCapture:
+    lengthBounds(node.captureBody, flags, gm)
+  of nkNamedCapture:
+    lengthBounds(node.namedCaptureBody, flags, gm)
+  of nkGroup:
+    lengthBounds(node.groupBody, flags, gm)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      lengthBounds(
+        node.flagBody,
+        flags + node.flagsOn - node.flagsOff,
+        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
+      )
+    else:
+      LenBounds(maxLen: 0, fixedLen: 0)
+  of nkAtomicGroup:
+    lengthBounds(node.atomicBody, flags, gm)
+  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    LenBounds(maxLen: 0, fixedLen: 0)
+  of nkCharType:
+    # A grapheme cluster — \X, or ``.`` in grapheme/word mode — runs over as
+    # many characters as the cluster holds, so it has no bound at all.
+    let unbounded =
+      node.charType == ctGraphemeCluster or
+      (node.charType == ctDot and gm in {gmGrapheme, gmWord})
+    LenBounds(maxLen: if unbounded: -1 else: MaxRuneBytes, fixedLen: -1)
+  of nkCharClass:
+    # Under (?i) a class also matches the multi-character fold of a member.
+    LenBounds(
+      maxLen:
+        if rfIgnoreCase in flags:
+          MaxFoldExpansionRunes * MaxRuneBytes
+        else:
+          MaxRuneBytes,
+      fixedLen: -1,
+    )
+  of nkBackreference, nkNamedBackref, nkSubexpCall:
+    LenBounds(maxLen: -1, fixedLen: -1) # can't bound
+  of nkConditional:
+    let yes = lengthBounds(node.condYes, flags, gm)
+    let no =
+      if node.condNo != nil:
+        lengthBounds(node.condNo, flags, gm)
+      else:
+        LenBounds(maxLen: 0, fixedLen: 0)
+    LenBounds(
+      maxLen:
+        if yes.maxLen < 0 or no.maxLen < 0:
+          -1
+        else:
+          max(yes.maxLen, no.maxLen),
+      fixedLen: -1,
+    )
+  of nkAbsent:
+    LenBounds(maxLen: -1, fixedLen: -1)
+
+proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
+  ## Record [lengthBounds] of every lookaround body on the lookaround node.
+  ##
+  ## A lookbehind asks for its body's length once per position it is tried at,
+  ## which puts a whole recursive walk in the matcher's inner loop.  Computing
+  ## it here turns that into a flag check (see ``boundsUsable``).
+  ##
+  ## Must run on the final AST: a later rewrite would leave the annotation
+  ## describing a tree that no longer exists.  Nodes default to
+  ## ``lookBoundsValid == false`` and fall back to the walk.
+  if node == nil:
+    return
+  case node.kind
+  of nkLookaround:
+    node.lookBounds = lengthBounds(node.lookBody, flags, gm)
+    node.lookAltBounds = @[]
+    if node.lookBody != nil and node.lookBody.kind == nkAlternation:
+      for alt in node.lookBody.alternatives:
+        node.lookAltBounds.add(lengthBounds(alt, flags, gm))
+    node.lookBoundsFlags = flags
+    node.lookBoundsGm = gm
+    node.lookBoundsValid = true
+    annotateLookaroundBounds(node.lookBody, flags, gm)
+  of nkConcat:
+    var currentFlags = flags
+    var currentGm = gm
+    for child in node.children:
+      # A bare flag group applies to the rest of the concat, as in
+      # [lengthBounds].
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        currentFlags = currentFlags + child.flagsOn - child.flagsOff
+        if child.graphemeMode != gmNone:
+          currentGm = child.graphemeMode
+        continue
+      annotateLookaroundBounds(child, currentFlags, currentGm)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      annotateLookaroundBounds(
+        node.flagBody,
+        flags + node.flagsOn - node.flagsOff,
+        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
+      )
+  else:
+    for child in node.childNodes:
+      annotateLookaroundBounds(child, flags, gm)
+
+proc maxByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
+  ## Upper bound on the bytes ``node`` consumes, or -1 when unbounded.
+  ## See [lengthBounds].
+  lengthBounds(node, flags, gm).maxLen
+
+proc fixedByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
+  ## The one length every match of ``node`` consumes, or -1 when it varies.
+  ## See [lengthBounds].
+  lengthBounds(node, flags, gm).fixedLen
+
+proc semiEndAnchored*(node: Node): bool =
+  ## Whether every match of ``node`` has to end at ``\Z`` — the end of the
+  ## subject, or just before a newline that ends it.
+  ##
+  ## This is Oniguruma's ``ANCHOR_SEMI_END_BUF``, and the scan uses it the way
+  ## ``onig_search`` does: it jumps the first start position to the anchor
+  ## instead of walking there.  The analysis is deliberately conservative —
+  ## it looks only at the last element of every path — because a false
+  ## positive would skip start positions that can still match.  ``$`` is not
+  ## included: Oniguruma gives it ``ANCHOR_END_LINE``, which gets no jump.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAnchor:
+    node.anchor == akStringEndOrNewline
+  of nkConcat:
+    node.children.len > 0 and semiEndAnchored(node.children[^1])
+  of nkAlternation:
+    if node.alternatives.len == 0:
+      return false
+    for alt in node.alternatives:
+      if not semiEndAnchored(alt):
+        return false
+    true
+  of nkCapture:
+    semiEndAnchored(node.captureBody)
+  of nkNamedCapture:
+    semiEndAnchored(node.namedCaptureBody)
+  of nkGroup:
+    semiEndAnchored(node.groupBody)
+  of nkFlagGroup:
+    semiEndAnchored(node.flagBody)
+  of nkAtomicGroup:
+    semiEndAnchored(node.atomicBody)
+  else:
+    false

@@ -373,6 +373,8 @@ suite "Step 7: Named captures and backreferences":
     # (Oniguruma default behavior)
     let r = re("(a)(?<x>b)(c)")
     check r.ast.kind == nkConcat
+    # ``flattenLiteralGroups`` would drop a group around nothing but
+    # literals, but it runs before this demotion, so these two survive it.
     check r.ast.children[0].kind == nkGroup
     check r.ast.children[0].groupBody.kind == nkLiteral
     check r.ast.children[1].kind == nkNamedCapture

@@ -1899,8 +1899,9 @@ suite "split edge cases":
     check split("", re(",")) == @[""]
 
   test "split with zero-width pattern":
-    # Zero-width lookahead splits at each boundary but doesn't capture between-chars text
-    check split("abc", re("(?=\\w)")) == @["", "", "", ""]
+    # A zero-width separator consumes nothing, so the character the scan has
+    # to step over to make progress stays in the field that follows.
+    check split("abc", re("(?=\\w)")) == @["", "a", "b", "c"]
 
 suite "graphemeMode backtracking":
   test "graphemeMode does not leak from failed quantifier":
@@ -1960,7 +1961,7 @@ suite "firstCharInfo optimization":
     check m.found
     check m.boundaries[0].a == 3
 
-  test "fcByte preserved for case-insensitive digit":
+  test "the hint for a case-insensitive digit stays tight":
     let r = re("(?i)1")
     check r.firstCharInfo.kind == fcByte
     check r.firstCharInfo.byte == uint8('1')
@@ -2087,7 +2088,7 @@ suite "zero-width match iteration":
     check replace("abc", re(""), "-") == "-a-b-c-"
 
   test "split with zero-width lookahead":
-    check split("abc", re("(?=b)")) == @["a", "", "c"]
+    check split("abc", re("(?=b)")) == @["a", "bc"]
 
 suite "extractFirstChar with zero-width prefixes":
   test "word boundary before literal":
@@ -2450,7 +2451,7 @@ suite "MatchContext-based API":
       if not searchIntoCtx(ctx, subject, r, m, start = pos):
         break
       spans.add m.matchSpan
-      pos = advanceAfterMatch(subject, m.matchSpan.b, pos)
+      pos = advanceAfterMatch(subject, m.matchSpan)
       if pos < 0:
         break
     var expected: seq[Span]
@@ -2581,26 +2582,726 @@ suite "captureStacks isolation across lookaround":
       check m.matchSpan == 1 .. 2
 
 suite "malformed UTF-8 above U+10FFFF":
-  # fastRuneAt turns a malformed five- or six-byte sequence into a value far
-  # above U+10FFFF; every unicodedb lookup used to abort on one.
-  const OverMax = "\xFD\xBF\xBF\xBF\xBF\xBF" # decodes to 0xFFFFFF
+  # A lead byte of 0xF5 or more begins no character at all: it is one byte on
+  # its own, the way Oniguruma's length table has it.  0xF4 does lead four
+  # bytes, though, and the decode is the naive OR Oniguruma performs, so a
+  # continuation byte of 0x90 or more still yields a value above U+10FFFF and
+  # every ``unicodedb`` lookup has to be guarded against it.
+  const OverMax = "\xFD\xBF\xBF\xBF\xBF\xBF"
+
+  test "it is six one-byte characters":
+    check search(OverMax, re("\\X")).matchSpan == 0 .. 1
+    check search(OverMax, re(".")).matchSpan == 0 .. 1
+    var n = 0
+    for _ in findAll(OverMax, re(".")):
+      inc n
+    check n == 6
 
   test "property lookups do not abort":
     check not search(OverMax, re("\\p{L}")).found
     check not search(OverMax, re("\\p{Latin}")).found
     check not search(OverMax, re("\\p{InBasicLatin}")).found
     check not search(OverMax, re("\\p{Upper}")).found
-    check not search(OverMax, re("\\p{Lower}")).found
     check not search(OverMax, re("[[:alpha:]]")).found
-    check not search(OverMax, re("\\w")).found
 
-  test "it counts as an unassigned code point":
-    check search(OverMax, re("\\p{Cn}")).matchSpan == 0 .. 6
-    check search(OverMax, re("\\W")).matchSpan == 0 .. 6
+  test "\\w still reads the code point, so 0xFD is the letter U+00FD":
+    # Every class above misses it — a one-byte character above U+007F reaches
+    # neither container — but \\w bypasses them.
+    check search(OverMax, re("\\w")).matchSpan == 0 .. 1
+    check search(OverMax & "a", re("(?i)\\w+")).matchSpan == 0 .. 1
 
   test "case folding does not abort":
-    check search(OverMax & "a", re("(?i)\\w+")).matchSpan == 6 .. 7
-    check search("1\xF8\xE3\x81\x82z", re("(?i)\\N{1,3}[a-z]++\\w+")).found == false
+    check search("\xF5" & "a", re("(?i)[a-z]+")).matchSpan == 1 .. 2
 
-  test "grapheme matching does not abort":
-    check search(OverMax, re("\\X")).matchSpan == 0 .. 6
+  test "a 0xF4 lead can decode above U+10FFFF":
+    # 0xF4 0xBF 0xBF 0xBF is U+13FFFF: a four-byte character by the length
+    # table, past the ceiling by the decode.
+    check search("\xF4\xBF\xBF\xBF", re("\\X")).matchSpan == 0 .. 4
+    check not search("\xF4\xBF\xBF\xBF", re("\\w")).found
+    check not search("\xF4\xBF\xBF\xBF", re("\\p{L}")).found
+
+  test "word segmentation does not abort on one":
+    # ``wordBreakProp`` is the lookup ``(?y{w})`` reaches, and an unguarded
+    # one aborts with an uncatchable AssertionDefect rather than failing to
+    # match.  Spans read off Oniguruma 6.9.10.
+    check search("\xF4\xBF\xBF\xBF", re("(?y{w})\\X")).matchSpan == 0 .. 4
+    check search("\xF4\x90\x80\x80a", re("(?y{w})\\X")).matchSpan == 0 .. 4
+    check search("A\xF4\x7F\xA9\x0D", re("(?y{w})\\X")).matchSpan == 0 .. 1
+    check search("a\xF4\xBF\xBF\xBFa", re("(?y{w}).")).matchSpan == 0 .. 1
+
+suite "the \\Z anchor is reached the way Oniguruma reaches it":
+  # ``onig_search`` resolves ANCHOR_SEMI_END_BUF by stepping back from the end
+  # of the subject over continuation bytes, not by following the forward
+  # ``encLen`` chain.  A ``'\\n'`` can sit inside the span its predecessor's
+  # lead byte declares, and the chain steps straight over it; the jump is the
+  # only thing that puts a start position there.  Spans read off Oniguruma
+  # 6.9.10 (ONIG_SYNTAX_ONIGURUMA, UTF-8, onig_search).
+
+  test "a newline hidden inside a lead byte's span is still the anchor":
+    check search("\xC2\x0A", re("\\Z")).matchSpan == 1 .. 1
+    check search("\xE0\xC2\x0A", re("\\Z")).matchSpan == 2 .. 2
+    check search("\xF0a\x0A", re("\\Z")).matchSpan == 2 .. 2
+    check search("\xC2\x0A", re("(?m)\\Z")).matchSpan == 1 .. 1
+
+  test "an invalid lead byte still leaves the window off the chain":
+    # ``"\xC0\x0A"``: the ``encLen`` chain from 0 runs 0-2, so position 1 is
+    # only ever tried via the ``\Z`` window.  ``\Z`` matches at the newline
+    # while ``\s\Z`` must consume a character there and does not match
+    # ``"\xC0"``.  Read off Oniguruma 6.9.10 and pinned here: the
+    # brute-force sweep below shares the window arithmetic, so a common-mode
+    # slip of one byte either way would stay green there (too far right turns
+    # 1..1 into 2..2; reaching 1 out of band invents 1..2).
+    check search("\xC0\x0A", re("\\Z")).matchSpan == 1 .. 1
+    check not search("\xC0\x0A", re("\\s\\Z")).found
+
+  test "the jump leaves room for what the pattern consumes":
+    check search("\xC2a\x0A", re("a\\Z")).matchSpan == 1 .. 2
+    check search("\xC2a\x0A", re(".\\Z")).matchSpan == 0 .. 2
+
+  test "a newline at offset 0 is not jumped to":
+    check search("\x0A", re("\\Z")).matchSpan == 0 .. 0
+
+  test "the anchors that get no jump keep the chain's answer":
+    # ``$`` is ANCHOR_END_LINE in Oniguruma and ``\\z`` ANCHOR_END_BUF;
+    # neither steps back to a newline the chain hid.
+    check search("\xC2\x0A", re("$")).matchSpan == 2 .. 2
+    check search("\xC2\x0A", re("\\z")).matchSpan == 2 .. 2
+
+  test "\\A wins over \\Z, as it does in onig_search's anchor chain":
+    check not search("\xC2\x0A", re("\\A\\Z")).found
+
+  test "well-formed subjects are unaffected":
+    check search("ab\x0A", re("\\Z")).matchSpan == 2 .. 2
+    check search("ab", re("\\Z")).matchSpan == 2 .. 2
+    check search("", re("\\Z")).matchSpan == 0 .. 0
+
+suite "the \\Z jump never skips a start position":
+  # The jump to the ``\\Z`` anchor is ``minSemiEnd - semiEndDMax``, so both
+  # ends have to be right: the landing position must stay inside the subject,
+  # and ``semiEndDMax`` must be a real upper bound on what the pattern eats.
+  # Where it is not, the leftmost match is skipped or lost entirely.
+
+  test "a truncated sequence cannot push the start past the end":
+    # The lead byte declares four bytes and the subject holds three, so
+    # right-adjusting the landing position ran off the end and the scan loop
+    # never ran an attempt at all.
+    check search("\xF0\x80\x80", re("a?\\Z")).matchSpan == 3 .. 3
+    check search("\xF0\x80\x80", re("\\Z")).matchSpan == 3 .. 3
+    check search("\xE0\x80", re("a?\\Z")).matchSpan == 2 .. 2
+    # ``\z`` gets no jump and always agreed.
+    check search("\xF0\x80\x80", re("a?\\z")).matchSpan == 3 .. 3
+
+  test "a grapheme cluster has no byte bound":
+    # ``\X`` runs over as many characters as the cluster holds, so no dmax
+    # bounds it and the scan must start where it would without the jump.
+    check re("\\X\\Z").semiEndDMax == -1
+    check search("क्षि", re("\\X\\Z")).matchSpan == 6 .. 12
+    check search("क्षि", re("\\X")).matchSpan == 0 .. 6
+
+  test "so does a dot in grapheme or word mode":
+    check re("(?y{g}).\\Z").semiEndDMax == -1
+    check re("(?y{w}).\\Z").semiEndDMax == -1
+    check search("क्षि", re("(?y{g}).\\Z")).matchSpan == 6 .. 12
+    check search("क्षि", re("(?y{w}).\\Z")).matchSpan == 0 .. 12
+    # Outside those modes a dot is one character wide again.
+    check re(".\\Z").semiEndDMax == 4
+
+suite "case folding widens what a pattern character can consume":
+  # Under ``(?i)`` a character matches a fold equivalent with a wider encoding
+  # (``k`` ↔ U+212A KELVIN SIGN) and the whole of its multi-character fold
+  # (``ΐ`` ↔ ``ι``+``◌̈``+``◌́``, six bytes).  Both the ``\Z`` jump and the
+  # lookbehind start positions are derived from that width.
+
+  test "a multi-character fold is reachable from the \\Z anchor":
+    check search("\xCE\xB9\xCC\x88\xCC\x81", re("(?i)ΐ\\Z")).matchSpan == 0 .. 6
+    check search("i\xCC\x87", re("(?i)İ\\Z")).matchSpan == 0 .. 3
+    check search("եւ", re("(?i)և\\Z")).matchSpan == 0 .. 4
+    check search("ss", re("(?i)ß\\Z")).matchSpan == 0 .. 2
+
+  test "so is a fold equivalent with a wider encoding":
+    check search("\xE2\x84\xAA", re("(?i)k\\Z")).matchSpan == 0 .. 3
+    check search("\xC5\xBF", re("(?i)s\\Z")).matchSpan == 0 .. 2
+
+  test "an ASCII literal keeps its narrow bound":
+    check re("(?i)a\\Z").semiEndDMax == 1
+    check re("a\\Z").semiEndDMax == 1
+
+  test "a lookbehind of a folding character is not fixed-length":
+    check search("\xCE\xB9\xCC\x88\xCC\x81x", re("(?<=(?i)ΐ)x")).matchSpan == 6 .. 7
+    check search("\xC5\xBFx", re("(?<=(?i)s)x")).matchSpan == 2 .. 3
+    check search("\xE2\x84\xAAx", re("(?<=(?i)k)x")).matchSpan == 3 .. 4
+    # A pair the subject can match with one folded character, and back.
+    check search("ßx", re("(?<=(?i)ss)x")).matchSpan == 2 .. 3
+    check search("ssx", re("(?<=(?i)ß)x")).matchSpan == 2 .. 3
+
+suite "the reverse fold reads a run of literals, groups and all":
+  # One subject character can stand for two or three pattern characters
+  # (``ﬀ`` for ``ff``), and what makes a run a run is that the characters are
+  # literals next to each other.  A plain ``(?:...)`` around some of them
+  # says nothing about the language, so it may not break the run either --
+  # Oniguruma 6.9.10 folds through one, and every case below was checked
+  # against it.
+
+  const Ff = "\u{FB00}" ## ﬀ, the one character that folds to ``ff``.
+
+  test "a non-capturing group does not break the run":
+    for pattern in [
+      "(?i)ff", "(?i)f(?:f)", "(?i)(?:f)f", "(?i)(?:f)(?:f)", "(?i)(?:ff)",
+      "(?i)f(?:(?:f))", "(?i)(?:f(?:f))", "(?i)a|f(?:f)",
+    ]:
+      check search(Ff, re(pattern)).matchSpan == 0 .. 3
+    # Three characters, and the group may fall at either seam.
+    for pattern in ["(?i)ffi", "(?i)ff(?:i)", "(?i)f(?:fi)", "(?i)(?:ff)i"]:
+      check search("\u{FB03}", re(pattern)).matchSpan == 0 .. 3
+
+  test "but everything that is not a plain group does":
+    # Each of these is ``NONE`` in Oniguruma too.  A capture, a class, a
+    # quantifier, an atomic or flag scope, an assertion or an empty group
+    # all keep the two characters apart.
+    for pattern in [
+      "(?i)(f)(f)", "(?i)[f][f]", "(?i)f[f]", "(?i)f{2}", "(?i)f+", "(?i)(f)+",
+      "(?i)ff?", "(?i)(?:f){1}", "(?i)f(?>f)", "(?i)f(?i:f)", "(?i)f(?m:f)",
+      "(?i)f(?=f)f", "(?i)f\\Kf", "(?i)f(?:)f",
+    ]:
+      check not search(Ff, re(pattern)).found
+    # The expansion has to be consumed whole: ``ffi`` is three characters and
+    # two of them are not a match for ﬃ.
+    check not search("\u{FB03}", re("(?i)ff")).found
+
+  test "an unnamed capture demoted to a group still breaks it":
+    # A named capture anywhere demotes the unnamed ones to ``(?:...)``, but
+    # they were written as captures and Oniguruma keeps folding out of them.
+    # So the group flattening has to happen before the demotion, not after.
+    check not search("z" & Ff, re("(?i)(?<x>z)(f)(f)")).found
+    check search("z" & Ff, re("(?i)(?<x>z)ff")).matchSpan == 0 .. 4
+    check search("z" & Ff, re("(?i)(?<x>z)f(?:f)")).matchSpan == 0 .. 4
+
+  test "the length analysis follows the run through the groups":
+    # A run that can be matched by one wider character is no longer
+    # fixed-length, so a lookbehind over it has to scan.  It used to depend
+    # on the two ``f``s being written as bare neighbours.
+    for pattern in ["(?<=(?i)ff)x", "(?<=(?i)f(?:f))x", "(?<=(?i)(?:f)(?:f))x"]:
+      check search(Ff & "x", re(pattern)).matchSpan == 3 .. 4
+    # And the ``\Z`` scan may not skip the only position it can start from.
+    for pattern in ["(?i)ff\\Z", "(?i)f(?:f)\\Z", "(?i)(?:ff)\\Z"]:
+      check search("x" & Ff, re(pattern)).matchSpan == 1 .. 4
+    # Three characters: the window has to leave room for the fold width.
+    for pattern in ["(?i)ffi\\Z", "(?i)f(?:fi)\\Z"]:
+      check search("x" & "\u{FB03}", re(pattern)).matchSpan == 1 .. 4
+
+  test "flattening a group leaves a pattern that folds nothing alone":
+    # The wrapper goes whether or not ``(?i)`` is on, so the ordinary
+    # readings have to survive it.
+    check search("abc", re("a(?:b)c")).matchSpan == 0 .. 3
+    check search("abc", re("(?:a)(?:b)(?:c)")).matchSpan == 0 .. 3
+    check not search("ac", re("a(?:b)c")).found
+    check search("abc", re("a(?:b|x)c")).matchSpan == 0 .. 3
+    check search("axc", re("a(?:b|x)c")).matchSpan == 0 .. 3
+    check search("abbc", re("a(?:b){2}c")).matchSpan == 0 .. 4
+    check search("ab", re("(?:a)(?:b)")).matchSpan == 0 .. 2
+    # A backreference still counts the captures it always did.
+    check search("abab", re("(?:x)?(ab)\\1")).matchSpan == 0 .. 4
+
+suite "extractFirstChar does not look past a consuming ^ subtree":
+  # A subtree such as (^a*) reports fcLineStart yet can consume input, so the
+  # following child's byte is not the pattern's first byte.  Using it as a
+  # scan hint skipped every valid start position.
+
+  test "capture containing ^ and a quantifier still matches":
+    let m = search("aab", re("(^a*)b"))
+    check m.found
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1].a == 0
+    check m.boundaries[1].b == 2
+
+  test "hint is fcLineStart, not the byte after the subtree":
+    let r = re("(^a*)b")
+    check r.firstCharInfo.kind == fcLineStart
+
+  test "per-alternative hints are sound too":
+    let m = search("aab", re("z|(^a*)b"))
+    check m.found
+    check m.matchSpan == 0 .. 3
+
+  test "a bare ^ is still looked past for a byte hint":
+    let r = re("^(a)b")
+    check r.firstCharInfo.kind == fcByte
+    check r.firstCharInfo.byte == uint8('a')
+
+suite "a character's length comes from its lead byte alone":
+  # Oniguruma reads the length out of a table indexed by the lead byte and
+  # never checks the bytes after it.  ``encLen`` is that table, and the
+  # matcher, both scan loops and the first-byte hints are all defined in
+  # terms of it.
+
+  test "a stray continuation byte is a character of its own":
+    check search("\x0A\x85", re("\\N")).matchSpan == 1 .. 2
+    check search("\x80", re("[^a]")).matchSpan == 0 .. 1
+    check search("\xFF", re("\\w")).matchSpan == 0 .. 1
+
+  test "the bytes after a lead byte are not checked":
+    # 0xE3 declares three bytes, so "a" is swallowed into the character at 0.
+    check search("\xE3\x81\x61", re(".")).matchSpan == 0 .. 3
+    check not search("\xE3\x81\x61", re("[a]")).found
+
+  test "0xF5 and up begin nothing, so they are one byte":
+    check search("\xF5\x80\x80\x80", re(".")).matchSpan == 0 .. 1
+    check search("\xF8", re(".")).matchSpan == 0 .. 1
+
+  test "a sequence truncated by the end of the subject is no character":
+    check not search("\xE0\x83", re(".")).found
+    check not search("\xC0", re("\\X")).found
+    check search("\x61\xC0", re("a")).matchSpan == 0 .. 1
+    check not search("\x61\xC0", re("a.")).found
+
+  test "the scan steps a whole character at a time":
+    # 0xC0 declares two bytes, so offset 1 is inside it and never tried.
+    check not search("\xC0\x31", re("[0-9]")).found
+    check search("\xC0\xC0\x31", re("[0-9]")).matchSpan == 2 .. 3
+
+suite "a class picks its container by encoded length":
+  # A compiled class keeps its members below U+0080 in a byte set and the
+  # rest in a code-point range list, and chooses between them by the
+  # character's *length*, not its value.  So an overlong sequence that spells
+  # an ASCII code point reaches the range list, which cannot hold it.
+
+  test "an overlong sequence matches no ASCII class member":
+    # "\xC0\xB1" spells U+0031 to the decoder, yet no ASCII class sees it.
+    check not search("\xC0\xB1", re("[0-9]")).found
+    check not search("\xC0\xB1", re("\\d")).found
+    check not search("\xC0\xB1", re("\\h")).found
+    check not search("\xC0\xB1", re("[[:xdigit:]]")).found
+    check not search("\xC0\xB1", re("[[:ascii:]]")).found
+    check not search("\xC0\xB1", re("\\x{31}")).found
+
+  test "but negation still applies over the miss":
+    check search("\xC0\xB1", re("[^1]")).matchSpan == 0 .. 2
+    check search("\xC0\xB1", re("\\D")).matchSpan == 0 .. 2
+    check search("\xC0\xB1", re("[^a]")).matchSpan == 0 .. 2
+
+  test "an overlong sequence above U+007F does reach the ranges":
+    # "\xE0\x83\xA9" spells U+00E9, which the range list can hold.
+    check search("\xE0\x83\xA9", re("[\xC3\xA9]")).matchSpan == 0 .. 3
+    check search("\xE0\x83\xA9", re("\\p{L}")).matchSpan == 0 .. 3
+    check search("\xE0\x83\xA9", re("[[:alpha:]]")).matchSpan == 0 .. 3
+
+  test "a one-byte character above U+007F reaches neither container":
+    check not search("\x85", re("[\\x{85}]")).found
+    check not search("\x80", re("[[:^ascii:]]")).found
+    check not search("\xFE", re("[[:alpha:]]")).found
+
+  test "except through a range written across the ASCII boundary":
+    # Oniguruma fills the byte set up to 0xFF when the range starts below
+    # U+0080, so [a-ÿ] accepts a stray 0xFF byte that [ÿ] rejects.
+    check search("\xFF", re("[a-\xC3\xBF]")).matchSpan == 0 .. 1
+    check search("\x80", re("[a-\xC3\xBF]")).matchSpan == 0 .. 1
+    check not search("\xFF", re("[\xC3\xBF]")).found
+    check not search("\x80", re("[\\x{80}-\\x{FF}]")).found
+
+  test "\\w and \\W read the code point instead of a container":
+    # OP_WORD tests the decoded value directly, so it disagrees with the
+    # class spelling of the same thing.  Oniguruma does too.
+    check search("\xC0\xB1", re("\\w")).matchSpan == 0 .. 2
+    check not search("\xC0\xB1", re("[\\w]")).found
+    check not search("\xC0\xB1", re("[[:word:]]")).found
+    # 0xFE is U+00FE, a letter, so \\W rejects it while \\W accepts 0x80.
+    check not search("\xFE", re("\\W")).found
+    check search("\x80", re("\\W")).matchSpan == 0 .. 1
+
+suite "a case-sensitive literal is compared as bytes":
+  test "an overlong spelling of the same code point does not match":
+    check not search("\xC0\xB1", re("1")).found
+    check not search("\xE0\x83\xA9", re("\xC3\xA9")).found
+
+  test "but (?i) compares code points, through the class containers":
+    check search("\xE0\x83\xA9", re("(?i)\xC3\xA9")).matchSpan == 0 .. 3
+    check not search("\xC1\xA1", re("(?i)a")).found
+
+  test "a literal prefix is searched for as bytes, so it may start mid-character":
+    # Oniguruma's exact-string optimization ignores character boundaries.
+    check search("\xC0\x31", re("1")).matchSpan == 1 .. 2
+    check search("\xC0\x61\x62", re("ab")).matchSpan == 1 .. 3
+    # A pattern that gets no such prefix walks characters instead.
+    check not search("\xC0\x31", re("[1]")).found
+    check not search("\xC0\x31", re("1|2")).found
+
+  test "a backreference is compared as bytes too":
+    check search("\xC0\xB1\xC0\xB1", re("(.)\\1")).matchSpan == 0 .. 4
+    check not search("\xC3\xA9\xE0\x83\xA9", re("(.)\\1")).found
+
+  test "segmentation steps back over the same characters the matcher does":
+    # The character before offset 2 is the stray ``\x80``, U+0080, a GCB
+    # Control that GB4 breaks after — not the ``a`` a raw continuation-byte
+    # walk would land on.
+    var spans: seq[string]
+    for m in findAll("a\x80\xCC\x81", re("\\X")):
+      spans.add($m.matchSpan.a & ".." & $m.matchSpan.b)
+    check spans == @["0..1", "1..2", "2..4"]
+
+suite "the hints and the scans agree by construction":
+  # The soundness property the whole first-byte machinery has to keep: the
+  # scan may never skip a position at which a match begins.  Checked against
+  # a brute-force walk of the same character chain, over every one- and
+  # two-byte subject.
+
+  # Every skip the forward scan makes is keyed on one of two things: the
+  # anchor the pattern carries, or the first character it can begin with.  So
+  # the patterns these invariants run over are *generated* from those two
+  # axes instead of listed.  A list has to be remembered: the ``\Z`` skip
+  # went in while the four-byte test below still had no ``\Z`` pattern, and
+  # the skip could jump off the character chain unnoticed.  Generating means
+  # a skip added for a new anchor is covered the day it lands.
+  const Bodies = [
+    "", "1", "a", "\xC3\xA9", "\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "\\h", "\\H",
+    ".", "\\N", "\\R", "\\X", "[0-9]", "[a-z]", "[^a]", "[^0-9]", "[[:ascii:]]",
+    "[[:^ascii:]]", "[[:alpha:]]", "[[:xdigit:]]", "[a-\xC3\xBF]", "\\x{85}",
+    "[\\x{85}]", "\\p{L}", "a|1", "\\d+", "(?i)A", "(?i)[A-Z]", "(?i)ff", "..",
+    "\\s*",
+  ]
+
+  const Anchors = ["", "\\z", "\\Z", "$", "^", "\\b", "\\B", "(?m)^", "(?m)$", "\\A"]
+    ## ``\G`` is deliberately absent: it is defined against the position the
+    ## search *started* from, so ``matchAt`` at any other position asks a
+    ## different question and neither invariant below can read the answer.
+
+  proc generatedPatterns(
+      bodies: openArray[string] = Bodies, pairBodies: openArray[string] = Bodies
+  ): seq[string] =
+    ## ``Anchors`` x ``bodies``, with the anchor on each side.  An anchor that
+    ## trails is what drives the ``\Z`` skip; one that leads is what drives
+    ## the ``^`` skip.
+    for a in Anchors:
+      for b in bodies:
+        if a.len == 0 and b.len == 0:
+          continue
+        result.add(a & b)
+        if a.len > 0 and b.len > 0:
+          result.add(b & a)
+    # Then both at once, over ``pairBodies``.  A pattern anchored on one side
+    # exercises one skip; the two skips only *meet* when a pattern carries
+    # both, because the leading anchor re-bases the walk that the trailing
+    # anchor's window starts from.  This axis multiplies by the square of
+    # ``Anchors``, so a caller with a large subject set passes a smaller
+    # ``pairBodies``.
+    for lead in Anchors:
+      if lead.len == 0:
+        continue
+      for tail in Anchors:
+        if tail.len == 0:
+          continue
+        for b in pairBodies:
+          result.add(lead & b & tail)
+
+  let Patterns = generatedPatterns()
+
+  proc semiEndWindowStart(subject: string, rx: Regex): int =
+    ## Where ``onig_search`` begins for a ``\Z``-anchored pattern:
+    ## ``min_semi_end - dmax``, adjusted right to a character head.
+    ##
+    ## The test spells this out rather than reading it off the engine because
+    ## it is the *model* of which positions the scan visits, and on malformed
+    ## input there is no subject-only rule to derive it from -- the window
+    ## starts wherever the arithmetic lands, on the chain from 0 or not, and
+    ## the walk that follows is the chain from there.  The skip-independent
+    ## statement of the same property is the well-formed test above; this one
+    ## is the model, and the differential run against Oniguruma is the
+    ## backstop for both.
+    if not rx.semiEndAnchored or subject.len == 0:
+      return 0
+    let dmax = rx.semiEndDMax
+    if dmax < 0:
+      return 0
+    var preEnd = subject.len - 1
+    while preEnd > 0 and (subject[preEnd].uint8 and 0xC0'u8) == 0x80'u8:
+      dec preEnd
+    let minSemiEnd =
+      if subject[preEnd] == '\n':
+        if preEnd == 0:
+          return 0
+        preEnd
+      else:
+        subject.len
+    if minSemiEnd <= dmax:
+      return 0
+    result = minSemiEnd - dmax
+    if result < subject.len:
+      # Right-adjust to a character head.
+      var q = result
+      while q > 0 and (subject[q].uint8 and 0xC0'u8) == 0x80'u8:
+        dec q
+      if q < result:
+        result = min(q + encLen(subject[q].uint8), subject.len)
+
+  proc bruteForce(subject: string, rx: Regex): Match =
+    ## Walk the character chain from the window start and take the first
+    ## position that matches.  See [semiEndWindowStart] for why the walk does
+    ## not simply begin at 0.
+    var p = semiEndWindowStart(subject, rx)
+    while p <= subject.len:
+      let m = matchAt(subject, rx, p)
+      if m.found:
+        return m
+      if p >= subject.len:
+        break
+      # Clamped, like ``nextScanPos``: a sequence truncated by the end must
+      # not step over the end position, where the end anchors match.
+      p = min(p + encLen(subject[p].uint8), subject.len)
+    result.found = false
+
+  proc bruteForceBackward(subject: string, rx: Regex): Match =
+    ## Walk back from the end with Oniguruma's ``ONIGENC_STEP_BACK(.., 1)``
+    ## and take the first position that matches.
+    ##
+    ## This is deliberately not ``bruteForce`` read in reverse.  Oniguruma
+    ## steps forward along the ``encLen`` chain and back along the
+    ## continuation-byte rule, and on malformed input the two visit different
+    ## positions -- so ``search`` and ``searchBackward`` may disagree about
+    ## whether a match exists at all, exactly as ``onig_search`` does.
+    var p = subject.len
+    while true:
+      let m = matchAt(subject, rx, p)
+      if m.found:
+        return m
+      if p <= 0:
+        break
+      var q = p - 1
+      while q > 0 and (subject[q].uint8 and 0xC0'u8) == 0x80'u8:
+        dec q
+      p = q
+    result.found = false
+
+  proc subjects(): seq[string] =
+    const Bytes = [
+      '\x00', '\x0A', '\x31', '\x61', '\x7F', '\x80', '\xA9', '\xBF', '\xC0', '\xC1',
+      '\xC2', '\xC3', '\xDF', '\xE0', '\xE3', '\xEF', '\xF0', '\xF4', '\xF5', '\xF8',
+      '\xFE', '\xFF',
+    ]
+    for b in Bytes:
+      result.add($b)
+      for b2 in Bytes:
+        result.add($b & $b2)
+
+  proc wellFormedSubjects(): seq[string] =
+    ## Well-formed UTF-8 only, so every character start is on the chain and
+    ## the scan owes the caller *every* matching position -- no model of
+    ## which ones it visits is needed to check it.  The pieces are the ones
+    ## the skips key on: a newline for ``^``, an end for ``\Z``, wide
+    ## characters for the character walk, and ﬀ / ß for the case folds whose
+    ## width the length analysis has to bound.
+    const Pieces =
+      ["", "a", "1", "\n", " ", "\u{00E9}", "\u{3042}", "\u{FB00}", "\u{00DF}"]
+    for p1 in Pieces:
+      for p2 in Pieces:
+        result.add(p1 & p2)
+        for p3 in Pieces:
+          result.add(p1 & p2 & p3)
+
+  test "search agrees with matchAt at every position, on well-formed input":
+    # The property every skip has to keep, stated without reference to how
+    # the scan walks: ``search`` returns the first position ``matchAt``
+    # accepts.  A skip that jumps too far fails this whatever it keys on,
+    # which is what makes it worth having next to the brute-force walk --
+    # that one has to be taught about each new skip, and this one does not.
+    for pattern in Patterns:
+      let rx = re(pattern)
+      for subject in wellFormedSubjects():
+        var want = -1
+        for p in 0 .. subject.len:
+          # On well-formed input a match can only begin at a character start.
+          if p < subject.len and (subject[p].uint8 and 0xC0'u8) == 0x80'u8:
+            continue
+          if matchAt(subject, rx, p).found:
+            want = p
+            break
+        let got = search(subject, rx)
+        check got.found == (want >= 0)
+        if got.found and want >= 0:
+          check got.matchSpan.a == want
+
+  test "search never skips a position a brute-force walk would match":
+    for pattern in Patterns:
+      let rx = re(pattern)
+      # The literal byte search deliberately reaches positions off the chain,
+      # so it is a superset and only checked one way below.
+      if rx.literalScan:
+        continue
+      for subject in subjects():
+        let got = search(subject, rx)
+        let want = bruteForce(subject, rx)
+        check got.found == want.found
+        if got.found and want.found:
+          check got.matchSpan == want.matchSpan
+
+  test "a literal scan only ever reaches more positions, never fewer":
+    for pattern in Patterns:
+      let rx = re(pattern)
+      if not rx.literalScan:
+        continue
+      for subject in subjects():
+        if bruteForce(subject, rx).found:
+          check search(subject, rx).found
+
+  test "searchBackward walks back the way Oniguruma steps back":
+    # The backward scan owes the caller Oniguruma's positions, not the
+    # forward scan's.  It is *not* checked against ``search`` here: the two
+    # visit different positions on malformed input, and so do Oniguruma's.
+    for pattern in Patterns:
+      let rx = re(pattern)
+      # The literal byte search reaches positions off either rule, so it is a
+      # superset and only checked one way.
+      if rx.literalScan:
+        continue
+      for subject in subjects():
+        let got = searchBackward(subject, rx)
+        let want = bruteForceBackward(subject, rx)
+        check got.found == want.found
+        if got.found and want.found:
+          check got.matchSpan == want.matchSpan
+
+  test "a literal backward scan only ever reaches more positions, never fewer":
+    for pattern in Patterns:
+      let rx = re(pattern)
+      if not rx.literalScan:
+        continue
+      for subject in subjects():
+        if bruteForceBackward(subject, rx).found:
+          check searchBackward(subject, rx).found
+
+  test "the end of the subject is a start position, however it is reached":
+    # A sequence truncated by the end declares more bytes than are there.
+    # Stepping by the declared length would jump over ``subject.len``, and
+    # the anchors that only match there would stop matching.
+    for pattern in ["\\z", "\\Z", "$"]:
+      let rx = re(pattern)
+      for subject in ["a\xC0", "a\xE3\x81", "\x00\x00\xC0", "\xF0\x9F"]:
+        check search(subject, rx).matchSpan == subject.len .. subject.len
+    # ``\b`` holds at the end after a word character, and the forward and
+    # backward scans have to agree that the position is reachable.
+    let wb = re("\\b")
+    for subject in ["\x00\x00\xC0", "a\xC0"]:
+      check searchBackward(subject, wb).matchSpan == subject.len .. subject.len
+      check search(subject, wb, start = subject.len).matchSpan ==
+        subject.len .. subject.len
+
+  test "a zero-width match at a truncated tail stays inside the subject":
+    # ``replace`` and ``split`` slice at the position ``nextRunePos`` hands
+    # back, so it may never point past the end: it used to, and both raised.
+    for pattern in ["x*", "\\N*", "\\G", "\\b", "\\B", "^", "(?m)^"]:
+      let rx = re(pattern)
+      for subject in ["a\xC0", "a\xE3\x81", "\xC0", "ab\xF0\x9F\x98"]:
+        for m in findAll(subject, rx):
+          check m.matchSpan.b <= subject.len
+        discard replace(subject, rx, "-")
+        discard split(subject, rx)
+
+  test "findAll steps to the positions search would start at":
+    # ``nextRunePos`` and ``nextScanPos`` share the length rule, so a
+    # zero-width match never skips a position ``search`` would visit.
+    for pattern in ["\\N*", "\\N", "a*", "[^a]*"]:
+      let rx = re(pattern)
+      for subject in subjects():
+        var n = 0
+        for m in findAll(subject, rx):
+          check m.matchSpan.a >= 0
+          check m.matchSpan.b <= subject.len
+          inc n
+          # A zero-width match must not stall: the iterator advances by
+          # ``nextRunePos``, which follows the same length rule as the scan.
+          check n <= subject.len + 1
+
+  test "the ^ skip lands on a position the character walk visits":
+    # ``^`` jumps to the next line instead of trying every position.  A
+    # ``'\n'`` can sit inside the span its lead byte declares, so the byte
+    # after it need not be on the chain the walk visits; landing there
+    # reported matches at mid-character offsets that the backward scan --
+    # which makes no such skip -- never offered.
+    check not search("A\xE0\n\nB", re("^$")).found
+    check not search("A\xE0\n\nB", re("^\\s*$")).found
+    check not search("A\xE0\nB", re("^[^A]")).found
+    # The skip still has to reach the line starts that are on the chain.
+    check search("A\xE0\xB1\xB1\n\nB", re("^$")).matchSpan == 5 .. 5
+    check search("ab\ncd", re("(?m)^c")).matchSpan == 3 .. 4
+
+  test "the scans agree on subjects long enough to hide a newline":
+    # Reaching the ``^`` skip's failure needs a lead byte, a ``'\n'`` inside
+    # the span it declares, and a failed attempt at an earlier position --
+    # three bytes more than ``subjects()`` offers.
+    const Bytes =
+      ['\x0A', '\x61', '\x41', '\x31', '\x80', '\xC0', '\xC3', '\xE0', '\xF0']
+    # Generated the same way, over a small body set: this loop already runs
+    # over 9^4 subjects, so it takes the anchors -- where the skips live --
+    # and only a handful of bodies to go with them.
+    let linePatterns =
+      generatedPatterns(["", "a", ".", "\\w", "\\s*", "[^A]"], ["", "\\s*", "[^A]"])
+    for pattern in linePatterns:
+      let rx = re(pattern)
+      for b0 in Bytes:
+        for b1 in Bytes:
+          for b2 in Bytes:
+            for b3 in Bytes:
+              let subject = $b0 & $b1 & $b2 & $b3
+              let got = search(subject, rx)
+              if not rx.literalScan:
+                let want = bruteForce(subject, rx)
+                check got.found == want.found
+                if got.found and want.found:
+                  check got.matchSpan == want.matchSpan
+              if not rx.literalScan:
+                let wantBack = bruteForceBackward(subject, rx)
+                let gotBack = searchBackward(subject, rx)
+                check gotBack.found == wantBack.found
+                if gotBack.found and wantBack.found:
+                  check gotBack.matchSpan == wantBack.matchSpan
+
+suite "backward stepping and zero-width iteration":
+  test "prevCharStart gives Oniguruma's answer, not the forward chain's":
+    # The forward ``encLen`` chain over "\xC0\xC3\xA9" runs 0 -> 2 -> 3, so the
+    # character ending at 3 is the lone byte 0xA9, not a word char.  Stepping
+    # back lands on 1 instead and validates it, because 1 + encLen(0xC3) == 3 —
+    # this is ``left_adjust_char_head``, and the engine keeps its answer.
+    const S = "\xC0\xC3\xA9"
+    check search(S, re("(?<=\\w)")).found
+    check matchAt(S, re("\\b"), 3).found
+
+  test "a byte covered by nothing reads as itself, not as a sequence past pos":
+    # In "\xC0\xC2\xA9" nothing ends at offset 2, so the byte before it stands
+    # for itself and reads as 0xC2 = U+00C2 (a word char), not as the U+00A9
+    # (not a word char) that the sequence starting at 1 would run *past* 2 to
+    # spell.  The character at 2 is the lone byte 0xA9, also not a word char,
+    # so \b sees exactly one word side and matches.  (Lookbehind asks a
+    # stricter question — the character it consumes must *end* at 2 — and so
+    # matches at neither reading.)
+    const S = "\xC0\xC2\xA9"
+    check matchAt(S, re("\\b"), 2).found
+    check not matchAt(S, re("(?<=\\w)"), 2).found
+
+  test "grapheme and word segmentation step back the same way":
+    # The look-back scans inside \X and (?y{w}) used to walk continuation
+    # bytes raw and could start decoding at an offset no forward walk visits.
+    # The point here is that malformed input is handled without a crash or an
+    # out-of-range span; on these subjects the two scans also happen to agree,
+    # which they are not obliged to do in general.
+    const Subjects = [
+      "\xC0\xC3\xA9a", "\xC0\x80\xE2\x80\x8D\xC0",
+      "\xF0\x9F\x87\xA6\xC0\xF0\x9F\x87\xA7",
+    ]
+    for s in Subjects:
+      for rx in [re("\\X"), re("(?y{w})\\X"), re("\\y"), re("\\Y")]:
+        # No crash, no out-of-range span, and forward and backward agree.
+        let m = search(s, rx)
+        if m.found:
+          check m.matchSpan.a >= 0
+          check m.matchSpan.b <= s.len
+        check m.found == searchBackward(s, rx).found
+
+  test "a zero-width match past the scan start is yielded once":
+    var spans: seq[Span]
+    for m in findAll("ab", re("\\b")):
+      spans.add m.matchSpan
+    check spans == @[Span(a: 0, b: 0), Span(a: 2, b: 2)]
+
+  test "zero-width iteration matches Oniguruma's findAll/replace/split":
+    check replace("ab", re("\\b"), "-") == "-ab-"
+    check split("ab", re("\\b")) == @["", "ab", ""]
+    check replace("abc", re("(?=b)"), "-") == "a-bc"
+    check split("abc", re("(?=b)")) == @["a", "bc"]

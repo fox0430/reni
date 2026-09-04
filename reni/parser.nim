@@ -16,6 +16,9 @@ type Parser* = object
   requiresExclusive: bool ## true when (?Ii:...) requires being the only node
   inLookbehind: bool ## true when inside lookbehind assertion
   inLiteralQuote: bool ## true when inside \Q...\E
+  sawPlainGroup*: bool
+    ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
+    ## skip [flattenLiteralGroups] when there is nothing to find.
 
 const
   MaxNestingDepth = 256
@@ -1234,6 +1237,7 @@ proc parseGroup(p: var Parser): Node =
       # (?:...) non-capturing group
       p.advance()
       let body = p.parseRegex()
+      p.sawPlainGroup = true
       result = Node(kind: nkGroup, groupBody: body)
     of '~':
       # (?~...) absent operator
