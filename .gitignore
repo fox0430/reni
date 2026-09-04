@@ -9,8 +9,15 @@ tests/test_*
 !tests/*.nim
 
 tools/port_*
+tools/diff_*
 !tools/*.nim
 !tools/*.py
+!tools/*.c
+!tools/*.sh
 
 bench/bench_*
 !bench/*.nim
+nimble.develop
+nimble.paths
+nimbledeps
+/config.nims

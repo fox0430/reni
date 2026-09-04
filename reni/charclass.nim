@@ -342,9 +342,12 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.expect('}')
       # \p{^Prop} = negated property
       if name.len > 1 and name[0] == '^':
-        CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1]))
+        CcAtom(
+          kind: ccNegUnicodeProp,
+          prop: resolveUnicodeProp(name[1 ..^ 1], inClass = true),
+        )
       else:
-        CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name))
+        CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
     else:
       if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
         p.error("invalid Unicode property name")
@@ -353,7 +356,7 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.advance()
       if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
         p.error("invalid Unicode property '" & name & "'")
-      CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name))
+      CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
   of 'P':
     p.advance()
     if p.peek == '{':
@@ -367,9 +370,11 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.expect('}')
       # \P{^Prop} = double negation = positive
       if name.len > 1 and name[0] == '^':
-        CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1]))
+        CcAtom(
+          kind: ccUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1], inClass = true)
+        )
       else:
-        CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name))
+        CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
     else:
       if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
         p.error("invalid Unicode property name")
@@ -378,7 +383,7 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       p.advance()
       if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
         p.error("invalid Unicode property '" & name & "'")
-      CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name))
+      CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
   else:
     # Literal escape: \], \-, \\, \[, etc.
     let r = p.advanceRune()
@@ -536,10 +541,9 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
       p.advance() # skip first '&'
       p.advance() # skip second '&'
       let leftAtoms = atoms
-      # Note: 'negated' is the outer class negation (^), applied to the
-      # intersection result, NOT to the left operand. Left atoms already
-      # contain their own negation (e.g. nested [^abc]).
-      # Parse right side: all atoms until ] or another &&
+      # 'negated' is the outer ^, applied to the intersection result, not to
+      # the left operand (left atoms carry their own negation, e.g. [^abc]).
+      # Parse the right side: all atoms until ] or another &&.
       var rightNeg = false
       var rightAtoms: seq[CcAtom]
       (rightNeg, rightAtoms) = p.parseCharClassBody()
