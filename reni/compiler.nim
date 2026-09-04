@@ -219,7 +219,12 @@ proc canMatchEmpty(node: Node): bool =
   of nkAtomicGroup:
     canMatchEmpty(node.atomicBody)
   of nkConditional:
-    canMatchEmpty(node.condYes) and (node.condNo == nil or canMatchEmpty(node.condNo))
+    # Either branch matching empty is enough, and with no else-branch a false
+    # condition matches empty by itself.
+    if node.condNo == nil:
+      true
+    else:
+      canMatchEmpty(node.condYes) or canMatchEmpty(node.condNo)
   of nkSubexpCall:
     true # conservative: assume it can match empty
 
@@ -555,6 +560,30 @@ proc mergeLiterals(node: Node): Node =
   else:
     node
 
+proc markQuantBodyPure(node: Node): bool =
+  ## Records on every quantifier whether its body can write state that a
+  ## rollback snapshot restores: captures, ``keepStart`` (``\K``), flags /
+  ## grapheme mode or ``subjectEnd``.  ``nkSubexpCall`` counts conservatively.
+  ## Returns that verdict for ``node``'s own subtree; the flag stored on a
+  ## quantifier is its negation.
+  if node == nil:
+    return false
+  result =
+    case node.kind
+    of nkCapture, nkNamedCapture, nkFlagGroup, nkAbsent, nkSubexpCall:
+      true
+    of nkAnchor:
+      node.anchor == akKeep
+    else:
+      false
+  for child in node.childNodes:
+    if markQuantBodyPure(child):
+      result = true
+  if node.kind == nkQuantifier:
+    # ``result`` is the OR over the children, and the quantifier node itself
+    # writes nothing, so it is exactly the body's verdict.
+    node.quantBodyPure = not result
+
 proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateUtf8(pattern)
   var p = initParser(pattern, flags)
@@ -596,6 +625,10 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateNumericRefs(ast, captureCount, namedCaptures)
   # Merge consecutive literals into nkString nodes
   ast = mergeLiterals(ast)
+  # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
+  # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
+  # added after this line stays safe (it just always snapshots).
+  discard markQuantBodyPure(ast)
   # Re-collect group bodies after AST transformation
   bodies = @[]
   groupFlags = @[]

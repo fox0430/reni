@@ -331,6 +331,21 @@ suite "Step 4: Alternation and quantifiers":
     let m = search("aaa", re("a++a"))
     check not m.found
 
+  test "possessive quantifier rolls back a failed iteration's \\K":
+    # The last iteration matches \K and then fails, so its match-start move has
+    # to be undone: /(?:\Ka)*+/ matches "a" at 0..1, not 1..1.
+    let m = search("a", re("(?:\\Ka)*+"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "possessive quantifier rolls back a failed iteration's captures":
+    # Iteration 2 captures "b" at 2..3 before failing on [^a]; group 1 must keep
+    # the value written by iteration 1.
+    let m = search("abb", re("(?:\\K([ab])[^a])*+"))
+    check m.found
+    check m.boundaries[0] == 0 .. 2
+    check m.boundaries[1] == 0 .. 1
+
   test "dot star greedy":
     let m = search("abc", re(".*"))
     check m.found
@@ -983,9 +998,63 @@ suite "Conditionals":
     check m.found
     check m.boundaries[0] == 0 .. 1
 
-  test "backref condition: no else branch fails":
+  # Every expectation from here to the end of the false-condition group was
+  # read off Oniguruma 6.9.10 (ONIG_SYNTAX_ONIGURUMA, UTF-8, onig_search).
+  # Oniguruma has no regex conditions — /(?(?=a))b/ and /(?(a+))b/ are syntax
+  # errors there — so the regex-condition cases below follow PCRE2 instead.
+  test "backref condition: no else branch skips a non-empty yes branch":
+    # Oniguruma matches the empty string at 0 here.
     let m = search("c", re("(a)?(?(1)b)"))
-    check not m.found
+    check m.found
+    check m.boundaries[0] == 0 .. 0
+
+  test "named ref condition: no else branch skips a non-empty yes branch":
+    let m = search("c", re("(?<x>a)?(?(<x>)b)"))
+    check m.found
+    check m.boundaries[0] == 0 .. 0
+
+  test "backref condition: empty yes branch and no else branch fails":
+    # /(a)?(?(1))b/ does not match "b" in Oniguruma, unlike /(a)?(?(1)x)b/.
+    check not search("b", re("(a)?(?(1))b")).found
+
+  test "backref condition: empty yes branch still runs when the condition holds":
+    let m = search("ab", re("(a)(?(1))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 2
+
+  test "backref condition: a group is not an empty yes branch":
+    let m = search("b", re("(a)?(?(1)(?:))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "backref condition: a comment is not an empty yes branch":
+    # (?#...) is erased while parsing, but it was there in the source, so the
+    # branch counts as non-empty just like /(a)?(?(1)(?:))b/ does.
+    let m = search("b", re("(a)?(?(1)(?#note))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "backref condition: comment yes branch still runs when condition holds":
+    let m = search("ab", re("(a)(?(1)(?#note))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 2
+
+  test "backref condition: \\Q\\E is not an empty yes branch":
+    # \Q\E parses to no nodes at all, but it was written in the source, so it
+    # counts as non-empty just like /(a)?(?(1)(?#note))b/ does.
+    let m = search("b", re("(a)?(?(1)\\Q\\E)b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "backref condition: extended-mode whitespace is not an empty yes branch":
+    let m = search("b", re("(?x)(a)?(?(1) )b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "backref condition: extended-mode comment is not an empty yes branch":
+    let m = search("b", re("(?x)(a)?(?(1)#c\n)b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
 
   test "named ref condition: captured":
     let m = search("ab", re("(?<x>a)?(?(<x>)b|c)"))
@@ -1039,6 +1108,29 @@ suite "Conditionals":
     let m = search("b", re("(?(?=a)a)"))
     check m.found
     check m.boundaries[0] == 0 .. 0
+
+  test "regex condition: empty yes branch and no else is skipped":
+    # The empty-yes-branch rule is Oniguruma's, and Oniguruma has no regex
+    # conditions — /(?(?=a))b/ is a syntax error there.  PCRE2 is the only
+    # reference, and it skips the false condition and matches "b".
+    let m = search("b", re("(?(?=a))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "regex condition: empty yes branch skipped mid-subject":
+    let m = search("ab", re("(?(?=a))b"))
+    check m.found
+    check m.boundaries[0] == 1 .. 2
+
+  test "bare regex condition: empty yes branch and no else is skipped":
+    let m = search("b", re("(?(a+))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
+
+  test "always-false condition: empty yes branch and no else is skipped":
+    let m = search("b", re("(?(*FAIL))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 1
 
   test "conditional alternation both branches":
     let m1 = search("ab", re("(a)?(?(1)b|c)"))
@@ -2182,6 +2274,18 @@ suite "Mutual recursion detection":
   test "mutual recursion via optional quantifier is valid":
     let r = re("(?<a>(?&b)?x)(?<b>(?&a)?y)")
     check r.captureCount == 2
+
+  test "recursion behind a conditional with no else branch detected":
+    # /(?(<a>)x)/ matches empty when the condition is false, so \g<a> is
+    # reachable without consuming input.  Oniguruma rejects this pattern with
+    # ONIGERR_NEVER_ENDING_RECURSION.
+    expect RegexError:
+      discard re("(?<a>(?(<a>)x)\\g<a>)")
+
+  test "recursion behind a conditional with an else branch is valid":
+    # Both branches consume, so the call is only reached after input.
+    let r = re("(?<a>(?(<a>)x|y)\\g<a>?)")
+    check r.captureCount == 1
 
 suite "matchSpan on non-matching result":
   test "matchSpan returns UnsetSpan when not found":
