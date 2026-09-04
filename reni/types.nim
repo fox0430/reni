@@ -295,6 +295,63 @@ type
     of fcNone, fcAnchorStart:
       discard
 
+const
+  acWord* = 0x0001'u16
+  acDigit* = 0x0002'u16
+  acSpace* = 0x0004'u16
+  acAlpha* = 0x0008'u16
+  acLower* = 0x0010'u16
+  acUpper* = 0x0020'u16
+  acPunct* = 0x0040'u16
+  acCntrl* = 0x0080'u16
+  acXdigit* = 0x0100'u16
+  acBlank* = 0x0200'u16
+  acGraph* = 0x0400'u16
+  acPrint* = 0x0800'u16
+  acAlnum* = 0x1000'u16
+
+proc buildAsciiClassTable(): array[128, uint16] =
+  ## Membership bits per ASCII code point: below U+0080 the Unicode and
+  ## ASCII-only readings of every class agree, so one table answers both.
+  for c in 0 .. 127:
+    var f = 0'u16
+    if c >= ord('a') and c <= ord('z'):
+      f = f or acLower or acAlpha
+    if c >= ord('A') and c <= ord('Z'):
+      f = f or acUpper or acAlpha
+    if c >= ord('0') and c <= ord('9'):
+      f = f or acDigit
+    if (c >= ord('0') and c <= ord('9')) or (c >= ord('a') and c <= ord('f')) or
+        (c >= ord('A') and c <= ord('F')):
+      f = f or acXdigit
+    if (f and (acAlpha or acDigit)) != 0:
+      f = f or acAlnum
+    if (f and acAlnum) != 0 or c == ord('_'):
+      f = f or acWord
+    if c == 0x20 or (c >= 0x09 and c <= 0x0D):
+      f = f or acSpace
+    if c == 0x20 or c == 0x09:
+      f = f or acBlank
+    if c < 0x20 or c == 0x7F:
+      f = f or acCntrl
+    if c > 0x20 and c < 0x7F:
+      f = f or acGraph
+    if c >= 0x20 and c < 0x7F:
+      f = f or acPrint
+    if (f and acGraph) != 0 and (f and acAlnum) == 0:
+      f = f or acPunct
+    result[c] = f
+
+const AsciiClassTable* = buildAsciiClassTable()
+
+proc asciiHas*(c: int32, bits: uint16): bool {.inline.} =
+  ## Range-checked table lookup.  The guard lives here rather than at the call
+  ## sites so a caller that forgets it cannot read out of bounds under
+  ## ``-d:danger``; hot callers already branch on ``c < 128``, so the compiler
+  ## folds the duplicate test away.
+  c >= 0 and c < 128 and (AsciiClassTable[c] and bits) != 0
+
+type
   RequiredByteInfo* = object
     valid*: bool
     byte*: uint8
