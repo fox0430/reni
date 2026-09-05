@@ -234,6 +234,13 @@ type
       quantMax*: int ## -1 = unbounded
       quantKind*: QuantKind
       quantBody*: Node
+      quantBodyPure*: bool
+        ## Raised by ``markQuantBodyPure``: true when ``quantBody`` provably
+        ## writes none of the state a rollback snapshot restores (captures,
+        ## ``\K``, flags/grapheme mode, ``subjectEnd``), so a possessive
+        ## quantifier needs no per-iteration capture snapshot.  The default
+        ## ``false`` is the safe value, so a node the pass never visits
+        ## degrades to "always snapshot", never to "never".
     of nkCharClass:
       negated*: bool
       atoms*: seq[CcAtom]

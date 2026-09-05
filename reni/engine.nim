@@ -112,16 +112,34 @@ type
     captureSnapshots: seq[Span]
       ## Side stack of ``ctx.captures`` snapshots for ``ckCapturesChanged``,
       ## pushed and popped LIFO with ``frames``.
+    capSaves: seq[Span]
+      ## Side stack of capture vectors for live ``SavedState`` snapshots.
+      ## Below the high-water mark a snapshot is a plain ``copyMem`` into
+      ## capacity that is already there.
+    capSavesPeak: int ## High-water mark of ``capSaves`` for the current search.
+    capSavesHigh: int ## Highest peak seen since the buffer was last released.
+    capSavesQuiet: int ## Consecutive searches whose peak stayed within ``CapSavesKeep``.
     flBestLen: int ## findLongest: best match length so far (-1 if none)
     flBestMatch: Match ## findLongest: deepest match recorded
 
-  SavedState = object
+  ScalarState = object
+    ## Everything in a rollback snapshot except the capture vector.  A body
+    ## that cannot write captures rolls back with one of these alone; the
+    ## separate type keeps it out of the procs that release a side-stack slot.
     pos: int
-    captures: seq[Span]
     flags: RegexFlags
     keepStart: int
     subjectEnd: int
     graphemeMode: GraphemeMode
+
+  SavedState = object
+    ## Rollback snapshot.  ``capOff`` is the capture vector's offset on
+    ## ``MatchContext.capSaves``, so taking one is a bulk copy rather than an
+    ## allocation.  Strictly LIFO: every ``save`` must release its slot before
+    ## returning, via ``restore``, ``restoreKeepingCaptures`` or ``drop``
+    ## (``rewind`` rolls back without releasing, to replay the snapshot).
+    scalars: ScalarState
+    capOff: int32
 
 var emptySubjectByte: char
   ## Target for the ``data`` pointer of an empty subject, so a ``Subject``
@@ -145,6 +163,14 @@ template oa(s: Subject): untyped =
   toOpenArray(s.data, 0, s.size - 1)
 
 const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
+
+const CapSavesKeep = 4096
+  ## ``capSaves`` capacity (~64 KB) a context keeps between searches for free;
+  ## anything above this is released once it stops being used.
+
+const CapSavesQuietRuns = 16
+  ## Consecutive searches that must stay within ``CapSavesKeep`` before an
+  ## outsized ``capSaves`` buffer is handed back.
 
 const MaxQuantRepetitions = 10_000
 const MaxCallDepth* = 400
@@ -170,25 +196,70 @@ proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
   result = ctx.frames.len.int32
   ctx.frames.add(frame)
 
-proc save(ctx: MatchContext): SavedState =
-  SavedState(
+template copyCaptures(dst, src, n: untyped) =
+  ## ``Span`` is a plain two-int value, so a snapshot moves in one block.
+  ## A template so the ``addr`` operands are only taken when ``n > 0``.
+  if n > 0:
+    copyMem(addr dst, addr src, n * sizeof(Span))
+
+proc pushCaptures(ctx: MatchContext): int32 {.inline.} =
+  ## Copy ``ctx.captures`` onto the side stack and return its offset.
+  result = ctx.capSaves.len.int32
+  let n = ctx.captures.len
+  ctx.capSaves.setLen(int(result) + n)
+  copyCaptures(ctx.capSaves[int(result)], ctx.captures[0], n)
+  if ctx.capSaves.len > ctx.capSavesPeak:
+    ctx.capSavesPeak = ctx.capSaves.len
+
+proc popCapturesTo(ctx: MatchContext, off: int32) {.inline.} =
+  ## Copy the slice at ``off`` back into ``ctx.captures`` and release it.
+  copyCaptures(ctx.captures[0], ctx.capSaves[int(off)], ctx.captures.len)
+  ctx.capSaves.setLen(off)
+
+proc saveScalars(ctx: MatchContext): ScalarState {.inline.} =
+  ## Snapshot everything but the capture vector.  Nothing is pushed onto
+  ## ``capSaves``, so the result rolls back with ``restoreScalars`` only.
+  ScalarState(
     pos: ctx.pos,
-    captures: ctx.captures,
     flags: ctx.flags,
     keepStart: ctx.keepStart,
     subjectEnd: ctx.subjectEnd,
     graphemeMode: ctx.graphemeMode,
   )
 
-proc restore(ctx: MatchContext, s: sink SavedState) =
-  ## ``s`` is consumed: its ``captures`` buffer is moved into ``ctx``.
-  ## Callers passing a still-live lvalue get a synthesized copy instead.
+proc save(ctx: MatchContext): SavedState =
+  SavedState(scalars: saveScalars(ctx), capOff: pushCaptures(ctx))
+
+proc pos(s: SavedState): int {.inline.} =
+  s.scalars.pos
+
+proc restoreScalars(ctx: MatchContext, s: ScalarState) {.inline.} =
   ctx.pos = s.pos
-  ctx.captures = move(s.captures)
   ctx.flags = s.flags
   ctx.keepStart = s.keepStart
   ctx.subjectEnd = s.subjectEnd
   ctx.graphemeMode = s.graphemeMode
+
+proc restore(ctx: MatchContext, s: SavedState) {.inline.} =
+  ## Roll back to ``s`` and release its slot on the side stack.
+  restoreScalars(ctx, s.scalars)
+  popCapturesTo(ctx, s.capOff)
+
+proc rewind(ctx: MatchContext, s: SavedState) {.inline.} =
+  ## Roll back to ``s`` but keep its slot, so it can be replayed again.
+  ## The caller is responsible for releasing the stack afterwards.
+  restoreScalars(ctx, s.scalars)
+  copyCaptures(ctx.captures[0], ctx.capSaves[int(s.capOff)], ctx.captures.len)
+
+proc restoreKeepingCaptures(ctx: MatchContext, s: SavedState) {.inline.} =
+  ## Roll back everything except the capture vector.  Positive lookaround
+  ## and lookbehind keep what their (zero-width) body captured.
+  restoreScalars(ctx, s.scalars)
+  ctx.capSaves.setLen(s.capOff)
+
+proc drop(ctx: MatchContext, s: SavedState) {.inline.} =
+  ## Release ``s``'s slot without rolling anything back.
+  ctx.capSaves.setLen(s.capOff)
 
 proc saveStackLens(ctx: MatchContext): seq[int] =
   ## Snapshot the per-group ``captureStacks[i].len`` so a lookaround body
@@ -536,6 +607,8 @@ proc matchQuantGreedyIter(
 ): bool =
   ## Iterative greedy fallback for large repetition counts.
   ## Matches body greedily, then tries cont from longest to shortest.
+  ## States stay replayable, so it uses ``rewind`` and frees the run at once.
+  let baseOff = ctx.capSaves.len.int32
   var states: seq[SavedState]
   states.add(save(ctx))
   var reps = 0
@@ -549,6 +622,7 @@ proc matchQuantGreedyIter(
       # Zero-width match: try cont, then force capture changes (matches recursive version)
       if startCount + reps >= minRep:
         if runCont(ctx, cont):
+          ctx.capSaves.setLen(baseOff)
           return true
       for _ in 0 ..< ctx.captures.len:
         let s2 = save(ctx)
@@ -561,19 +635,24 @@ proc matchQuantGreedyIter(
         inc reps
         if startCount + reps >= minRep:
           if runCont(ctx, cont):
+            ctx.capSaves.setLen(baseOff)
             return true
+        drop(ctx, s2)
       restore(ctx, before)
       break
+    drop(ctx, before)
     states.add(save(ctx))
     inc reps
 
   for i in countdown(states.high, 0):
     if startCount + i >= minRep:
-      restore(ctx, states[i])
+      rewind(ctx, states[i])
       if runCont(ctx, cont):
+        ctx.capSaves.setLen(baseOff)
         return true
 
-  restore(ctx, states[0])
+  rewind(ctx, states[0])
+  ctx.capSaves.setLen(baseOff)
   false
 
 proc matchQuantLazyIter(
@@ -588,6 +667,7 @@ proc matchQuantLazyIter(
     if not matchWithCont(ctx, body, TrueCont):
       restore(ctx, before)
       return false
+    drop(ctx, before)
     if ctx.pos == before.pos:
       break
     inc reps
@@ -598,6 +678,7 @@ proc matchQuantLazyIter(
   while reps < MaxQuantRepetitions:
     let saved = save(ctx)
     if runCont(ctx, cont):
+      drop(ctx, saved)
       return true
     restore(ctx, saved)
 
@@ -611,6 +692,7 @@ proc matchQuantLazyIter(
     if ctx.pos == before.pos:
       # Zero-width match: try cont, then force capture changes (matches recursive version)
       if runCont(ctx, cont):
+        drop(ctx, before)
         return true
       for _ in 0 ..< ctx.captures.len:
         let s2 = save(ctx)
@@ -622,9 +704,12 @@ proc matchQuantLazyIter(
           break
         inc reps
         if runCont(ctx, cont):
+          drop(ctx, before)
           return true
+        drop(ctx, s2)
       restore(ctx, before)
       break
+    drop(ctx, before)
     inc reps
 
   false
@@ -657,6 +742,7 @@ proc matchQuantGreedy(
     let ok = matchWithCont(ctx, body, fid)
     ctx.frames.setLen(fid)
     if ok:
+      drop(ctx, saved)
       return true
     restore(ctx, saved)
 
@@ -674,6 +760,7 @@ proc matchQuantLazy(
   if count >= minRep:
     let saved = save(ctx)
     if runCont(ctx, cont):
+      drop(ctx, saved)
       return true
     restore(ctx, saved)
 
@@ -694,37 +781,73 @@ proc matchQuantLazy(
     let ok = matchWithCont(ctx, body, fid)
     ctx.frames.setLen(fid)
     if ok:
+      drop(ctx, saved)
       return true
     restore(ctx, saved)
   false
 
 proc matchQuantPossessive(
-    ctx: MatchContext, body: Node, minRep, maxRep: int, cont: ContId
+    ctx: MatchContext, body: Node, minRep, maxRep: int, bodyWrites: bool, cont: ContId
 ): bool =
-  # Possessive: match greedily, no backtracking on count
+  # Possessive: match greedily, no backtracking on count.  ``bodyWrites`` is
+  # the compiler's verdict on whether the body can touch anything besides
+  # ``pos``; it is loop-invariant, hence two loops rather than a branch inside
+  # one.
+  let savedScalars = saveScalars(ctx)
   var count = 0
+  if bodyWrites:
+    # Two slots: the full rollback at the end, plus one scratch slot the loop
+    # overwrites in place — a ``save``/``drop`` pair per iteration would add
+    # two ``setLen`` calls on top of the copy that is actually needed.
+    let savedCapOff = pushCaptures(ctx)
+    let attemptOff = pushCaptures(ctx)
+    let n = ctx.captures.len
+    while maxRep < 0 or count < maxRep:
+      # Per-iteration rollback: a body failing part-way can still have moved
+      # ``keepStart`` or written captures.
+      let attemptScalars = saveScalars(ctx)
+      copyCaptures(ctx.capSaves[int(attemptOff)], ctx.captures[0], n)
+      if not matchWithCont(ctx, body, TrueCont):
+        restoreScalars(ctx, attemptScalars)
+        copyCaptures(ctx.captures[0], ctx.capSaves[int(attemptOff)], n)
+        break
+      count += 1
+      if ctx.pos == attemptScalars.pos:
+        break # zero-width: count as one rep, then stop
+    ctx.capSaves.setLen(attemptOff) # release the scratch slot
+    if count >= minRep and runCont(ctx, cont):
+      ctx.capSaves.setLen(savedCapOff)
+      return true
+    # Full rollback: the successful repetitions kept no snapshot of their own.
+    restoreScalars(ctx, savedScalars)
+    popCapturesTo(ctx, savedCapOff)
+    return false
+  # The body only moves ``pos``, so every rollback here is a scalar copy
+  # and nothing is pushed onto the side stack at all.
   while maxRep < 0 or count < maxRep:
-    let savedPos = ctx.pos
+    let attemptPos = ctx.pos
     if not matchWithCont(ctx, body, TrueCont):
-      ctx.pos = savedPos
+      ctx.pos = attemptPos
       break
     count += 1
-    if ctx.pos == savedPos:
+    if ctx.pos == attemptPos:
       break # zero-width: count as one rep, then stop
-  if count >= minRep:
-    return runCont(ctx, cont)
+  if count >= minRep and runCont(ctx, cont):
+    return true
+  restoreScalars(ctx, savedScalars)
   false
 
 proc runQuantGreedyMore(ctx: MatchContext, contId: ContId): bool =
   ## Continuation invoked after a single greedy quantifier body match.
   ## Captures the body's outcome ("zero-width" vs progress) and decides
   ## whether to try one more repetition or fall back to ``cont``.
-  let savedPos = ctx.frames[contId].qSavedPos
-  let body = ctx.frames[contId].qBody
-  let minRep = int(ctx.frames[contId].qMinRep)
-  let maxRep = int(ctx.frames[contId].qMaxRep)
-  let count = int(ctx.frames[contId].qCount)
-  let parent = ctx.frames[contId].parent
+  let fr = ctx.frames[contId]
+  let savedPos = fr.qSavedPos
+  let body = fr.qBody
+  let minRep = int(fr.qMinRep)
+  let maxRep = int(fr.qMaxRep)
+  let count = int(fr.qCount)
+  let parent = fr.parent
   if ctx.pos == savedPos:
     # Zero-width body match. Try cont, then try more iterations
     # in a bounded loop to set different captures (no recursive backtracking).
@@ -740,7 +863,9 @@ proc runQuantGreedyMore(ctx: MatchContext, contId: ContId): bool =
         restore(ctx, s2)
         break
       if runCont(ctx, parent):
+        drop(ctx, s2)
         return true
+      drop(ctx, s2)
     return false
   matchQuantGreedy(ctx, body, minRep, maxRep, count + 1, parent)
 
@@ -763,7 +888,9 @@ proc runQuantLazyMore(ctx: MatchContext, contId: ContId): bool =
         restore(ctx, s2)
         break
       if runCont(ctx, parent):
+        drop(ctx, s2)
         return true
+      drop(ctx, s2)
     return false
   matchQuantLazy(ctx, body, minRep, maxRep, count + 1, parent)
 
@@ -1290,10 +1417,8 @@ proc matchLookbehindFixed(
   let bodyMatch = matchWithCont(ctx, body, fid)
   ctx.frames.setLen(fid)
   if bodyMatch:
-    let savedCaps = ctx.captures
-    restore(ctx, saved)
+    restoreKeepingCaptures(ctx, saved)
     restoreStackLens(ctx, stackSnap)
-    ctx.captures = savedCaps
     return runCont(ctx, cont)
   restore(ctx, saved)
   restoreStackLens(ctx, stackSnap)
@@ -1325,12 +1450,13 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
     let stackSnap = saveStackLens(ctx)
     let saved = save(ctx)
     let bodyMatch = matchWithCont(ctx, node.lookBody, TrueCont)
-    let savedCaps = ctx.captures # keep captures from positive lookahead
+    if bodyMatch:
+      # Keep the captures the lookahead body made.
+      restoreKeepingCaptures(ctx, saved)
+      restoreStackLens(ctx, stackSnap)
+      return runCont(ctx, cont)
     restore(ctx, saved)
     restoreStackLens(ctx, stackSnap)
-    if bodyMatch:
-      ctx.captures = savedCaps
-      return runCont(ctx, cont)
     false
   of lkNegAhead:
     let stackSnap = saveStackLens(ctx)
@@ -1359,10 +1485,8 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
             let bodyMatch = matchWithCont(ctx, alt, fid)
             ctx.frames.setLen(fid)
             if bodyMatch:
-              let savedCaps = ctx.captures
-              restore(ctx, saved)
+              restoreKeepingCaptures(ctx, saved)
               restoreStackLens(ctx, stackSnap)
-              ctx.captures = savedCaps
               if runCont(ctx, cont):
                 return true
             else:
@@ -1385,10 +1509,8 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
             let bodyMatch = matchWithCont(ctx, alt, fid)
             ctx.frames.setLen(fid)
             if bodyMatch:
-              let savedCaps = ctx.captures
-              restore(ctx, saved)
+              restoreKeepingCaptures(ctx, saved)
               restoreStackLens(ctx, stackSnap)
-              ctx.captures = savedCaps
               return runCont(ctx, cont) # shortest priority: commit
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
@@ -1417,10 +1539,8 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
       let bodyMatch = matchWithCont(ctx, body, fid)
       ctx.frames.setLen(fid)
       if bodyMatch:
-        let savedCaps = ctx.captures
-        restore(ctx, saved)
+        restoreKeepingCaptures(ctx, saved)
         restoreStackLens(ctx, stackSnap)
-        ctx.captures = savedCaps
         return runCont(ctx, cont) # shortest priority: commit to this match
       restore(ctx, saved)
       restoreStackLens(ctx, stackSnap)
@@ -1509,6 +1629,7 @@ proc matchAtomic(ctx: MatchContext, body: Node, cont: ContId): bool =
   if matchWithCont(ctx, body, TrueCont):
     # Body matched — commit, no backtracking into body
     if runCont(ctx, cont):
+      drop(ctx, saved)
       return true
   restore(ctx, saved)
   false
@@ -1643,12 +1764,13 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
       # Save pos, captures, keepStart — but NOT flags.
       # Isolated flag groups (?i) extend across alternation branches.
       let savedPos = ctx.pos
-      let savedCaps = ctx.captures
       let savedKeep = ctx.keepStart
+      let capOff = pushCaptures(ctx)
       if matchWithCont(ctx, alt, cont):
+        ctx.capSaves.setLen(capOff)
         return true
       ctx.pos = savedPos
-      ctx.captures = savedCaps
+      popCapturesTo(ctx, capOff)
       ctx.keepStart = savedKeep
     false
   of nkCharType:
@@ -1726,7 +1848,9 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
     of qkLazy:
       matchQuantLazy(ctx, node.quantBody, qmin, qmax, 0, cont)
     of qkPossessive:
-      matchQuantPossessive(ctx, node.quantBody, qmin, qmax, cont)
+      matchQuantPossessive(
+        ctx, node.quantBody, qmin, qmax, not node.quantBodyPure, cont
+      )
   of nkBackreference:
     matchBackref(ctx, node.backrefIndex, cont, node.backrefLevel)
   of nkNamedBackref:
@@ -1738,6 +1862,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
         let idx = i + 1 # captures are 1-indexed in boundaries
         let saved = save(ctx)
         if matchBackref(ctx, idx, cont, node.namedBackrefLevel):
+          drop(ctx, saved)
           return true
         restore(ctx, saved)
     if not anyFound:
@@ -1823,20 +1948,20 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
           let stackSnap = saveStackLens(ctx)
           let saved = save(ctx)
           let bodyMatch = matchWithCont(ctx, node.condBody.lookBody, TrueCont)
-          let capsAfterBody = ctx.captures
-          restore(ctx, saved)
-          restoreStackLens(ctx, stackSnap)
-          if not bodyMatch:
-            condMet = true # negative lookaround succeeded
-          else:
+          if bodyMatch:
             condMet = false # negative lookaround failed, preserve captures
-            ctx.captures = capsAfterBody
+            restoreKeepingCaptures(ctx, saved)
+          else:
+            condMet = true # negative lookaround succeeded
+            restore(ctx, saved)
+          restoreStackLens(ctx, stackSnap)
         else:
           let stackSnap = saveStackLens(ctx)
           let saved = save(ctx)
           if matchWithCont(ctx, node.condBody, TrueCont):
             # Condition matched — condMet = true, pos is advanced past condition
             condMet = true
+            drop(ctx, saved)
           else:
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
@@ -1844,11 +1969,20 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
       matchWithCont(ctx, node.condYes, cont)
     elif node.condNo != nil:
       matchWithCont(ctx, node.condNo, cont)
-    elif node.condKind in {ckBackref, ckNamedRef}:
-      false # backref condition false with no else-branch → fail
+    elif node.condKind in {ckBackref, ckNamedRef} and (
+      node.condYes == nil or
+      (node.condYes.kind == nkConcat and node.condYes.children.len == 0)
+    ):
+      # Oniguruma fails a false backreference condition with neither an
+      # else-branch nor a yes-branch: /(a)?(?(1))b/ does not match "b", while
+      # /(a)?(?(1)(?:))b/ does — syntactic emptiness is what counts.
+      false
     else:
+      # Every other false condition with no else-branch is simply skipped:
+      # Oniguruma for backreferences (/(a)?(?(1)x)b/ matches "b"), and PCRE2
+      # for regex conditions and the reni-only forms, which Oniguruma has no
+      # equivalent of.
       runCont(ctx, cont)
-        # regex/other condition false with no else-branch → empty match
   of nkAbsent:
     matchAbsent(ctx, node, cont)
   of nkCalloutMax:
@@ -1982,6 +2116,26 @@ proc newMatchContext*(maxCapCount: int = 0): MatchContext =
     result.groupRecursionDepth = newSeq[int](maxCapCount)
     result.captureStacks = newSeq[seq[Span]](maxCapCount)
 
+proc noteCapSavesUsage(ctx: MatchContext) =
+  ## Account for one finished search against the ``capSaves`` side stack.
+  ## ``setLen`` keeps the capacity, so one deep backtrack would pin tens of
+  ## megabytes for the context's life; releasing on every search above
+  ## ``CapSavesKeep`` would instead free and re-grow the buffer on every call,
+  ## since a plain greedy quantifier over a few KB already reaches that mark.
+  ## So hand the capacity back only after several small searches in a row.
+  ## Quick rejects never touch the side stack but are counted here too, or a
+  ## context that is only ever quick-rejected would hold its peak forever.
+  if ctx.capSavesPeak > CapSavesKeep:
+    ctx.capSavesQuiet = 0
+    ctx.capSavesHigh = max(ctx.capSavesHigh, ctx.capSavesPeak)
+  else:
+    inc ctx.capSavesQuiet
+    if ctx.capSavesQuiet >= CapSavesQuietRuns and ctx.capSavesHigh > CapSavesKeep:
+      ctx.capSaves = newSeqOfCap[Span](CapSavesKeep)
+      ctx.capSavesHigh = 0
+      ctx.capSavesQuiet = 0
+  ctx.capSavesPeak = 0
+
 proc resetForRegex(
     ctx: MatchContext,
     subject: string,
@@ -2001,6 +2155,7 @@ proc resetForRegex(
   ctx.steps = 0
   ctx.recursionDepth = 0
   ctx.callDepth = 0
+  noteCapSavesUsage(ctx)
   let capCount = regex.captureCount
   # ``captures`` is sized exactly (it is copied into ``Match.boundaries``).
   # The internal buffers only grow, so their capacity survives a switch to
@@ -2029,8 +2184,10 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.subjectEnd = ctx.subject.len
   ctx.recursionDepth = 0
   ctx.callDepth = 0
+  # ``setLen(0)`` is a single length store; guarding it would cost more.
   ctx.frames.setLen(0)
   ctx.captureSnapshots.setLen(0)
+  ctx.capSaves.setLen(0)
   for i in 0 ..< ctx.captures.len:
     ctx.captures[i] = UnsetSpan
   for i in 0 ..< ctx.groupRecursionDepth.len:
@@ -2083,6 +2240,7 @@ proc searchImplInto*(
         found = true
         break
     if not found:
+      noteCapSavesUsage(ctx)
       return
   resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
@@ -2184,6 +2342,7 @@ proc searchBackwardImplInto*(
         found = true
         break
     if not found:
+      noteCapSavesUsage(ctx)
       return
   resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo

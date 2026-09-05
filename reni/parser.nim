@@ -1189,7 +1189,16 @@ proc parseConditional(p: var Parser): Node =
     var condParser = initParser(condName, p.flags)
     condBodyNode = condParser.parseRegex()
 
-  let yes = p.parseConcat()
+  let yesStart = p.pos
+  var yes = p.parseConcat()
+  if p.pos != yesStart and yes.kind == nkConcat and yes.children.len == 0:
+    # ``(?#...)``, ``\Q\E`` and extended-mode whitespace/comments are erased
+    # while parsing, so an AST-empty yes-branch can still have been non-empty in
+    # the source.  Consuming any input means the author wrote something, so wrap
+    # it like ``(?:)`` for the engine's emptiness test: /(a)?(?(1)(?#x))b/
+    # matches "b" but /(a)?(?(1))b/ does not.  Deciding on source position
+    # rather than the AST is Oniguruma's own rule.
+    yes = Node(kind: nkGroup, groupBody: yes)
   var no: Node = nil
   if p.peek == '|':
     p.advance()
