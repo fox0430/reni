@@ -98,7 +98,7 @@ type
     groupRecursionDepth: seq[int] ## per-group recursion depth counter
     steps: int ## match step counter for ReDoS protection
     graphemeMode: GraphemeMode ## current grapheme mode from (?y{g}) or (?y{w})
-    stepLimit: int ## max steps allowed (0 = unlimited)
+    stepLimit: int ## max steps allowed (``int.high`` = unlimited)
     maxRecursionDepth: int ## max subexpression recursion depth
     calloutCounters: Table[string, int] ## (*COUNT) / (*MAX) tag counters
     callDepth: int ## matchWithCont recursion depth for stack overflow protection
@@ -163,6 +163,11 @@ template oa(s: Subject): untyped =
   toOpenArray(s.data, 0, s.size - 1)
 
 const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
+
+# Counters in this region are bounded by ``stepLimit`` / ``MaxCallDepth`` / the
+# subject length, and ``fixedByteLen`` / ``maxByteLen`` guard overflow
+# explicitly, so the checks would only cost the hot path instructions.
+{.push overflowChecks: off.}
 
 const CapSavesKeep = 4096
   ## ``capSaves`` capacity (~64 KB) a context keeps between searches for free;
@@ -1281,6 +1286,8 @@ proc fixedByteLen(node: Node): int =
       let cl = fixedByteLen(child)
       if cl < 0:
         return -1
+      if cl > int.high - total:
+        return -1 # overflow guard
       total += cl
     total
   of nkAlternation:
@@ -1298,6 +1305,8 @@ proc fixedByteLen(node: Node): int =
       let bodyLen = fixedByteLen(node.quantBody)
       if bodyLen < 0:
         return -1
+      if node.quantMin > 0 and bodyLen > int.high div node.quantMin:
+        return -1 # overflow
       bodyLen * node.quantMin
     else:
       -1
@@ -1343,9 +1352,9 @@ proc maxByteLen(node: Node): int =
       let cl = maxByteLen(child)
       if cl < 0:
         return -1
-      total += cl
-      if total < 0:
+      if cl > int.high - total:
         return -1 # overflow guard
+      total += cl
     total
   of nkAlternation:
     var best = 0
@@ -1361,10 +1370,9 @@ proc maxByteLen(node: Node): int =
     let bodyLen = maxByteLen(node.quantBody)
     if bodyLen < 0:
       return -1
-    let total = bodyLen * node.quantMax
-    if node.quantMax > 0 and total div node.quantMax != bodyLen:
+    if node.quantMax > 0 and bodyLen > int.high div node.quantMax:
       return -1 # overflow
-    total
+    bodyLen * node.quantMax
   of nkCapture:
     maxByteLen(node.captureBody)
   of nkNamedCapture:
@@ -1742,7 +1750,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
 
 proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
   inc ctx.steps
-  if ctx.stepLimit > 0 and ctx.steps > ctx.stepLimit:
+  if ctx.steps > ctx.stepLimit:
     raise newException(RegexLimitError, "match step limit exceeded")
   inc ctx.callDepth
   if ctx.callDepth > MaxCallDepth:
@@ -2106,11 +2114,16 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
         ctx.flBestMatch.boundaries[0].a = ctx.keepStart
     false # force backtracking for more alternatives
 
+{.pop.} # overflowChecks: off — see the matching {.push.} above
+
 proc newMatchContext*(maxCapCount: int = 0): MatchContext =
   ## Allocate a reusable matcher scratch buffer.  Pre-sizing ``maxCapCount``
   ## avoids reallocation when the first regex has that many capture groups
   ## (default 0 means "grow on first use").
   result = MatchContext()
+  # ``resetForRegex`` overwrites this; default to unlimited so a context used
+  # before a reset cannot trip the step limit.
+  result.stepLimit = int.high
   if maxCapCount > 0:
     result.captures = newSeq[Span](maxCapCount + 1)
     result.groupRecursionDepth = newSeq[int](maxCapCount)
@@ -2148,7 +2161,7 @@ proc resetForRegex(
   ctx.flags = regex.flags
   ctx.regex = regex
   ctx.subjectEnd = subject.len
-  ctx.stepLimit = stepLimit
+  ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
   # Reset the per-search counters that used to be zero-initialized by
   # allocating a fresh ``MatchContext``.
