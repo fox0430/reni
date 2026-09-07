@@ -25,7 +25,7 @@ proc countMatches(ctx: MatchContext, subject: string, regex: Regex): int =
     if not m.found:
       break
     inc result
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0].b, pos)
+    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
     if nextPos < 0:
       break
     pos = nextPos

@@ -210,22 +210,44 @@ proc captureText*(
   captureText(m, idx, subject)
 
 proc nextRunePos*(subject: string, pos: int): int =
-  ## Advance past one UTF-8 code point. Returns the byte offset after the rune.
-  result = pos + 1
-  while result < subject.len and (subject[result].uint8 and 0xC0'u8) == 0x80'u8:
-    inc result
+  ## Advance past one character. Returns the byte offset after it.
+  ##
+  ## Uses the same length rule as the scan loops, so the positions
+  ## ``findAll`` / ``replace`` / ``split`` step to after a zero-width match
+  ## are exactly the positions ``search`` starts an attempt at.
+  ##
+  ## The step never leaves the subject: a sequence truncated by the end
+  ## declares more bytes than are there, and stepping past ``subject.len``
+  ## would skip the end position — which is a start position the scan does
+  ## visit — and hand a caller an out-of-range slice bound.
+  ##
+  ## At ``pos == subject.len`` there is no character to advance past, and the
+  ## result is ``pos + 1``: one past the end, which ends a scan.
+  if pos >= subject.len:
+    pos + 1
+  else:
+    min(pos + encLen(subject[pos].uint8), subject.len)
 
-proc advanceAfterMatch*(subject: string, matchEnd, pos: int): int {.inline.} =
-  ## Return next search position after a match.
+proc advanceAfterMatch*(subject: string, matchSpan: Span): int {.inline.} =
+  ## Return next search position after the match spanning ``matchSpan``.
   ## For zero-width matches, advance by one rune to avoid infinite loop.
   ## Returns -1 to signal that iteration should stop.
-  if matchEnd == pos:
-    if pos < subject.len:
-      nextRunePos(subject, pos)
+  ##
+  ## Zero width is ``matchSpan.b == matchSpan.a``, not "the match ended where
+  ## the scan began": a zero-width match found past the scan start would
+  ## otherwise resume the scan at the position it was just found at and be
+  ## yielded a second time.
+  ##
+  ## The span is taken whole rather than as two ``int`` parameters so that a
+  ## caller written against an older argument order fails to compile instead
+  ## of silently iterating differently.
+  if matchSpan.b == matchSpan.a:
+    if matchSpan.a < subject.len:
+      nextRunePos(subject, matchSpan.a)
     else:
       -1
   else:
-    matchEnd
+    matchSpan.b
 
 iterator findAll*(
     subject: string,
@@ -246,7 +268,7 @@ iterator findAll*(
     if not m.found:
       break
     yield m
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0].b, pos)
+    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
     if nextPos < 0:
       break
     pos = nextPos
@@ -329,12 +351,14 @@ proc replace*(
     if count > 0 and replaced >= count:
       result.add subject[matchEnd ..< subject.len]
       break
-    let nextPos = advanceAfterMatch(subject, matchEnd, pos)
+    let nextPos = advanceAfterMatch(subject, Span(a: matchStart, b: matchEnd))
     if nextPos < 0:
       break
-    if matchEnd == pos:
-      # Zero-width match: copy the skipped character to output
-      result.add subject[pos ..< nextPos]
+    if matchEnd == matchStart:
+      # Zero-width match: copy the skipped character to output.  Everything
+      # before the match is already in ``result``, so this starts at the
+      # match, which is not always where the scan started.
+      result.add subject[matchStart ..< nextPos]
     pos = nextPos
 
 proc replace*(
@@ -372,12 +396,14 @@ proc replace*(
     if count > 0 and replaced >= count:
       result.add subject[matchEnd ..< subject.len]
       break
-    let nextPos = advanceAfterMatch(subject, matchEnd, pos)
+    let nextPos = advanceAfterMatch(subject, Span(a: matchStart, b: matchEnd))
     if nextPos < 0:
       break
-    if matchEnd == pos:
-      # Zero-width match: copy the skipped character to output
-      result.add subject[pos ..< nextPos]
+    if matchEnd == matchStart:
+      # Zero-width match: copy the skipped character to output.  Everything
+      # before the match is already in ``result``, so this starts at the
+      # match, which is not always where the scan started.
+      result.add subject[matchStart ..< nextPos]
     pos = nextPos
 
 proc split*(
@@ -389,11 +415,16 @@ proc split*(
 ): seq[string] =
   ## Split subject by regex matches.
   result = @[]
+  # ``pos`` is where the next field starts, ``scanPos`` where the next search
+  # does.  They part company after a zero-width match: the scan has to step
+  # over a character to make progress, but that character is not a separator
+  # and belongs to the field that follows.
   var pos = 0
+  var scanPos = 0
   var splits = 0
   var m: Match
   let ctx = newMatchContext(regex.captureCount)
-  while pos <= subject.len:
+  while scanPos <= subject.len:
     if maxSplit > 0 and splits >= maxSplit:
       break
     searchImplInto(
@@ -401,7 +432,7 @@ proc split*(
       subject,
       regex,
       m,
-      start = pos,
+      start = scanPos,
       stepLimit = stepLimit,
       maxRecursionDepth = maxRecursionDepth,
     )
@@ -418,8 +449,9 @@ proc split*(
       else:
         result.add ""
     inc splits
-    let nextPos = advanceAfterMatch(subject, matchEnd, pos)
+    pos = matchEnd
+    let nextPos = advanceAfterMatch(subject, Span(a: matchStart, b: matchEnd))
     if nextPos < 0:
       break
-    pos = nextPos
+    scanPos = nextPos
   result.add subject[pos ..< subject.len]

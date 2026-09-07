@@ -57,7 +57,7 @@ proc collectReni(ctx: MatchContext, subject: string, regex: Regex): seq[Span] =
     if not m.found:
       break
     result.add (m.boundaries[0].a, m.boundaries[0].b)
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0].b, pos)
+    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
     if nextPos < 0:
       break
     pos = nextPos
@@ -69,9 +69,10 @@ proc collectOnig(
   while pos <= subject.len:
     if onig.search(reg, subject, region, pos) < 0:
       break
+    let mStart = region.beg[0].int
     let mEnd = region.ends[0].int
-    result.add (region.beg[0].int, mEnd)
-    let nextPos = advanceAfterMatch(subject, mEnd, pos)
+    result.add (mStart, mEnd)
+    let nextPos = advanceAfterMatch(subject, reni.Span(a: mStart, b: mEnd))
     if nextPos < 0:
       break
     pos = nextPos
@@ -84,9 +85,10 @@ proc collectPcre2(
     if pcre2.match(code, subject, data, pos) <= 0:
       break
     let ov = pcre2.ovector(data)
+    let mStart = ov[0].int
     let mEnd = ov[1].int
-    result.add (ov[0].int, mEnd)
-    let nextPos = advanceAfterMatch(subject, mEnd, pos)
+    result.add (mStart, mEnd)
+    let nextPos = advanceAfterMatch(subject, reni.Span(a: mStart, b: mEnd))
     if nextPos < 0:
       break
     pos = nextPos
@@ -99,7 +101,7 @@ proc countReni(ctx: MatchContext, subject: string, regex: Regex): int =
     if not m.found:
       break
     inc result
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0].b, pos)
+    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
     if nextPos < 0:
       break
     pos = nextPos
@@ -110,7 +112,8 @@ proc countOnig(reg: onig.OnigRegex, subject: string, region: ptr onig.OnigRegion
     if onig.search(reg, subject, region, pos) < 0:
       break
     inc result
-    let nextPos = advanceAfterMatch(subject, region.ends[0].int, pos)
+    let nextPos =
+      advanceAfterMatch(subject, reni.Span(a: region.beg[0].int, b: region.ends[0].int))
     if nextPos < 0:
       break
     pos = nextPos
@@ -123,7 +126,9 @@ proc countPcre2(
     if pcre2.match(code, subject, data, pos) <= 0:
       break
     inc result
-    let nextPos = advanceAfterMatch(subject, pcre2.ovector(data)[1].int, pos)
+    let nextPos = advanceAfterMatch(
+      subject, reni.Span(a: pcre2.ovector(data)[0].int, b: pcre2.ovector(data)[1].int)
+    )
     if nextPos < 0:
       break
     pos = nextPos

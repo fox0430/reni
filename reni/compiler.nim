@@ -461,6 +461,82 @@ proc validateNumericRefs(
   for child in node.childNodes:
     validateNumericRefs(child, captureCount, namedCaptures)
 
+proc collectLiteralNodes(node: Node, into: var seq[Node]): bool =
+  ## Append the literal characters of a subtree made of nothing but literals —
+  ## one, a concat of them, or any of those inside a ``(?:...)``.  False (with
+  ## ``into`` for the caller to discard) for anything else, including an empty
+  ## group or concat: Oniguruma does not see through ``(?:)`` either.
+  if node == nil:
+    return false
+  case node.kind
+  of nkLiteral, nkEscapedLiteral, nkString:
+    into.add node
+    true
+  of nkGroup:
+    collectLiteralNodes(node.groupBody, into)
+  of nkConcat:
+    if node.children.len == 0:
+      return false
+    for child in node.children:
+      if not collectLiteralNodes(child, into):
+        return false
+    true
+  else:
+    false
+
+proc flattenLiteralGroups(node: Node) =
+  ## Splice a ``(?:...)`` holding nothing but literals into the concat around
+  ## it.  Such a group has no identity of its own, and the wrapper only hid its
+  ## characters from the surrounding run — which is what the reverse
+  ## multi-character fold needs, so ``(?i)f(?:f)`` then matches ``ﬀ`` like
+  ## ``(?i)ff``.  Oniguruma reads these groups the same way.
+  ##
+  ## Must run before unnamed captures are demoted: a demoted capture is an
+  ## ``nkGroup`` too, and Oniguruma does not fold through one.
+  if node == nil:
+    return
+  case node.kind
+  of nkConcat:
+    for child in node.children:
+      flattenLiteralGroups(child)
+    var spliced: seq[Node]
+    var changed = false
+    for child in node.children:
+      var inner: seq[Node]
+      if child.kind == nkGroup and collectLiteralNodes(child, inner):
+        spliced.add inner
+        changed = true
+      else:
+        spliced.add child
+    if changed:
+      node.children = spliced
+  of nkAlternation:
+    for alt in node.alternatives:
+      flattenLiteralGroups(alt)
+  of nkCapture:
+    flattenLiteralGroups(node.captureBody)
+  of nkNamedCapture:
+    flattenLiteralGroups(node.namedCaptureBody)
+  of nkGroup:
+    flattenLiteralGroups(node.groupBody)
+  of nkFlagGroup:
+    flattenLiteralGroups(node.flagBody)
+  of nkQuantifier:
+    flattenLiteralGroups(node.quantBody)
+  of nkLookaround:
+    flattenLiteralGroups(node.lookBody)
+  of nkAtomicGroup:
+    flattenLiteralGroups(node.atomicBody)
+  of nkConditional:
+    flattenLiteralGroups(node.condYes)
+    flattenLiteralGroups(node.condNo)
+    flattenLiteralGroups(node.condBody)
+  of nkAbsent:
+    flattenLiteralGroups(node.absentBody)
+    flattenLiteralGroups(node.absentExpr)
+  else:
+    discard
+
 proc mergeLiterals(node: Node): Node =
   ## Merge consecutive nkLiteral/nkEscapedLiteral children in nkConcat into nkString.
   if node == nil:
@@ -590,6 +666,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   var ast = p.parseRegex()
   if not p.atEnd:
     raise newException(RegexError, "unexpected character at position " & $p.position)
+  # Before anything else reads the tree, and before unnamed captures are
+  # demoted into groups.  See [flattenLiteralGroups].  Skipped when the pattern
+  # has no ``(?:...)`` at all.
+  if p.sawPlainGroup:
+    flattenLiteralGroups(ast)
   var namedCaptures = p.namedCaptures
   var captureCount = p.captureCount
   # Resolve forward reference conditionals now that all named captures are known
@@ -629,11 +710,15 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
   discard markQuantBodyPure(ast)
+  let finalFlags = flags + (p.currentFlags * {rfFindLongest})
+  # Same rule: must see the final AST.  Annotate under ``finalFlags``, the
+  # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
+  # ``regex.flags``), since an annotation is used only while the two agree.
+  annotateLookaroundBounds(ast, finalFlags)
   # Re-collect group bodies after AST transformation
   bodies = @[]
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
-  let finalFlags = flags + (p.currentFlags * {rfFindLongest})
   initRegex(
     pattern = pattern,
     ast = ast,
@@ -643,5 +728,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     groupBodies = bodies,
     groupFlags = groupFlags,
     firstCharInfo = extractFirstChar(ast, finalFlags),
+    literalScan = hasLiteralPrefix(ast, finalFlags),
     requiredByte = extractRequiredByte(ast, finalFlags),
+    semiEndAnchored = semiEndAnchored(ast),
+    semiEndDMax = maxByteLen(ast, finalFlags),
   )

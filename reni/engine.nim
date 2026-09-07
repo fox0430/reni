@@ -162,10 +162,114 @@ template oa(s: Subject): untyped =
   ## The view as an ``openArray[char]``, for the Unicode helpers.
   toOpenArray(s.data, 0, s.size - 1)
 
+proc decodeChar(
+    ctx: MatchContext, p: int, code: var int32, next: var int
+): bool {.inline.} =
+  ## Decode the character at ``p`` within the active subject bounds.
+  ## False when the lead byte declares more bytes than are left, which is not
+  ## a character at all: nothing consumes it.
+  decodeAt(toOpenArray(ctx.subject.data, 0, ctx.subjectEnd - 1), p, code, next)
+
+proc nextScanPos(s: string, p: int): int {.inline.} =
+  ## The next position after ``p`` at which the scan loops start a match
+  ## attempt.  Takes a plain string: the scans run before a ``MatchContext``
+  ## view of the subject exists.
+  ##
+  ## One character on, with the length read out of the lead byte, clamped to
+  ## the end of the subject.  A sequence truncated by the end declares more
+  ## bytes than are there; stepping past ``s.len`` would skip the end
+  ## position, which is a start position like any other — ``\z``, ``$`` and
+  ## ``\b`` match there, and the backward scan starts from it.
+  min(p + encLen(s[p].uint8), s.len)
+
+proc leftAdjustCharHead(s: string, p: int): int {.inline.} =
+  ## Oniguruma's ``utf8_left_adjust_char_head``: walk back to the nearest byte
+  ## that is not a continuation byte.  This is a different rule from the
+  ## ``encLen`` chain ``nextScanPos`` follows, and on malformed input the two
+  ## disagree — as they do in Oniguruma, which steps forward with one and
+  ## back with the other.  Everything that walks *back* to a start position
+  ## goes through here: the backward scan and the semi-end anchor jump.
+  var q = p
+  while q > 0 and (s[q].uint8 and 0xC0'u8) == 0x80'u8:
+    dec q
+  q
+
+proc prevCharHead(s: string, p: int): int {.inline.} =
+  ## Oniguruma's ``ONIGENC_STEP_BACK(.., 1)``: the head of the character
+  ## before ``p``.  The backward scan's step, and the position the semi-end
+  ## anchor jump measures from.
+  if p <= 0:
+    0
+  else:
+    leftAdjustCharHead(s, p - 1)
+
+proc rightAdjustCharHead(s: string, p: int): int {.inline.} =
+  ## Oniguruma's ``onigenc_get_right_adjust_char_head``: left-adjust, and when
+  ## that moved, step one character forward again.  ``p`` must be inside ``s``.
+  ##
+  ## The forward step is clamped to ``s.len``: a lead byte can declare more
+  ## bytes than the subject holds, and a start position past the end would
+  ## leave the scan loop with nothing to try.
+  let q = leftAdjustCharHead(s, p)
+  if q < p:
+    min(q + encLen(s[q].uint8), s.len)
+  else:
+    p
+
+proc advanceChainTo(s: string, start, target: int, byteScan: bool): int {.inline.} =
+  ## The first scan position at or after ``target`` that a forward scan from
+  ## ``start`` actually visits.
+  ##
+  ## The rule for a skip that stays on the walk it is already on, such as the
+  ## ``^`` skip, whose newline is found by scanning bytes: jumping straight
+  ## onto an off-chain offset would put the scan on a different walk and miss
+  ## start positions the current one still owes.  A ``\Z`` skip is a window,
+  ## not a walk, and re-bases instead — see [semiEndScanStart].
+  ##
+  ## Under a case-sensitive literal prefix the scan steps by bytes, so every
+  ## offset is a candidate; otherwise it follows the ``encLen`` chain and the
+  ## chain has to be walked to reach ``target``.
+  if byteScan:
+    return clamp(target, start, s.len)
+  result = start
+  while result < target and result < s.len:
+    result = nextScanPos(s, result)
+
+proc semiEndScanStart(s: string, regex: Regex, start: int): int =
+  ## Where ``onig_search`` starts a forward scan for a pattern anchored at
+  ## ``\Z``.  A match can only end at the subject's end or just before a
+  ## newline that ends it, so everything more than ``semiEndDMax`` bytes to
+  ## the left of that anchor is skipped rather than tried.
+  ##
+  ## A *window*, not a walk: ``onig_search`` computes the range start by
+  ## arithmetic (``min_semi_end - dmax``), adjusts it to a character head and
+  ## searches from there, so the landing point need not be on the ``encLen``
+  ## chain from ``start``.  The walk that follows is the chain from where it
+  ## lands.  Hence ``\Z`` and ``\s\Z`` differ on ``"\xC0\n"``: ``dmax == 0``
+  ## gives window ``[1, 1]`` and a match at the newline, ``dmax == 1`` gives
+  ## ``[0, 0]``, where ``\s`` cannot match ``"\xC0"``.
+  let dmax = regex.semiEndDMax
+  if dmax < 0:
+    return start # Unbounded match length: no position can be ruled out.
+  let preEnd = prevCharHead(s, s.len)
+  let minSemiEnd =
+    if s[preEnd] == '\n':
+      # Oniguruma only jumps when the newline leaves room to its left.
+      if preEnd == 0 or start > preEnd:
+        return start
+      preEnd
+    else:
+      s.len
+  if minSemiEnd - start <= dmax:
+    return start
+  result = minSemiEnd - dmax
+  if result < s.len:
+    result = rightAdjustCharHead(s, result)
+
 const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 
 # Counters in this region are bounded by ``stepLimit`` / ``MaxCallDepth`` / the
-# subject length, and ``fixedByteLen`` / ``maxByteLen`` guard overflow
+# subject length, and ``lengthBounds`` guards overflow
 # explicitly, so the checks would only cost the hot path instructions.
 {.push overflowChecks: off.}
 
@@ -299,15 +403,6 @@ proc restoreStackLens(ctx: MatchContext, savedLens: sink seq[int]) =
       break
   ctx.captureStacksDirty = stillDirty
 
-proc getNodeRune(node: Node): (bool, Rune) =
-  ## Extract the rune from a literal node.
-  if node.kind == nkLiteral:
-    (true, node.rune)
-  elif node.kind == nkEscapedLiteral:
-    (true, node.escapedRune)
-  else:
-    (false, Rune(0))
-
 proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool =
   template nodes(): untyped =
     parent.children
@@ -335,7 +430,7 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject.oa, checkPos, r, true)
+        nextCharAt(ctx.subject.oa, checkPos, r)
     ctx.pos = rangeStart
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
@@ -356,25 +451,6 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
     # (?~|) or (?~) in sequence - restore subject end (clear absent range limit)
     ctx.subjectEnd = ctx.subject.len
     return matchSeqCont(ctx, parent, idx + 1, cont)
-  # Multi-char fold: subject char folds to match consecutive pattern literals
-  # e.g., subject "ß" matching pattern "ss"
-  if rfIgnoreCase in ctx.flags and ctx.pos < ctx.subjectEnd and idx + 1 < nodes.len:
-    let (isLit1, r1) = getNodeRune(nodes[idx])
-    let (isLit2, r2) = getNodeRune(nodes[idx + 1])
-    if isLit1 and isLit2:
-      let reverses = getReverseMultiCharFolds(simpleFold(r1), simpleFold(r2))
-      if reverses.len > 0:
-        let savedPos = ctx.pos
-        var sr: Rune
-        fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
-        let srFold = simpleFold(sr)
-        for i in 0 ..< reverses.len:
-          if srFold == simpleFold(reverses.runes[i]):
-            # Subject char matches a multi-char fold of the pattern pair
-            if matchSeqCont(ctx, parent, idx + 2, cont):
-              return true
-            break
-        ctx.pos = savedPos
   let fid = pushFrame(
     ctx, Frame(kind: ckSeqContinue, parent: cont, sNode: parent, sIdx: int32(idx + 1))
   )
@@ -393,13 +469,45 @@ proc caseInsensitiveMatch(r, target: Rune, flags: RegexFlags): bool =
     return r == target
   simpleFold(r) == simpleFold(target)
 
+proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
+  ## Compare the encoding of ``target`` against the subject at ``p``.
+  ## Returns the position just past it, or -1 on mismatch.  Oniguruma holds a
+  ## case-sensitive literal as the bytes it was written with and compares
+  ## those, so this never decodes the subject: an overlong encoding of the
+  ## same code point is a different byte string and does not match.
+  var buf: array[4, char]
+  let n = utf8Encode(int32(target), buf)
+  if p + n > ctx.subjectEnd:
+    return -1
+  for i in 0 ..< n:
+    if ctx.subject[p + i] != buf[i]:
+      return -1
+  p + n
+
 proc matchLiteral(ctx: MatchContext, target: Rune, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
   let savedPos = ctx.pos
-  var r: Rune
-  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
-  if r == target or caseInsensitiveMatch(r, target, ctx.flags):
+  if rfIgnoreCase notin ctx.flags:
+    let e = matchBytes(ctx, target, savedPos)
+    if e < 0:
+      return false
+    ctx.pos = e
+    if runCont(ctx, cont):
+      return true
+    ctx.pos = savedPos
+    return false
+  var code: int32
+  var next: int
+  if not decodeChar(ctx, savedPos, code, next):
+    return false
+  let r = Rune(code)
+  # Under (?i) the comparison is on code points, and it reads the subject
+  # character through the same containers a class would, so an overlong
+  # encoding of an ASCII letter still fails.
+  if codeIsClassifiable(code, next - savedPos) and
+      (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
+    ctx.pos = next
     if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
@@ -414,11 +522,14 @@ proc matchLiteral(ctx: MatchContext, target: Rune, cont: ContId): bool =
         if ctx.pos >= ctx.subjectEnd:
           matched = false
           break
-        var sr: Rune
-        fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
-        if not caseInsensitiveMatch(sr, fold.runes[i], ctx.flags):
+        var sc: int32
+        var sn: int
+        if not decodeChar(ctx, ctx.pos, sc, sn) or
+            not codeIsClassifiable(sc, sn - ctx.pos) or
+            not caseInsensitiveMatch(Rune(sc), fold.runes[i], ctx.flags):
           matched = false
           break
+        ctx.pos = sn
       if matched and runCont(ctx, cont):
         return true
       ctx.pos = savedPos
@@ -433,10 +544,25 @@ proc matchString(ctx: MatchContext, runes: seq[Rune], cont: ContId): bool =
       return false
     let target = runes[i]
     let posBeforeSubjChar = ctx.pos
-    var r: Rune
-    fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
-    let posAfterSubjChar = ctx.pos
-    if r == target or caseInsensitiveMatch(r, target, ctx.flags):
+    if rfIgnoreCase notin ctx.flags:
+      # Case-sensitive: the whole string is compared as bytes.
+      let e = matchBytes(ctx, target, ctx.pos)
+      if e < 0:
+        ctx.pos = savedPos
+        return false
+      ctx.pos = e
+      inc i
+      continue
+    var code: int32
+    var next: int
+    if not decodeChar(ctx, ctx.pos, code, next):
+      ctx.pos = savedPos
+      return false
+    let r = Rune(code)
+    let classifiable = codeIsClassifiable(code, next - ctx.pos)
+    ctx.pos = next
+    let posAfterSubjChar = next
+    if classifiable and (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
       inc i
       continue
     # Try forward multi-char fold: pattern char folds to multiple subject chars (e.g., ß → ss)
@@ -450,11 +576,14 @@ proc matchString(ctx: MatchContext, runes: seq[Rune], cont: ContId): bool =
           if ctx.pos >= ctx.subjectEnd:
             matched = false
             break
-          var sr: Rune
-          fastRuneAt(ctx.subject.oa, ctx.pos, sr, true)
-          if not caseInsensitiveMatch(sr, fold.runes[j], ctx.flags):
+          var sc: int32
+          var sn: int
+          if not decodeChar(ctx, ctx.pos, sc, sn) or
+              not codeIsClassifiable(sc, sn - ctx.pos) or
+              not caseInsensitiveMatch(Rune(sc), fold.runes[j], ctx.flags):
             matched = false
             break
+          ctx.pos = sn
         if matched:
           inc i
           continue
@@ -483,17 +612,20 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
   let savedPos = ctx.pos
-  var r: Rune
-  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
-  # Grapheme cluster: \X or . in grapheme/word mode
+  # Grapheme cluster: \X or . in grapheme/word mode.  These work on byte
+  # sequences rather than a single decoded character, so they run first.
   if ct == ctGraphemeCluster or
       (ct == ctDot and ctx.graphemeMode in {gmGrapheme, gmWord}):
+    # A cluster still starts with a character, so a sequence truncated by the
+    # end of the subject is no cluster either.
+    var probe: int32
+    var probeNext: int
+    if not decodeChar(ctx, savedPos, probe, probeNext):
+      return false
     if ct == ctDot:
-      let dotOk = rfMultiLine in ctx.flags or r != Rune(0x0A)
-      if not dotOk:
-        ctx.pos = savedPos
+      let isNewline = codeIsClassifiable(probe, probeNext - savedPos) and probe == 0x0A
+      if isNewline and rfMultiLine notin ctx.flags:
         return false
-    ctx.pos = savedPos
     let clusterEnd =
       if ctx.graphemeMode == gmWord:
         nextWordSegmentEnd(ctx.subject.oa, savedPos)
@@ -505,52 +637,79 @@ proc matchCharType(ctx: MatchContext, ct: CharTypeKind, cont: ContId): bool =
         return true
     ctx.pos = savedPos
     return false
-  # Newline sequence: \R matches \r\n, \r, \n, \v, \f, or Unicode line separators
+
+  var code: int32
+  var next: int
+  if not decodeChar(ctx, savedPos, code, next):
+    return false
+  let classifiable = codeIsClassifiable(code, next - savedPos)
+
+  # Newline sequence: \R matches \r\n, \r, \n, \v, \f, or a Unicode line
+  # separator.  It reads as a positive class over those code points, so an
+  # unclassifiable character — an overlong "\xC0\x8A", a stray 0x85 byte —
+  # matches none of them.
   if ct == ctNewlineSeq:
-    let c = int32(r)
-    if c == 0x0D:
+    if not classifiable:
+      return false
+    if code == 0x0D:
+      ctx.pos = next
       if ctx.pos < ctx.subjectEnd and ctx.subject[ctx.pos] == '\n':
         inc ctx.pos
       if runCont(ctx, cont):
         return true
       ctx.pos = savedPos
       return false
-    elif c == 0x0A or c == 0x0B or c == 0x0C or c == 0x85 or c == 0x2028 or c == 0x2029:
+    elif code in [0x0A'i32, 0x0B, 0x0C, 0x85, 0x2028, 0x2029]:
+      ctx.pos = next
       if runCont(ctx, cont):
         return true
       ctx.pos = savedPos
       return false
     else:
-      ctx.pos = savedPos
       return false
-  # Standard character type matching
+
+  let r = Rune(code)
+  # ``member`` is the positive class test; the negative types invert it.
+  # Every type below except ``\w``/``\W`` and ``\O`` is a class, so its
+  # members are only reachable by a character ``codeIsClassifiable`` admits.
+  # ``\w`` and ``\W`` test the code point directly, the way Oniguruma's
+  # OP_WORD does, and so also see a one-byte character above U+007F.
   let matched =
     case ct
     of ctDot:
-      rfMultiLine in ctx.flags or r != Rune(0x0A)
+      rfMultiLine in ctx.flags or not (classifiable and code == 0x0A)
+    of ctNotNewline:
+      not (classifiable and code == 0x0A)
     of ctWord:
       isWordChar(r, rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags)
     of ctNotWord:
       not isWordChar(r, rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags)
     of ctDigit:
-      isDigitChar(r, rfAsciiDigit in ctx.flags or rfAsciiPosix in ctx.flags)
+      classifiable and
+        isDigitChar(r, rfAsciiDigit in ctx.flags or rfAsciiPosix in ctx.flags)
     of ctNotDigit:
-      not isDigitChar(r, rfAsciiDigit in ctx.flags or rfAsciiPosix in ctx.flags)
+      not (
+        classifiable and
+        isDigitChar(r, rfAsciiDigit in ctx.flags or rfAsciiPosix in ctx.flags)
+      )
     of ctSpace:
-      isSpaceChar(r, rfAsciiSpace in ctx.flags or rfAsciiPosix in ctx.flags)
+      classifiable and
+        isSpaceChar(r, rfAsciiSpace in ctx.flags or rfAsciiPosix in ctx.flags)
     of ctNotSpace:
-      not isSpaceChar(r, rfAsciiSpace in ctx.flags or rfAsciiPosix in ctx.flags)
+      not (
+        classifiable and
+        isSpaceChar(r, rfAsciiSpace in ctx.flags or rfAsciiPosix in ctx.flags)
+      )
     of ctHexDigit:
-      isHexDigitChar(r)
+      classifiable and isHexDigitChar(r)
     of ctNotHexDigit:
-      not isHexDigitChar(r)
+      not (classifiable and isHexDigitChar(r))
     of ctAnyChar:
       true
-    of ctNotNewline:
-      r != Rune(0x0A)
     of ctNewlineSeq, ctGraphemeCluster:
       false # unreachable: handled above
   if matched:
+    ctx.pos = next
     if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
@@ -1039,7 +1198,7 @@ proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: ContId): bool =
         ok = false
         break
       var subjRune: Rune
-      fastRuneAt(ctx.subject.oa, p, subjRune, true)
+      nextCharAt(ctx.subject.oa, p, subjRune)
       let expRune = Rune(expCP[i])
       if subjRune != expRune and simpleFold(subjRune) != simpleFold(expRune):
         ok = false
@@ -1052,6 +1211,28 @@ proc tryMultiCharFold(ctx: MatchContext, node: Node, cont: ContId): bool =
       ctx.pos = savedPos
   false
 
+proc classHasByte(node: Node, b: uint8, flags: RegexFlags): bool =
+  ## Whether a *one-byte* character stands in the class's byte container.
+  ##
+  ## Below U+0080 every container agrees, so the ordinary member test
+  ## answers it.  At or above, only a range written across the ASCII
+  ## boundary reaches: Oniguruma fills its byte set from ``lo`` to
+  ## ``min(hi, 0xFF)`` whenever ``lo`` is single-byte, so ``[a-ÿ]`` accepts a
+  ## stray ``0xFF`` byte while ``[ÿ]`` and ``[[:alpha:]]`` do not.
+  if b < 0x80:
+    let r = Rune(int32(b))
+    for atom in node.atoms:
+      if node.bracketClass and matchCcAtomWithFold(r, atom, flags):
+        return true
+      elif not node.bracketClass and matchCcAtom(r, atom, flags):
+        return true
+    return false
+  for atom in node.atoms:
+    if atom.kind == ccRange and int32(atom.rangeFrom) < 0x80 and
+        int32(b) <= int32(atom.rangeTo):
+      return true
+  false
+
 proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
   if ctx.pos >= ctx.subjectEnd:
     return false
@@ -1060,17 +1241,29 @@ proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
     if tryMultiCharFold(ctx, node, cont):
       return true
   let savedPos = ctx.pos
-  var r: Rune
-  fastRuneAt(ctx.subject.oa, ctx.pos, r, true)
+  var code: int32
+  var next: int
+  if not decodeChar(ctx, savedPos, code, next):
+    return false
 
+  # A class keeps its members in two containers and picks one by the
+  # character's encoded length, not by its value.  A one-byte character is
+  # looked up in the byte set; a longer one in the code-point ranges, which
+  # hold nothing below U+0080 — so an overlong ``"\xC0\xB1"`` matches no
+  # member.  Negation applies on top of the lookup either way, which is why
+  # ``[^a]`` accepts a stray ``0x80`` byte that ``[\x{80}]`` rejects.
   var anyMatch = false
-  for atom in node.atoms:
-    if node.bracketClass and matchCcAtomWithFold(r, atom, ctx.flags):
-      anyMatch = true
-      break
-    elif not node.bracketClass and matchCcAtom(r, atom, ctx.flags):
-      anyMatch = true
-      break
+  if next - savedPos == 1:
+    anyMatch = classHasByte(node, uint8(code), ctx.flags)
+  elif code >= 0x80:
+    let r = Rune(code)
+    for atom in node.atoms:
+      if node.bracketClass and matchCcAtomWithFold(r, atom, ctx.flags):
+        anyMatch = true
+        break
+      elif not node.bracketClass and matchCcAtom(r, atom, ctx.flags):
+        anyMatch = true
+        break
 
   let matched =
     if node.negated:
@@ -1078,36 +1271,38 @@ proc matchCharClass(ctx: MatchContext, node: Node, cont: ContId): bool =
     else:
       anyMatch
   if matched:
+    ctx.pos = next
     if runCont(ctx, cont):
       return true
   ctx.pos = savedPos
   false
 
-proc prevRune(s: openArray[char], pos: int): Rune =
-  ## Decode the rune ending just before `pos`.
+proc prevCharCode(s: openArray[char], pos: int): int32 =
+  ## The code point of the character ending just before ``pos``, or -1 when
+  ## ``pos`` is 0 and there is no such character.
+  ##
+  ## For ``pos > 0`` there is always an answer, so callers need no -1 check
+  ## there: `prevCharAt` either finds a character ending exactly at ``pos``
+  ## or reads the byte covered by nothing as its own value.
   if pos <= 0:
-    return Rune(0)
-  var startPos = pos - 1
-  while startPos > 0 and (s[startPos].uint8 and 0xC0'u8) == 0x80'u8:
-    dec startPos
-  var p = startPos
-  var r: Rune
-  fastRuneAt(s, p, r, true)
-  r
+    return -1
+  var q: int
+  prevCharAt(s, pos, q)
 
 proc matchWordBoundary(ctx: MatchContext): bool =
   let asciiOnly = rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags
   let prevIsWord =
     if ctx.pos > 0:
-      isWordChar(prevRune(ctx.subject.oa, ctx.pos), asciiOnly)
+      isWordChar(Rune(prevCharCode(ctx.subject.oa, ctx.pos)), asciiOnly)
     else:
       false
   let nextIsWord =
     if ctx.pos < ctx.subjectEnd:
-      var p = ctx.pos
-      var r: Rune
-      fastRuneAt(ctx.subject.oa, p, r, true)
-      isWordChar(r, asciiOnly)
+      var code: int32
+      var next: int
+      # ``\b`` reads the code point directly, like ``\w``: no class
+      # containers are involved, so a one-byte character above U+007F counts.
+      decodeChar(ctx, ctx.pos, code, next) and isWordChar(Rune(code), asciiOnly)
     else:
       false
   prevIsWord xor nextIsWord
@@ -1140,8 +1335,8 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
         return false
       let mpBefore = mp
       var sr, mr: Rune
-      fastRuneAt(ctx.subject.oa, sp, sr, true)
-      fastRuneAt(ctx.subject.oa, mp, mr, true)
+      nextCharAt(ctx.subject.oa, sp, sr)
+      nextCharAt(ctx.subject.oa, mp, mr)
       if sr == mr or caseInsensitiveMatch(sr, mr, ctx.flags):
         continue
       let asciiOnly = rfIgnoreCaseAscii in ctx.flags
@@ -1159,7 +1354,7 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
             ok = false
             break
           var tr: Rune
-          fastRuneAt(ctx.subject.oa, tp, tr, true)
+          nextCharAt(ctx.subject.oa, tp, tr)
           if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
             ok = false
             break
@@ -1182,7 +1377,7 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
             ok = false
             break
           var tr: Rune
-          fastRuneAt(ctx.subject.oa, tp, tr, true)
+          nextCharAt(ctx.subject.oa, tp, tr)
           if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
             ok = false
             break
@@ -1266,148 +1461,6 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
       ctx.captureStacks[index][myDepth] = savedStackEntry
   ok
 
-proc fixedByteLen(node: Node): int =
-  ## Returns the fixed byte length consumed by a node, or -1 if variable/unknown.
-  if node == nil:
-    return 0
-  case node.kind
-  of nkLiteral:
-    node.rune.size
-  of nkEscapedLiteral:
-    node.escapedRune.size
-  of nkString:
-    var total = 0
-    for r in node.runes:
-      total += r.size
-    total
-  of nkConcat:
-    var total = 0
-    for child in node.children:
-      let cl = fixedByteLen(child)
-      if cl < 0:
-        return -1
-      if cl > int.high - total:
-        return -1 # overflow guard
-      total += cl
-    total
-  of nkAlternation:
-    if node.alternatives.len == 0:
-      return 0
-    let first = fixedByteLen(node.alternatives[0])
-    if first < 0:
-      return -1
-    for i in 1 ..< node.alternatives.len:
-      if fixedByteLen(node.alternatives[i]) != first:
-        return -1
-    first
-  of nkQuantifier:
-    if node.quantMin == node.quantMax and node.quantMin >= 0:
-      let bodyLen = fixedByteLen(node.quantBody)
-      if bodyLen < 0:
-        return -1
-      if node.quantMin > 0 and bodyLen > int.high div node.quantMin:
-        return -1 # overflow
-      bodyLen * node.quantMin
-    else:
-      -1
-  of nkCapture:
-    fixedByteLen(node.captureBody)
-  of nkNamedCapture:
-    fixedByteLen(node.namedCaptureBody)
-  of nkGroup:
-    fixedByteLen(node.groupBody)
-  of nkFlagGroup:
-    if node.flagBody != nil:
-      fixedByteLen(node.flagBody)
-    else:
-      0
-  of nkAtomicGroup:
-    fixedByteLen(node.atomicBody)
-  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
-    0 # zero-width
-  of nkCharType:
-    -1 # variable UTF-8 width
-  of nkCharClass:
-    -1 # variable UTF-8 width
-  else:
-    -1
-
-proc maxByteLen(node: Node): int =
-  ## Returns an upper bound on bytes consumed, or -1 if unbounded/unknown.
-  if node == nil:
-    return 0
-  case node.kind
-  of nkLiteral:
-    node.rune.size
-  of nkEscapedLiteral:
-    node.escapedRune.size
-  of nkString:
-    var total = 0
-    for r in node.runes:
-      total += r.size
-    total
-  of nkConcat:
-    var total = 0
-    for child in node.children:
-      let cl = maxByteLen(child)
-      if cl < 0:
-        return -1
-      if cl > int.high - total:
-        return -1 # overflow guard
-      total += cl
-    total
-  of nkAlternation:
-    var best = 0
-    for alt in node.alternatives:
-      let al = maxByteLen(alt)
-      if al < 0:
-        return -1
-      best = max(best, al)
-    best
-  of nkQuantifier:
-    if node.quantMax < 0:
-      return -1 # unbounded
-    let bodyLen = maxByteLen(node.quantBody)
-    if bodyLen < 0:
-      return -1
-    if node.quantMax > 0 and bodyLen > int.high div node.quantMax:
-      return -1 # overflow
-    bodyLen * node.quantMax
-  of nkCapture:
-    maxByteLen(node.captureBody)
-  of nkNamedCapture:
-    maxByteLen(node.namedCaptureBody)
-  of nkGroup:
-    maxByteLen(node.groupBody)
-  of nkFlagGroup:
-    if node.flagBody != nil:
-      maxByteLen(node.flagBody)
-    else:
-      0
-  of nkAtomicGroup:
-    maxByteLen(node.atomicBody)
-  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
-    0
-  of nkCharType:
-    4 # max UTF-8 bytes per rune
-  of nkCharClass:
-    4
-  of nkBackreference, nkNamedBackref, nkSubexpCall:
-    -1 # can't bound
-  of nkConditional:
-    let yesLen = maxByteLen(node.condYes)
-    let noLen =
-      if node.condNo != nil:
-        maxByteLen(node.condNo)
-      else:
-        0
-    if yesLen < 0 or noLen < 0:
-      -1
-    else:
-      max(yesLen, noLen)
-  of nkAbsent:
-    -1
-
 proc endCheckFrame(targetPos: int): Frame {.inline.} =
   Frame(kind: ckEndCheckPos, parent: TrueCont, ecpTargetPos: targetPos)
 
@@ -1451,6 +1504,25 @@ proc matchNegLookbehindFixed(
     return false
   runCont(ctx, cont)
 
+proc boundsUsable(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## Whether the compile-time annotation on ``node`` was taken under the flags
+  ## in force now.  A subexpression call can reach the same lookaround under
+  ## others (``(?i)\g<1>``); a mismatch falls back to walking the tree.
+  node.lookBoundsValid and node.lookBoundsFlags == ctx.flags and
+    node.lookBoundsGm == ctx.graphemeMode
+
+proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
+  if ctx.boundsUsable(node):
+    node.lookBounds
+  else:
+    lengthBounds(node.lookBody, ctx.flags, ctx.graphemeMode)
+
+proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.inline.} =
+  if ctx.boundsUsable(node) and i < node.lookAltBounds.len:
+    node.lookAltBounds[i]
+  else:
+    lengthBounds(alt, ctx.flags, ctx.graphemeMode)
+
 proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
   let kind = node.lookKind
   case kind
@@ -1480,8 +1552,9 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
     # For alternation at top level: try each branch independently with its own length
     let body = node.lookBody
     if body.kind == nkAlternation:
-      for alt in body.alternatives:
-        let altFbl = fixedByteLen(alt)
+      for i, alt in body.alternatives:
+        let altLen = ctx.altBounds(node, i, alt)
+        let altFbl = altLen.fixedLen
         if altFbl >= 0:
           # Fixed-length alternative: try at exact start position
           let st = targetEnd - altFbl
@@ -1502,7 +1575,7 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
               restoreStackLens(ctx, stackSnap)
         else:
           # Variable-length alternative: scan from shortest to longest
-          let altMbl = maxByteLen(alt)
+          let altMbl = altLen.maxLen
           let altMinPos =
             if altMbl >= 0:
               max(0, targetEnd - altMbl)
@@ -1524,15 +1597,13 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
             restoreStackLens(ctx, stackSnap)
             if startTry == 0:
               break
-            dec startTry
-            while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
-              dec startTry
+            startTry = prevCharStart(ctx.subject.oa, startTry)
       return false
-    let fbl = fixedByteLen(body)
-    if fbl >= 0:
-      return matchLookbehindFixed(ctx, body, targetEnd, fbl, cont)
+    let bodyLen = ctx.bodyBounds(node)
+    if bodyLen.fixedLen >= 0:
+      return matchLookbehindFixed(ctx, body, targetEnd, bodyLen.fixedLen, cont)
     # Variable-length (non-alternation): shortest priority (commit to first match)
-    let mbl = maxByteLen(body)
+    let mbl = bodyLen.maxLen
     let minPos =
       if mbl >= 0:
         max(0, targetEnd - mbl)
@@ -1554,17 +1625,16 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
       restoreStackLens(ctx, stackSnap)
       if startTry == 0:
         break
-      dec startTry
-      while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
-        dec startTry
+      startTry = prevCharStart(ctx.subject.oa, startTry)
     false
   of lkNegBehind:
     let targetEnd = ctx.pos
     let body = node.lookBody
     if body.kind == nkAlternation:
       # Try each alternative independently — if ANY matches, negative fails
-      for alt in body.alternatives:
-        let altFbl = fixedByteLen(alt)
+      for i, alt in body.alternatives:
+        let altLen = ctx.altBounds(node, i, alt)
+        let altFbl = altLen.fixedLen
         if altFbl >= 0:
           let st = targetEnd - altFbl
           if st >= 0:
@@ -1579,7 +1649,7 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
             if matched:
               return false
         else:
-          let altMbl = maxByteLen(alt)
+          let altMbl = altLen.maxLen
           let altMinPos =
             if altMbl >= 0:
               max(0, targetEnd - altMbl)
@@ -1599,15 +1669,13 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
               return false
             if startTry == 0:
               break
-            dec startTry
-            while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
-              dec startTry
+            startTry = prevCharStart(ctx.subject.oa, startTry)
       return runCont(ctx, cont)
-    let fbl = fixedByteLen(body)
-    if fbl >= 0:
-      return matchNegLookbehindFixed(ctx, body, targetEnd, fbl, cont)
+    let bodyLen = ctx.bodyBounds(node)
+    if bodyLen.fixedLen >= 0:
+      return matchNegLookbehindFixed(ctx, body, targetEnd, bodyLen.fixedLen, cont)
     # Variable-length (non-alternation): scan from right to left
-    let negMbl = maxByteLen(body)
+    let negMbl = bodyLen.maxLen
     let negMinPos =
       if negMbl >= 0:
         max(0, targetEnd - negMbl)
@@ -1627,9 +1695,7 @@ proc matchLookaround(ctx: MatchContext, node: Node, cont: ContId): bool =
         return false
       if startTry == 0:
         break
-      dec startTry
-      while startTry > 0 and (ctx.subject[startTry].uint8 and 0xC0'u8) == 0x80'u8:
-        dec startTry
+      startTry = prevCharStart(ctx.subject.oa, startTry)
     runCont(ctx, cont)
 
 proc matchAtomic(ctx: MatchContext, body: Node, cont: ContId): bool =
@@ -1668,7 +1734,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         break
       restore(ctx, saved)
       var r: Rune
-      fastRuneAt(ctx.subject.oa, checkPos, r, true)
+      nextCharAt(ctx.subject.oa, checkPos, r)
     # Match from startPos to firstAbsentPos (longest text before absent)
     ctx.pos = firstAbsentPos
     if runCont(ctx, cont):
@@ -1705,7 +1771,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject.oa, checkPos, r, true)
+        nextCharAt(ctx.subject.oa, checkPos, r)
     # Limit matching range to [startPos, absentPos)
     let savedEnd = ctx.subjectEnd
     ctx.pos = startPos
@@ -1740,7 +1806,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
         if checkPos >= ctx.subjectEnd:
           break
         var r: Rune
-        fastRuneAt(ctx.subject.oa, checkPos, r, true)
+        nextCharAt(ctx.subject.oa, checkPos, r)
     let savedEnd = ctx.subjectEnd
     ctx.subjectEnd = absentPos
     let ok = runCont(ctx, cont)
@@ -2244,7 +2310,10 @@ proc searchImplInto*(
     ctx.flBestMatch.found = false
     ctx.flBestMatch.boundaries.setLen(0)
   writeNotFound(m)
-  # Quick reject: if the pattern requires a specific byte, check its presence
+  # Quick reject: if the pattern requires a specific byte, check its presence.
+  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
+  # literal, and such a literal is compared byte for byte, so the byte has to
+  # occur literally for any match to exist.
   let rb = regex.requiredByte
   if rb.valid:
     var found = false
@@ -2257,34 +2326,75 @@ proc searchImplInto*(
       return
   resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
+  # A case-sensitive literal prefix is looked for as raw bytes, the way
+  # Oniguruma's exact-string optimization does, so every byte offset is a
+  # candidate start — including one inside a character the character walk
+  # steps over.  Anything else walks characters.
+  let byteScan = regex.literalScan
   var startPos = start
-  while startPos <= subject.len:
+  if regex.semiEndAnchored and subject.len > 0 and fc.kind != fcAnchorStart:
+    # ``onig_search`` resolves the anchors in one if/else chain, and ``\A``
+    # wins over ``\Z``: an anchored pattern is only ever tried at ``start``.
+    startPos = semiEndScanStart(subject, regex, start)
+  # ``exhausted`` means the walk has no candidate left.
+  var exhausted = false
+  while true:
+    if startPos > subject.len:
+      exhausted = true
     # Fast skip based on first character optimization
-    case fc.kind
-    of fcAnchorStart:
-      if startPos != 0:
-        break
-    of fcByte:
-      # Scan forward to next occurrence of the required first byte
-      var found = false
-      while startPos < subject.len:
-        if subject[startPos].uint8 == fc.byte:
-          found = true
-          break
-        inc startPos
-      if not found:
-        break
-    of fcByteSet:
-      var found = false
-      while startPos < subject.len:
-        if subject[startPos].uint8 in fc.bytes:
-          found = true
-          break
-        inc startPos
-      if not found:
-        break
-    of fcNone:
-      discard
+    if not exhausted:
+      case fc.kind
+      of fcAnchorStart:
+        if startPos != 0:
+          exhausted = true
+      of fcLineStart:
+        # ``^`` only holds at the subject start and just after a newline, so
+        # jump to the next line.  ``nl + 1`` is a target for
+        # [advanceChainTo], not a position to jump onto.
+        while startPos > 0 and subject[startPos - 1] != '\n':
+          var nl = -1
+          for i in startPos ..< subject.len:
+            if subject[i] == '\n':
+              nl = i
+              break
+          if nl < 0:
+            exhausted = true
+            break
+          startPos = advanceChainTo(subject, startPos, nl + 1, byteScan)
+      of fcByte:
+        # Scan forward to the next candidate whose lead byte is the one the
+        # pattern needs, stepping with ``nextScanPos``: a byte inside a
+        # character the walk steps over is not a start position.
+        var found = false
+        while startPos < subject.len:
+          if subject[startPos].uint8 == fc.byte:
+            found = true
+            break
+          startPos =
+            if byteScan:
+              startPos + 1
+            else:
+              nextScanPos(subject, startPos)
+        if not found:
+          exhausted = true
+      of fcByteSet:
+        var found = false
+        while startPos < subject.len:
+          if subject[startPos].uint8 in fc.bytes:
+            found = true
+            break
+          startPos =
+            if byteScan:
+              startPos + 1
+            else:
+              nextScanPos(subject, startPos)
+        if not found:
+          exhausted = true
+      of fcNone:
+        discard
+    if exhausted:
+      break
+
     resetForPosition(ctx, startPos, start)
 
     if findLongest:
@@ -2305,12 +2415,17 @@ proc searchImplInto*(
         writeFoundCopy(m, ctx.captures)
         return
 
-    # Advance to next UTF-8 code point boundary
+    # Advance to the next candidate start position.  Neither a plain
+    # continuation-byte test nor the declared length is right alone — the
+    # prefilters above land on a stray 0x80..0xBF byte and inside a truncated
+    # sequence — so ``nextScanPos`` skips only what the decoder really covers.
     if startPos >= subject.len:
       break
-    inc startPos
-    while startPos < subject.len and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
-      inc startPos
+    startPos =
+      if byteScan:
+        startPos + 1
+      else:
+        nextScanPos(subject, startPos)
 
   if findLongest and ctx.flBestMatch.found:
     # ctx.flBestMatch lives on the reusable context.  Copy its
@@ -2346,7 +2461,10 @@ proc searchBackwardImplInto*(
 ) =
   ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
   writeNotFound(m)
-  # Quick reject: if the pattern requires a specific byte, check its presence
+  # Quick reject: if the pattern requires a specific byte, check its presence.
+  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
+  # literal, and such a literal is compared byte for byte, so the byte has to
+  # occur literally for any match to exist.
   let rb = regex.requiredByte
   if rb.valid:
     var found = false
@@ -2364,6 +2482,19 @@ proc searchBackwardImplInto*(
       min(start, subject.len)
     else:
       subject.len
+  # The backward scan steps with ``prevCharHead`` — Oniguruma's
+  # ``ONIGENC_STEP_BACK(.., 1)``, the rule ``onig_search`` itself walks back
+  # with.  It is deliberately *not* the ``encLen`` chain the forward scan
+  # steps forward on: on malformed input the two disagree, and Oniguruma
+  # disagrees with itself in exactly the same way.  Matching the forward
+  # scan's positions instead would need the chain materialized from offset 0,
+  # which costs O(subject) memory and moves the answers further from
+  # Oniguruma's, not closer.
+  #
+  # ``literalScan`` takes byte-wise candidates, matching the forward scan's
+  # literal search.  Each step below is guarded by ``startPos > 0``.
+  let byteScan = regex.literalScan
+
   while startPos >= 0:
     # Fast skip based on first character optimization
     case fc.kind
@@ -2371,20 +2502,26 @@ proc searchBackwardImplInto*(
       if startPos != 0:
         startPos = 0
         continue
+    of fcLineStart:
+      discard # backward scan walks positions one by one; no skip to make
     of fcByte:
       while startPos > 0 and startPos < subject.len and
           subject[startPos].uint8 != fc.byte:
-        dec startPos
-        while startPos > 0 and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
-          dec startPos
+        startPos =
+          if byteScan:
+            startPos - 1
+          else:
+            prevCharHead(subject, startPos)
       if startPos < subject.len and subject[startPos].uint8 != fc.byte:
         break
     of fcByteSet:
       while startPos > 0 and startPos < subject.len and
           subject[startPos].uint8 notin fc.bytes:
-        dec startPos
-        while startPos > 0 and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
-          dec startPos
+        startPos =
+          if byteScan:
+            startPos - 1
+          else:
+            prevCharHead(subject, startPos)
       if startPos < subject.len and subject[startPos].uint8 notin fc.bytes:
         break
     of fcNone:
@@ -2403,9 +2540,11 @@ proc searchBackwardImplInto*(
 
     if startPos == 0:
       break
-    dec startPos
-    while startPos > 0 and (subject[startPos].uint8 and 0xC0'u8) == 0x80'u8:
-      dec startPos
+    startPos =
+      if byteScan:
+        startPos - 1
+      else:
+        prevCharHead(subject, startPos)
 
 proc searchBackwardImpl*(
     subject: string,
