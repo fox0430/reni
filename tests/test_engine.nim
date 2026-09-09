@@ -3803,20 +3803,23 @@ suite "the ASCII class bitset and the atom walk agree by construction":
   ]
 
   const FlagPrefixes = [
-    "", "(?i)", "(?I)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
-    "(?i)(?W)(?D)(?S)(?P)",
+    "", "(?i)", "(?I)", "(?iI)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
+    "(?i)(?W)(?D)(?S)(?P)", "(?iI)(?W)(?D)(?S)(?P)",
   ]
     ## Every flag a class atom can read.  ``(?W)``/``(?D)``/``(?S)``/``(?P)``
     ## are the ASCII restrictions the exactness claim is about; ``(?i)``/``(?I)``
     ## are the ones the fast path steps aside for.
     ##
-    ## ``(?i)`` and ``(?I)`` together are deliberately absent: the two spellings
-    ## already disagree there without any of this -- on ``(?i)(?I)``, ``[A-Z]``
-    ## rejects ``y`` while ``[[A-Z]]`` accepts it, and that predates the bitset
-    ## (it reproduces with the fast path removed entirely).  The pair is not a
-    ## same-semantics oracle under those flags, so it cannot say anything about
-    ## this invariant; adding the combination here only re-reports that separate
-    ## bug.  Fix that first, then this axis can come back.
+    ## Ignore-case-ASCII is spelled ``(?iI)``, not ``(?i)(?I)``.  Oniguruma
+    ## takes only the combined form -- it rejects the split one as an invalid
+    ## group option -- so the combined form is the one a conformance
+    ## expectation can be written against, and it stays correct if reni ever
+    ## follows suit and rejects the split spelling too.
+    ##
+    ## This axis was held out for a while: a fold bug made the pair disagree
+    ## on its own, ``[A-Z]`` missing ``y`` where ``[[A-Z]]`` matched it, so it
+    ## was not a same-semantics oracle under these flags and could say nothing
+    ## about the bitset.  That is fixed; the axis is back.
 
   proc firstCharClass(node: Node): Node =
     ## The first ``nkCharClass`` in the tree, or nil.
@@ -3867,3 +3870,68 @@ suite "the ASCII class bitset and the atom walk agree by construction":
     check search("日", re("[^\\d]")).found
     check search("日", re("[[:^ascii:]]")).found
     check not search("日", re("[[:ascii:]]")).found
+suite "ASCII-only case folding is a restriction on both ends":
+  # ``(?I)`` narrows ``(?i)`` to ASCII.  That is a statement about *pairs*: a
+  # fold applies only when the subject and the character it folds to are both
+  # ASCII.  Getting only the subject half right lets an ASCII subject reach its
+  # non-ASCII variants -- ``k`` is a case fold of U+212A KELVIN SIGN and ``s``
+  # of U+017F LATIN SMALL LETTER LONG S -- so ``[[:^ascii:]]`` would match
+  # ``k``.  Every expectation here is Oniguruma 6.9.10's answer.
+  #
+  # Oniguruma rejects ``(?i)(?I)`` as an invalid group option and takes only
+  # the combined ``(?iI)``, so that is the spelling these use.
+
+  test "a range folds in both directions, not just toward the folded case":
+    # ``simpleFold`` maps toward one case, so testing it against the range's
+    # own endpoints answered only for a range written in that case: ``[a-z]``
+    # matched ``Y`` while ``[A-Z]`` missed ``y``.
+    check search("y", re("(?iI)[A-Z]")).found
+    check search("Y", re("(?iI)[a-z]")).found
+    check search("k", re("(?iI)[A-Z]")).found
+    check search("K", re("(?iI)[a-z]")).found
+    check search("y", re("(?iI)[0-9A-Z]")).found
+    check search("y", re("(?iI)[\\x{41}-\\x{5A}]")).found
+    # The unrestricted spelling has always held; it is here so a fix that
+    # collapses the two arms cannot quietly change it.
+    check search("y", re("(?i)[A-Z]")).found
+    check search("Y", re("(?i)[a-z]")).found
+
+  test "an ASCII subject does not reach its non-ASCII fold variants":
+    check not search("k", re("(?iI)[\\x{212A}]")).found
+    check not search("s", re("(?iI)[\\x{17F}]")).found
+    check not search("k", re("(?iI)[\\x{2120}-\\x{2130}]")).found
+    # Through a nested class and through a predicate atom, which fold on a
+    # different path than a bare range does.
+    check not search("k", re("(?iI)[[\\x{212A}]]")).found
+    check not search("s", re("(?iI)[[\\x{17F}]]")).found
+    check not search("k", re("(?iI)[[\\x{2120}-\\x{2130}]]")).found
+    check not search("k", re("(?iI)[[:^ascii:]]")).found
+    check not search("s", re("(?iI)[[:^ascii:]]")).found
+    check not search("k", re("(?iI)[[^\\x{00}-\\x{7F}]]")).found
+    # And the other direction: a non-ASCII subject reaches no ASCII member.
+    check not search("\u212A", re("(?iI)[k]")).found
+    check not search("å", re("(?iI)[Å]")).found
+
+  test "plain (?i) still reaches them":
+    check search("k", re("(?i)[\\x{212A}]")).found
+    check search("s", re("(?i)[\\x{17F}]")).found
+    check search("k", re("(?i)[\\x{2120}-\\x{2130}]")).found
+    check search("k", re("(?i)[[\\x{212A}]]")).found
+    check search("k", re("(?i)[[:^ascii:]]")).found
+    check search("\u212A", re("(?i)[k]")).found
+    check search("å", re("(?i)[Å]")).found
+
+  test "the ASCII folds themselves keep working":
+    check search("k", re("(?iI)[K]")).found
+    check search("K", re("(?iI)[k]")).found
+    check search("y", re("(?iI)[[A-Z]]")).found
+    check search("k", re("(?iI)[[[:upper:]]]")).found
+    check search("k", re("(?iI)[\\p{Lu}]")).found
+    check search("a", re("(?iI)[\\p{Ll}]")).found
+    check search("y", re("(?iI)Y")).found
+    check not search("k", re("(?iI)[[:^word:]]")).found
+
+  test "(?I) without (?i) folds nothing":
+    check not search("y", re("(?I)[A-Z]")).found
+    check not search("Y", re("(?I)[a-z]")).found
+    check not search("k", re("(?I)[K]")).found
