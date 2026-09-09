@@ -1511,6 +1511,34 @@ suite "Find longest (?L)":
     check m.found
     check m.boundaries[0] == 0 .. 1
 
+  test "scoped form takes longest":
+    let m = search("abc", re("(?L:a|abc)"))
+    check m.found
+    check m.boundaries[0] == 0 .. 3
+
+  test "scoped form behind transparent wrappers takes longest":
+    let m1 = search("abc", re("(?:(?L:a|abc))"))
+    check m1.found
+    check m1.boundaries[0] == 0 .. 3
+    let m2 = search("abc", re("(?i:(?L:a|abc))"))
+    check m2.found
+    check m2.boundaries[0] == 0 .. 3
+
+  test "scoped mixed flags take longest":
+    let m1 = search("abc", re("(?L-i:a|abc)"))
+    check m1.found
+    check m1.boundaries[0] == 0 .. 3
+    let m2 = search("abc", re("(?IL:a|abc)"))
+    check m2.found
+    check m2.boundaries[0] == 0 .. 3
+
+  test "scoped form preserves captures of longest match":
+    let r = re("(?L:(a)|(abc))")
+    let m = search("abc", r)
+    check m.found
+    check m.boundaries[0] == 0 .. 3
+    check captureText(m, 2, "abc") == some("abc")
+
 suite "Edge cases":
   test "multiple \\K uses last position":
     let m = search("abc", re("a\\Kb\\Kc"))

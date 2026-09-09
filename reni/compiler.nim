@@ -676,6 +676,33 @@ proc annotateTree(node: Node) =
   for child in node.childNodes:
     annotateTree(child)
 
+proc hasTopLevelFindLongest(node: Node): bool =
+  ## True when a scoped ``(?L:...)`` spans the whole pattern. The parser
+  ## restores ``p.flags`` on scoped-group exit, so ``p.currentFlags`` only
+  ## carries the isolated ``(?L)`` spelling; walk the finished AST instead.
+  ## Transparent wrappers (``(?:...)`` and ordinary ``(?flags:...)``) are
+  ## unwrapped. Anything else means the ``L`` group, if any, does not span
+  ## the pattern -- such patterns are rejected elsewhere, so answer false.
+  var n = node
+  while n != nil:
+    case n.kind
+    of nkGroup:
+      n = n.groupBody
+    of nkConcat:
+      if n.children.len == 1:
+        n = n.children[0]
+      else:
+        return false
+    of nkFlagGroup:
+      if rfFindLongest in n.flagsOn:
+        return true
+      if n.flagBody == nil:
+        return false
+      n = n.flagBody
+    else:
+      return false
+  false
+
 proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateUtf8(pattern)
   var p = initParser(pattern, flags)
@@ -727,7 +754,13 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
   discard markQuantBodyPure(ast)
-  let finalFlags = flags + (p.currentFlags * {rfFindLongest})
+  # ``p.currentFlags`` only carries the isolated ``(?L)`` spelling: scoped
+  # groups restore ``p.flags`` on exit. A scoped ``(?L:...)`` that spans the
+  # whole pattern is the same global option, so lift it from the AST.
+  let scopedLongest = hasTopLevelFindLongest(ast)
+  let finalFlags =
+    flags + (p.currentFlags * {rfFindLongest}) +
+    (if scopedLongest: {rfFindLongest} else: {})
   # Same rule: must see the final AST.  Annotate under ``finalFlags``, the
   # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
   # ``regex.flags``), since an annotation is used only while the two agree.
