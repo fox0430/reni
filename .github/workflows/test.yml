@@ -93,15 +93,16 @@ jobs:
       - name: Setup paths
         run: nimble setup -y
 
-      - name: Run engine tests with a tiny stack budget
+      - name: Run stack-budget tests with a tiny stack budget
         # The first-interval probing guard only fires under a small
         # -d:reniMaxStackBytes, so the default suite cannot observe it.
-        # Scoped to test_engine, which holds all guard tests: the ported
-        # conformance suites pin default-budget semantics and need more
-        # than 16 KiB of native stack for deep recursion by design.
-        run: nim c -r -d:reniMaxStackBytes=16384 tests/test_engine.nim
+        # Scoped to test_stack_budget, which holds the guard tests: the full
+        # conformance suites pin default-budget semantics and already run in
+        # the matrix jobs. Compiling the full test_engine.nim here is
+        # needlessly slow, especially under setjmp below.
+        run: nim c -r -d:reniMaxStackBytes=16384 tests/test_stack_budget.nim
 
-      - name: Run engine tests with setjmp exceptions and no stack traces
+      - name: Run stack-budget tests with setjmp exceptions and no stack traces
         # The configuration the byte budget exists for: a recursion level costs
         # ~12 KB instead of ~750 B, and with stack traces off Nim's own
         # call-depth abort is gone, so the byte guard is the only thing between
@@ -110,6 +111,8 @@ jobs:
         # guard still answers rather than crashing.
         #
         # Not a release build: -O3 over setjmp's expanded control flow takes
-        # tens of minutes on this file, and what is being exercised is the
-        # frame size, which a debug build only makes larger.
-        run: nim c -r --exceptions:setjmp --stacktrace:off tests/test_engine.nim
+        # tens of minutes on a large test file, and what is being exercised is
+        # the frame size, which a debug build only makes larger. This step
+        # targets the small guard file for the same reason: compiling the full
+        # suite under setjmp costs ~10x a goto build.
+        run: nim c -r --exceptions:setjmp --stacktrace:off tests/test_stack_budget.nim
