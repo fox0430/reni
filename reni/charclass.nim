@@ -7,8 +7,7 @@ type CcParser* = object
   pos: int
   flags: RegexFlags
   pendingAtoms*: seq[CcAtom]
-  stackBase: int
-    ## Outer parse start frame; shared base for the byte-budget check.
+  stackBase: int ## Outer parse start frame; shared base for the byte-budget check.
   depth: int
     ## Nesting depth in `parseCharClassBody`; level-based guard for debug builds.
 
@@ -41,7 +40,8 @@ proc initCcParser*(src: string, pos: int, flags: RegexFlags, stackBase: int): Cc
 template checkCcBudget(p: CcParser) =
   ## Byte-budget check covering `[` nesting and `&&` right sides.
   if stackUsedFrom(p.stackBase) > MaxStackBytes:
-    raise newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
+    raise
+      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
 proc position*(p: CcParser): int =
   p.pos
@@ -651,7 +651,9 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
   dec p.depth
   result = (negated, atoms)
 
-proc parseCharClass*(src: string, pos: int, flags: RegexFlags, stackBase: int): (int, Node) =
+proc parseCharClass*(
+    src: string, pos: int, flags: RegexFlags, stackBase: int
+): (int, Node) =
   ## Parse a character class starting at `[` at position pos.
   ## Returns (new position after `]`, Node).
   var p = initCcParser(src, pos, flags, stackBase)
