@@ -991,6 +991,9 @@ proc classHasByte(node: Node, b: uint8, flags: RegexFlags): bool =
   ## Whether one-byte char ``b`` is in the class byte set. Below U+0080 the
   ## member test answers; above only ranges crossing the ASCII boundary reach.
   if b < 0x80:
+    if node.asciiSetOk and rfIgnoreCase notin flags:
+      # Precomputed bitmap: exact below U+0080 as long as nothing folds.
+      return b in node.asciiSet
     let r = Rune(int32(b))
     for atom in node.atoms:
       if node.bracketClass and matchCcAtomWithFold(r, atom, flags):
