@@ -3803,20 +3803,23 @@ suite "the ASCII class bitset and the atom walk agree by construction":
   ]
 
   const FlagPrefixes = [
-    "", "(?i)", "(?I)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
-    "(?i)(?W)(?D)(?S)(?P)",
+    "", "(?i)", "(?I)", "(?iI)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
+    "(?i)(?W)(?D)(?S)(?P)", "(?iI)(?W)(?D)(?S)(?P)",
   ]
     ## Every flag a class atom can read.  ``(?W)``/``(?D)``/``(?S)``/``(?P)``
     ## are the ASCII restrictions the exactness claim is about; ``(?i)``/``(?I)``
     ## are the ones the fast path steps aside for.
     ##
-    ## ``(?i)`` and ``(?I)`` together are deliberately absent: the two spellings
-    ## already disagree there without any of this -- on ``(?i)(?I)``, ``[A-Z]``
-    ## rejects ``y`` while ``[[A-Z]]`` accepts it, and that predates the bitset
-    ## (it reproduces with the fast path removed entirely).  The pair is not a
-    ## same-semantics oracle under those flags, so it cannot say anything about
-    ## this invariant; adding the combination here only re-reports that separate
-    ## bug.  Fix that first, then this axis can come back.
+    ## Ignore-case-ASCII is spelled ``(?iI)``, not ``(?i)(?I)``.  Oniguruma
+    ## takes only the combined form -- it rejects the split one as an invalid
+    ## group option -- so the combined form is the one a conformance
+    ## expectation can be written against, and it stays correct if reni ever
+    ## follows suit and rejects the split spelling too.
+    ##
+    ## This axis was held out for a while: a fold bug made the pair disagree
+    ## on its own, ``[A-Z]`` missing ``y`` where ``[[A-Z]]`` matched it, so it
+    ## was not a same-semantics oracle under these flags and could say nothing
+    ## about the bitset.  That is fixed; the axis is back.
 
   proc firstCharClass(node: Node): Node =
     ## The first ``nkCharClass`` in the tree, or nil.
