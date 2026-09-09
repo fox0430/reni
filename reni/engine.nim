@@ -883,10 +883,21 @@ proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
       true
     elif rfIgnoreCase in flags:
       if rfIgnoreCaseAscii in flags:
-        # ASCII-only: only fold ASCII characters
+        # ASCII-only: the subject and the variant it folds to must both be
+        # ASCII, so ``k`` never reaches U+212A and U+212A never reaches ``k``.
+        #
+        # Walk the variants rather than folding once.  A range is not a value
+        # that can be folded alongside the subject the way [caseInsensitiveMatch]
+        # folds both sides of a literal, and ``simpleFold`` maps toward one
+        # case only -- testing it against the range's own endpoints answers
+        # only for a range written in that case, so ``[a-z]`` would match ``Y``
+        # while ``[A-Z]`` missed ``y``.
         if ri <= 127:
-          let fi = int32(simpleFold(r))
-          fi >= lo and fi <= hi
+          for variant in caseFoldVariants(r):
+            let vi = int32(variant)
+            if vi <= 127 and vi >= lo and vi <= hi:
+              return true
+          false
         else:
           false
       else:
@@ -973,17 +984,20 @@ proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
     # With rfIgnoreCaseAscii, only fold ASCII characters
     if rfIgnoreCaseAscii in flags and int32(r) > 127:
       return false
+    let asciiOnly = rfIgnoreCaseAscii in flags
     case atom.kind
-    of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp:
-      # Check case-fold variants
+    of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp, ccNestedClass:
+      # Check case-fold variants.  ASCII-only folding restricts both ends, not
+      # just the subject: the subject is already known to be ASCII here, and a
+      # variant that is not stays out, so ``k`` reaches ``K`` but never U+212A
+      # and ``[[:^ascii:]]`` does not match it.
       for variant in caseFoldVariants(r):
-        if variant != r and matchCcAtom(variant, atom, flags):
-          return true
-    of ccNestedClass:
-      for variant in caseFoldVariants(r):
-        if variant != r and matchCcAtom(variant, atom, flags):
+        if variant == r or (asciiOnly and int32(variant) > 127):
+          continue
+        if matchCcAtom(variant, atom, flags):
           return true
     else:
+      # ``ccLiteral`` and ``ccRange`` fold inside [matchCcAtom] itself.
       discard
   false
 
