@@ -791,3 +791,209 @@ suite "resolved \\p{...} property matching":
     for cp in [int32(-1), int32(-128), low(int32)]:
       check not matchUnicodeProp(Rune(cp), p)
       check not matchPosixClass(Rune(cp), pcAscii, true)
+
+suite "(?I) and (?L) may only open a pattern":
+  # Oniguruma treats ignore-case-ASCII and find-longest as options of the whole
+  # match, not of a position in it.  It takes them in one group at the very
+  # start of the pattern and nowhere else, and never lets them be cleared.
+  #
+  # "The start" is the run of wrappers the pattern opens with, and only
+  # ``(?:...)`` and ``(?flags:...)`` belong to it: a capture, a lookaround, an
+  # atomic group, an isolated ``(?flags)`` or any content at all ends it.  Every
+  # expectation below is Oniguruma 6.9.10's answer through ``onig_new`` under
+  # ``ONIG_SYNTAX_ONIGURUMA``.
+
+  proc accepts(pattern: string): bool =
+    try:
+      discard re(pattern)
+      true
+    except RegexError:
+      false
+
+  test "a group that opens the pattern is taken":
+    check accepts("(?I)a")
+    check accepts("(?L)a")
+    check accepts("(?iI)a")
+    check accepts("(?Ii)a")
+    check accepts("(?IL)a")
+    check accepts("(?iIL)a")
+    check accepts("(?I)")
+    check accepts("(?I)a|b")
+    check accepts("(?I)|b")
+    check accepts("(?I)(?i)a")
+    check accepts("(?I)(?W)a")
+    check accepts("(?I)[a]")
+
+  test "only (?:...) and (?flags:...) keep the pattern open":
+    check accepts("(?:(?I)a)")
+    check accepts("(?i:(?I)a)")
+    check accepts("(?W:(?I)a)")
+    check accepts("(?:(?:(?I)a))")
+    check accepts("(?:(?i:(?I)a))")
+    check accepts("(?W:(?:(?I)a))")
+    # A leading comment is transparent -- it neither opens nor ends the run.
+    check accepts("(?#c)(?I)a")
+    # Anything else ends it.
+    check not accepts("((?I)a)")
+    check not accepts("(?<n>(?I)a)")
+    check not accepts("(?>(?I)a)")
+    check not accepts("(?=(?I)a)")
+    check not accepts("(?<=a)(?I)b")
+    check not accepts("(?!a)(?I)b")
+
+  test "content or an isolated (?flags) ends it":
+    check not accepts("a(?I)b")
+    check not accepts("[a](?I)b")
+    check not accepts("a|(?I)b")
+    check not accepts("(?:a(?I)b)")
+    check not accepts("(?:(?:a(?I)b))")
+    check not accepts("(?i)(?I)a")
+    check not accepts("(?m)(?I)a")
+    check not accepts("(?x)(?I)a")
+    check not accepts("(?-i)(?I)a")
+    check not accepts("(?W)(?I)a")
+    check not accepts("(?i)(?W)(?I)a")
+    check not accepts("(?:)(?I)a")
+    check not accepts("(?i:)(?I)a")
+    check not accepts("(?i)(?L)a")
+
+  test "one such group is all a pattern gets":
+    check not accepts("(?I)(?I)a")
+    check not accepts("(?L)(?L)a")
+    check not accepts("(?I)(?L)a")
+    check not accepts("(?L)(?I)a")
+    check not accepts("(?iI)(?I)a")
+    check not accepts("(?I)(?I:a)")
+    # Even where the second one would otherwise still be opening the pattern.
+    check not accepts("(?I:(?I)a)")
+    check not accepts("(?I:(?I:a))")
+    check not accepts("(?I:(?L:a))")
+    check not accepts("(?L:(?I:a))")
+    check not accepts("(?iI:(?L:a))")
+
+  test "the scoped form has to span the pattern":
+    check accepts("(?I:a)")
+    check accepts("(?I:a|b)")
+    check accepts("(?:(?I:a))")
+    check accepts("(?i:(?I:a))")
+    check accepts("(?:(?:(?I:a)))")
+    check accepts("(?L:a)")
+    check accepts("(?L:a|b)")
+    check accepts("(?:(?L:a))")
+    check accepts("(?i:(?L:a))")
+    check accepts("(?:(?:(?L:a)))")
+    # A sibling after it, or an alternation around it, is not allowed -- unlike
+    # the isolated form, which wraps whatever follows.
+    check not accepts("(?I:a)b")
+    check not accepts("(?L:a)b")
+    check not accepts("(?iI:a)b")
+    check not accepts("(?I:a)|b")
+    check not accepts("(?L:a)|b")
+    check not accepts("b|(?I:a)")
+    check not accepts("(?:(?I:a)b)")
+    check not accepts("a(?I:b)")
+    check not accepts("((?I:a))")
+
+  test "a quantified exclusive group is rejected":
+    # A quantifier on the exclusive group (or on transparent wrappers around
+    # it) stops it from spanning the pattern, so Oniguruma rejects it. A
+    # quantifier *inside* its body -- or inside the isolated form's span --
+    # is fine. Nested inside ``(?flags:...)`` the outer group masks the
+    # quantifier, so Oniguruma takes ``(?i:(?I:a)+)``.
+    check not accepts("(?I:a)+")
+    check not accepts("(?I:a)*")
+    check not accepts("(?I:a)?")
+    check not accepts("(?I:a){2}")
+    check not accepts("(?L:a)+")
+    check not accepts("(?I)+")
+    check not accepts("(?L)+")
+    check not accepts("(?:(?I:a))+")
+    check not accepts("(?:(?I:a))*")
+    check not accepts("(?:(?I:a))?")
+    check not accepts("(?:(?I:a)+)")
+    check not accepts("(?:(?I)a)+")
+    check not accepts("(?:(?I)ab)+")
+    check not accepts("(?i:(?I:a))+")
+    check not accepts("(?I:a)+b")
+    check not accepts("(?I-i:a)+")
+    # Controls: quantifiers inside the span are fine, as is the masked form.
+    check accepts("(?I:a+)")
+    check accepts("(?I:ab+)")
+    check accepts("(?I:(?:a)+)")
+    check accepts("(?I)a+")
+    check accepts("(?I)ab+")
+    check accepts("(?:(?I:a+))")
+    check accepts("(?i:(?I:a)+)")
+
+  test "an isolated flag group after an exclusive group is rejected":
+    # An isolated ``(?flags)`` still counts as a sibling of what precedes it,
+    # even though it wraps the rest -- unlike content inside the isolated
+    # group's own span, which is fine.
+    check not accepts("(?I:a)(?i)")
+    check not accepts("(?L:a)(?i)")
+    check not accepts("(?I:a)(?m)")
+    check not accepts("(?I:a)(?W)")
+    check not accepts("(?I:a)(?i)a")
+    check not accepts("(?:(?I:a))(?i)")
+    check not accepts("(?:(?I)ab)(?i)")
+    # Controls: wrapping the rest from the exclusive group itself is fine,
+    # and comments are not siblings.
+    check accepts("(?I)(?i)a")
+    check accepts("(?I:a)(?#c)")
+
+  test "scoped mixed flags still have to span the pattern":
+    # Turning another flag off alongside is fine, but the scoped mixed form
+    # still has to span the pattern just like the plain scoped form.
+    check accepts("(?I-i:a)")
+    check accepts("(?L-i:a)")
+    check accepts("(?iI-x:a)")
+    check accepts("(?:(?I-i:a))")
+    check not accepts("(?I-i:a)b")
+    check not accepts("(?L-i:a)b")
+    check not accepts("(?I-i:a)|b")
+    check not accepts("(?L-i:a)|b")
+    check not accepts("b|(?I-i:a)")
+    check not accepts("(?:(?I-i:a)b)")
+
+  test "the isolated form may not have siblings outside its wrappers":
+    # The isolated form wraps the rest of its own group, so content after it
+    # inside that group is fine -- but the wrappers around it must hold
+    # nothing else, in either direction.
+    check accepts("(?I)ab")
+    check accepts("(?I)a|b")
+    check accepts("(?I)(?:a)b")
+    check accepts("(?:(?I)ab)")
+    check accepts("(?:(?:(?I)a))")
+    check not accepts("(?:(?I)a)b")
+    check not accepts("(?:(?L)a)b")
+    check not accepts("(?:(?I)a)|b")
+    check not accepts("(?:(?I)a)(?:b)")
+    check not accepts("(?:(?I)a)+b")
+    check not accepts("(?i:(?I)a)b")
+    check not accepts("(?W:(?I)a)b")
+    check not accepts("(?:(?:(?I)a))b")
+    # An empty body is no different.
+    check not accepts("(?:(?I))b")
+    # A sibling before the wrapper is caught too.
+    check not accepts("a(?:(?I)b)")
+    check not accepts("b(?:(?I)a)")
+    check not accepts("(?:a)(?:(?I)b)")
+
+  test "neither can be cleared":
+    check not accepts("(?-I)a")
+    check not accepts("(?-L)a")
+    check not accepts("(?i-I)a")
+    check not accepts("(?i-L)a")
+    check not accepts("(?-I:a)")
+    check not accepts("(?i-I:a)")
+    check not accepts("(?I-I:a)")
+    # Turning something else off alongside is fine.
+    check accepts("(?I-i)a")
+    check accepts("(?L-i)a")
+    check accepts("(?iI-x)a")
+
+  test "a body may still carry ordinary option groups":
+    check accepts("(?I:(?i)a)")
+    check accepts("(?I:(?W)a)")
+    check accepts("(?I:(?:a))")
+    check accepts("(?I)(?i:a)")

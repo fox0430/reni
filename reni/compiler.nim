@@ -682,6 +682,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   var ast = p.parseRegex()
   if not p.atEnd:
     raise newException(RegexError, "unexpected character at position " & $p.position)
+  p.validateLeadingOnlyPosition(ast)
   # Before anything else reads the tree, and before unnamed captures are
   # demoted into groups.  See [flattenLiteralGroups].  Skipped when the pattern
   # has no ``(?:...)`` at all.
