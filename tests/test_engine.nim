@@ -1,6 +1,7 @@
 import std/[unittest, strutils, options, unicode]
 
 import ../reni
+import ../reni/engine
 
 suite "Step 1: Literal matching":
   test "empty pattern matches empty string":
@@ -1203,9 +1204,28 @@ suite "Subroutine calls and recursion":
 
   test "recursion depth limit does not crash":
     let s = "a".repeat(60)
-    let m = search(s, re("(a(?1)?)"))
-    # Should not crash; may match partially due to MaxRecursionDepth=50
+    # Each subject character costs about one ``matchNodeRecursive`` level,
+    # and ``maxRecursionDepth`` (default 50) caps the subroutine nesting, so
+    # this stays near ~50 delegation levels: inside the byte budget in both
+    # exception models, and the partial match the depth cap bounds is the
+    # answer. Under a small ``-d:reniMaxStackBytes`` the same shape is what
+    # the budget guard turns into RegexLimitError. A segfault is neither.
+    when compileOption("exceptions", "setjmp") or engine.MaxStackBytes <= 64 * 1024:
+      try:
+        check search(s, re("(a(?1)?)")).found
+      except RegexLimitError:
+        discard
+    else:
+      check search(s, re("(a(?1)?)")).found
+
+  test "maxRecursionDepth bounds recursion before the call depth guard does":
+    # The public maxRecursionDepth is only meaningful if it is reachable: the
+    # call depth guard must not fire first and turn a bounded partial match
+    # into an error. Subroutine calls hold no native frame per level, so 40
+    # characters fit every budget on every build and the depth cap answers.
+    let m = search("a".repeat(40), re("(a(?1)?)"), maxRecursionDepth = 50)
     check m.found
+    check m.matchSpan == Span(a: 0, b: 40)
 
 suite "Absent operator":
   test "abClear (?~) matches empty":
@@ -1257,6 +1277,16 @@ suite "Absent operator":
     let m = search("abc", re("(?~|b)."))
     check m.found
     check m.boundaries[0] == 0 .. 1
+
+  test "abExpression alternation retries inside the narrowed range":
+    # The loop un-narrows subjectEnd while walking out of the absent frame;
+    # when the parent then fails, the second branch must retry narrowed.
+    # Retrying widened matched past the absent instead.
+    check not search("abc", re("(?~|b|(a|ab))c")).found
+    check not search("axc", re("(?~|x|(a|ax))c")).found
+    let m = search("abc", re("(?~|b|(a|ab))b"))
+    check m.found
+    check m.boundaries[0] == 0 .. 2
 
 suite "Callout verbs":
   test "MAX basic limits repetitions":
@@ -1545,10 +1575,14 @@ suite "Edge cases":
     let m = search(s, re("a{5000}"), stepLimit = 0)
     check m.found
 
-  test "quantifier exceeding MaxQuantRepetitions does not crash":
+  test "a repetition count in the tens of thousands still matches":
+    # The matcher used to give up past an internal repetition cap and report
+    # no match on a subject that plainly matches; the count is now bounded
+    # only by the subject.
     let s = "a".repeat(20000)
     let m = search(s, re("a{20000}"), stepLimit = 0)
-    check not m.found
+    check m.found
+    check m.matchSpan == 0 .. 20000
 
 suite "Grapheme mode (?y{w})":
   test "(?y{w}) dot matches word segment":
@@ -2145,18 +2179,24 @@ suite "searchBackward firstChar optimization":
     let m = searchBackward("", re("a"))
     check not m.found
 
-suite "matchWithCont call depth guard":
+suite "deep patterns and long runs":
   test "deeply nested alternation raises RegexLimitError":
     # Build a pattern with deep nkConcat nesting using non-mergeable nodes:
     # (?:a.){N} expands to concat chains of [literal, charType] inside groups
-    # that cannot be merged into nkString, creating deep call stacks.
+    # that cannot be merged into nkString.
+    #
+    # 700 repetitions is ~2100 levels of nesting, which the recursive matcher
+    # could not walk without running out of the stack budget. The machine
+    # keeps the nesting on the heap, so the only thing that bounds this is
+    # the pattern's own size.
     var pat = ""
-    for i in 0 ..< 250:
+    for i in 0 ..< 700:
       pat.add "(?:a.)"
-    let subject = "ab".repeat(250)
+    let subject = "ab".repeat(700)
     let r = re(pat)
-    expect(RegexLimitError):
-      discard search(subject, r, stepLimit = 0)
+    let m = search(subject, r, stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. 1400
 
   test "long literal pattern works after nkString merge":
     var pat = ""
@@ -2172,6 +2212,99 @@ suite "matchWithCont call depth guard":
     let m = search("abc", re("((a)(b)(c))"))
     check m.found
     check m.matchSpan == 0 .. 3
+
+  test "a long run of absent markers neither aborts nor raises":
+    # Consecutive absent ranges in one concat used to hold a native frame
+    # per marker past every guard (stepLimit, byte budget, MaxCallDepth),
+    # so 1500 of them killed a debug build with an uncatchable call depth
+    # abort. The markers now walk iteratively: reaching this check at all
+    # is most of the assertion, and the answer is an ordinary match.
+    let m = search("b", re("(?~|a)".repeat(1500) & "b"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. 1
+
+suite "long repetition runs":
+  # Runs long enough that the recursive matcher would have held a native frame
+  # per repetition. What they check is the answer, not the mechanism: the
+  # captures a long run leaves behind are the ones a short run would.
+  test "a capturing body keeps the last repetition's capture":
+    let m = search("a".repeat(5_000), re("(a)*"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. 5_000
+    check m.captureSpan(1) == 4_999 .. 5_000
+
+  test "a multi-element body captures each of its groups":
+    let m = search("ab".repeat(3_000), re("(?:(a)(b))*"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. 6_000
+    check m.captureSpan(1) == 5_998 .. 5_999
+    check m.captureSpan(2) == 5_999 .. 6_000
+
+  test "a body with internal choice runs as long as the subject":
+    # A body that can match in more than one way needs real backtracking, so
+    # the matcher used to answer this with RegexLimitError past a few hundred
+    # repetitions. Its choice points are on the heap now, and the length that
+    # bounds it is the subject's.
+    let m = search("a".repeat(5_000) & "b", re("(?:a|aa)*b"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. 5_001
+
+  test "an ambiguous body backtracks to the answer a short run gives":
+    # (?:ab|a)* over "abab..." can take either branch at every step; the
+    # trailing "c" forces the run to unwind and re-drive earlier repetitions,
+    # which is the case a body committed to its first success answers wrongly.
+    for n in [3, 50, 2_000]:
+      let m = search("ab".repeat(n) & "c", re("(?:ab|a)*c"), stepLimit = 0)
+      check m.found
+      check m.matchSpan == 0 .. (2 * n + 1)
+
+suite "subject length is not a matching limit":
+  # A quantifier body with any internal choice used to cost native stack per
+  # repetition, so these patterns answered RegexLimitError on subjects a user
+  # would call short. The ceiling each one had is in its comment; the counts
+  # here are two orders of magnitude past them.
+  #
+  # What is checked is the answer, not that no exception is raised: a run this
+  # long has to reach the same span and the same captures a three-character
+  # subject does.
+  const Reps = 20_000
+
+  test "(a|b)*c":
+    # ceiling was 271 repetitions, 542 characters
+    let m = search("ab".repeat(Reps) & "c", re("(a|b)*c"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
+    check m.captureSpan(1) == (2 * Reps - 1) .. (2 * Reps)
+
+  test "(x|y)+z":
+    # ceiling was 271 repetitions
+    let m = search("xy".repeat(Reps) & "z", re("(x|y)+z"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
+
+  test "(?:a|b)*c":
+    # ceiling was 321 repetitions
+    let m = search("ab".repeat(Reps) & "c", re("(?:a|b)*c"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
+
+  test "(?:a(?:b|c))*d":
+    # ceiling was 303 repetitions; the choice is nested one level down
+    let m = search("ab".repeat(Reps) & "d", re("(?:a(?:b|c))*d"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
+
+  test "(?:ab|a)*c":
+    # ceiling was 632 repetitions; both branches match at every step, so this
+    # one needs the run to stay re-drivable, not just to fit
+    let m = search("ab".repeat(Reps) & "c", re("(?:ab|a)*c"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
+
+  test "a lazy alternation body repeats as long as the subject":
+    let m = search("ab".repeat(Reps) & "c", re("(?:a|b)*?c"), stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * Reps + 1)
 
 suite "captureSpan bounds checking":
   test "captureSpan out of range returns unset span":
@@ -2371,6 +2504,63 @@ suite "MatchContext-based API":
     check m.boundaries.len == 1
     check m.matchSpan.a == 0
     check m.matchSpan.b == 4
+
+  test "reusing ctx across a deep run and the quiet runs after it":
+    # The scratch buffers grow with the subject and are handed back only after
+    # several small searches in a row. What is checked here is the answer, not
+    # the capacity: every search past the growth and past the release must
+    # agree with a fresh context. A policy regression that only wastes memory
+    # stays invisible to this test by construction.
+    let ctx = newMatchContext()
+    var m: Match
+    let deep = re("(a|b)*c")
+    let big = "ab".repeat(20_000) & "c"
+    check searchIntoCtx(ctx, big, deep, m, stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * 20_000 + 1)
+    # More small searches than the quiet-run mark, each checked for parity so
+    # a stale length surviving the release cannot hide.
+    let smalls = @["abc", "xxab", "hello", "aab", ""]
+    let pats = @[re("abc"), re("ab"), re("(a+?)(b)"), re("z"), re("")]
+    for i in 0 ..< 20:
+      for s in smalls:
+        for r in pats:
+          let expected = search(s, r)
+          discard searchIntoCtx(ctx, s, r, m)
+          check m.found == expected.found
+          check m.boundaries == expected.boundaries
+    # The deep run again after the release: re-growth must answer the same.
+    check searchIntoCtx(ctx, big, deep, m, stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * 20_000 + 1)
+
+  test "scratch buffers are handed back after quiet runs":
+    # Upper-bound check on the release policy: a deep run grows the buffers
+    # with the subject, and several small searches in a row must hand the
+    # capacity back. Only the direction and the order of magnitude are
+    # asserted, so retuning the keep marks does not break this test.
+    let ctx = newMatchContext()
+    var m: Match
+    let deep = re("(a|b)*c")
+    let big = "ab".repeat(20_000) & "c"
+    check searchIntoCtx(ctx, big, deep, m, stepLimit = 0)
+    check m.found
+    let grown = scratchCaps(ctx)
+    # The deep run must actually grow the buffers, or the comparison below
+    # would pass vacuously.
+    check grown.frames > 16_384
+    check grown.choices > 16_384
+    # More small searches than the quiet-run mark before the release fires.
+    for i in 0 ..< 20:
+      discard searchIntoCtx(ctx, "abc", re("abc"), m)
+      check m.found
+    let handedBack = scratchCaps(ctx)
+    check handedBack.frames < grown.frames div 8
+    check handedBack.choices < grown.choices div 8
+    # The released buffers must still answer correctly.
+    check searchIntoCtx(ctx, big, deep, m, stepLimit = 0)
+    check m.found
+    check m.matchSpan == 0 .. (2 * 20_000 + 1)
 
   test "searchIntoCtx with start offset":
     let ctx = newMatchContext()
@@ -3304,3 +3494,248 @@ suite "backward stepping and zero-width iteration":
     check split("ab", re("\\b")) == @["", "ab", ""]
     check replace("abc", re("(?=b)"), "-") == "a-bc"
     check split("abc", re("(?=b)")) == @["a", "bc"]
+
+# Regression for the worker-thread stack overflow: deep delegation must raise
+# RegexLimitError before it exhausts the thread's native stack. A worker
+# stack is 2 MiB against the main thread's 8 MiB, and under
+# --exceptions:setjmp a delegation level costs ~10 KB, so this used to
+# segfault instead of raising.
+#
+# The outcome crosses the thread boundary as an enum written through a pointer
+# to a main-thread local: under --mm:refc each thread owns its heap and frees
+# it at thread exit, so a string assigned on the worker would dangle by the
+# time the main thread read it.
+type
+  DeepQuantOutcome = enum
+    dqMatched
+    dqNoMatch
+    dqLimit
+    dqUnexpected
+
+  DeepQuantArg = tuple[reps: int, maxDepth: int, outcome: ptr DeepQuantOutcome]
+
+proc deepQuantOnThread(arg: DeepQuantArg) {.thread.} =
+  {.cast(gcsafe).}:
+    try:
+      # A subroutine call per subject character. Subexpression calls run as
+      # loop turns holding no native frame, so unlike the still-delegated
+      # shapes below this is paced by ``maxRecursionDepth``, not by the
+      # byte-budget guard.
+      let m = search(
+        "a".repeat(arg.reps),
+        re("(a(?1)?)"),
+        stepLimit = 0,
+        maxRecursionDepth = arg.maxDepth,
+      )
+      arg.outcome[] = if m.found: dqMatched else: dqNoMatch
+    except RegexLimitError:
+      arg.outcome[] = dqLimit
+    except CatchableError:
+      arg.outcome[] = dqUnexpected
+
+proc outcomeAt(reps: int, maxDepth: int = DefaultMaxRecursionDepth): DeepQuantOutcome =
+  var t: Thread[DeepQuantArg]
+  result = dqUnexpected
+  createThread(
+    t, deepQuantOnThread, (reps: reps, maxDepth: maxDepth, outcome: addr result)
+  )
+  joinThread(t)
+
+proc deepFullOnThread(arg: DeepQuantArg) {.thread.} =
+  {.cast(gcsafe).}:
+    try:
+      # Fully anchored, so only a full-depth nesting can match: a depth cap
+      # below the nesting answers no-match instead of raising.
+      let m = search(
+        "a".repeat(arg.reps),
+        re("\\A(a(?1)?)\\z"),
+        stepLimit = 0,
+        maxRecursionDepth = arg.maxDepth,
+      )
+      arg.outcome[] = if m.found: dqMatched else: dqNoMatch
+    except RegexLimitError:
+      arg.outcome[] = dqLimit
+    except CatchableError:
+      arg.outcome[] = dqUnexpected
+
+proc outcomeFullAt(
+    reps: int, maxDepth: int = DefaultMaxRecursionDepth
+): DeepQuantOutcome =
+  var t: Thread[DeepQuantArg]
+  result = dqUnexpected
+  createThread(
+    t, deepFullOnThread, (reps: reps, maxDepth: maxDepth, outcome: addr result)
+  )
+  joinThread(t)
+
+suite "call depth guard on a worker thread":
+  test "a shallow recursion still matches":
+    # Under a tiny budget even 20 delegation levels exceed it, so keep the
+    # "still matches" shape inside the budget on every build.
+    when engine.MaxStackBytes <= 64 * 1024:
+      check outcomeAt(5) == dqMatched
+    else:
+      check outcomeAt(20) == dqMatched
+
+  test "deep recursion is bounded by maxRecursionDepth, not the native stack":
+    # Subexpression calls hold no native frame per level, so 2000 levels fit
+    # every worker stack on every build: the depth cap answers instead of the
+    # byte budget. A stack overflow takes the whole test binary down, so
+    # reaching the checks at all is most of the assertion; the anchored pair
+    # pins the cap itself (a silent no-match past it, never a raise).
+    check outcomeAt(2000, maxDepth = 2000) == dqMatched
+    check outcomeFullAt(2000, maxDepth = 2000) == dqMatched
+    check outcomeFullAt(2000, maxDepth = 100) == dqNoMatch
+
+  test "a shallow delegation already exceeds a small stack budget":
+    # MaxStackBytes is a compile-time budget, so this only pins the
+    # first-interval probing when built small (e.g.
+    # -d:reniMaxStackBytes=16384): a few re-entry levels already exceed
+    # such a budget, and the guard must raise before the native stack is
+    # gone. Sampling every sixteenth level from the start would let the
+    # overrun precede the first reading instead. Under the default budget
+    # this shape matches, which the other guard tests already cover. No
+    # construct holds a native frame per repetition anymore, so the probe
+    # uses pattern-nested lookaheads: 60 closed re-entries.
+    when engine.MaxStackBytes <= 64 * 1024:
+      var pat = "a"
+      for i in 0 ..< 60:
+        pat = "(?=" & pat & ")"
+      expect RegexLimitError:
+        discard search("a", re(pat), stepLimit = 0)
+
+# These shapes once held a native frame per quantifier repetition -- one frame
+# chain per subject character -- and only the byte budget in ``runMachine``
+# stood between them and a stack overflow. Every construct runs in the loop
+# now, so they match at any repetition count on a 2 MiB worker thread; what
+# the suite pins is that none of them regresses into holding native stack
+# again.
+type DelegatedArg = tuple[pattern: string, reps: int, outcome: ptr DeepQuantOutcome]
+
+proc delegatedOnThread(arg: DelegatedArg) {.thread.} =
+  {.cast(gcsafe).}:
+    try:
+      let m = search("a".repeat(arg.reps) & "b", re(arg.pattern), stepLimit = 0)
+      arg.outcome[] = if m.found: dqMatched else: dqNoMatch
+    except RegexLimitError:
+      arg.outcome[] = dqLimit
+    except CatchableError:
+      arg.outcome[] = dqUnexpected
+
+proc delegatedOutcome(pattern: string, reps: int): DeepQuantOutcome =
+  var t: Thread[DelegatedArg]
+  result = dqUnexpected
+  createThread(
+    t, delegatedOnThread, (pattern: pattern, reps: reps, outcome: addr result)
+  )
+  joinThread(t)
+
+suite "a delegated construct in a quantifier body stays inside the budget":
+  test "a range marker in a quantifier body matches a long subject":
+    # ``(?~|x)`` in a sequence used to be walked by ``matchSeqCont`` through
+    # a delegate site of its own (~6 native frames a level), so 10_000
+    # repetitions exceeded the budget by design. The loop answers consecutive
+    # markers inline now, holding no native frame per repetition.
+    check delegatedOutcome("(?:(?~|x)a)*b", 10_000) == dqMatched
+
+  test "an alternation lookbehind repeats without overflowing the stack":
+    # The last delegated shape: its fixed alternatives used to be retried
+    # from a native loop counter, so 10_000 levels could not fit any budget.
+    # The remainder lives in a heap entry now, holding no native frame per
+    # repetition.
+    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 10_000) == dqMatched
+
+  test "delegated shapes match well inside the budget":
+    # Small repetition counts match on every build: no remaining shape holds
+    # a native frame per repetition, so no guard is left to fire early here.
+    check delegatedOutcome("(?:(?~|x)a)*b", 10) == dqMatched
+    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 10) == dqMatched
+    check delegatedOutcome("(?:(?~|x)a)*b", 100) == dqMatched
+    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 100) == dqMatched
+
+  test "a group around a lookbehind repeats without overflowing the stack":
+    # ``runCont`` used to walk continuation-chain links by native recursion,
+    # so one capture group around the lookbehind cost ~8 native frames per
+    # repetition against the six the depth guard budgets per level. Nothing
+    # in the loop walks the chain natively anymore, so this matches on every
+    # build; the depth guard below now only paces direct ``runCont`` callers.
+    check delegatedOutcome("(?:((?<=a|xy))a)*b", 400) == dqMatched
+
+suite "lookbehind repeats in the loop rather than on the native stack":
+  test "a negative lookbehind in a quantifier body matches a long subject":
+    # Every repetition used to hold a ``matchLookaround`` frame open, so this
+    # answered ``RegexLimitError`` at best and segfaulted at worst. Neither a
+    # match nor a rejection needs a frame: the predicate keeps nothing.
+    let m = search("a".repeat(20_000) & "b", re("(?:(?<!xy)a)*b"), stepLimit = 0)
+    check m.found
+    check m.boundaries[0] == 0 .. 20_001
+
+  test "a variable-length positive lookbehind in a quantifier body does too":
+    let m = search("a".repeat(20_000) & "b", re("(?:(?<=a?)a)*b"), stepLimit = 0)
+    check m.found
+    check m.boundaries[0] == 0 .. 20_001
+
+  test "and on a 2 MiB worker stack":
+    check delegatedOutcome("(?:(?<!xy)a)*b", 20_000) == dqMatched
+    check delegatedOutcome("(?:(?<=a?)a)*b", 20_000) == dqMatched
+
+  test "the loop answers the same lookbehinds as the recursive matcher did":
+    check search("xab", re("(?<=x)ab")).found
+    check not search("yab", re("(?<=x)ab")).found
+    check search("ab", re("(?<!x)ab")).found
+    check not search("xab", re("(?<!x)ab"), start = 1).found
+    check search("aab", re("(?<=a+)b")).found
+    check not search("b", re("(?<=a+)b")).found
+    # Captures a positive lookbehind body writes survive it, as a lookahead's do.
+    let m = search("xab", re("(?<=(x))ab"))
+    check m.found
+    check m.boundaries[1] == 0 .. 1
+    # A negative lookbehind keeps nothing, not even a matching body's captures.
+    let n = search("ab", re("(?<!(y))ab"))
+    check n.found
+    check n.boundaries[1].a < 0
+
+suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
+  test "the backtrack stack does not grow with the subject":
+    # The general greedy path pushes a choice, a continuation frame and a
+    # capture snapshot per repetition; a single-way leaf body needs none of
+    # them, only the position each repetition ended at.
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "a".repeat(50_000) & "b", re("a*b"), m, stepLimit = 0)
+    check ctx.scratchCaps.choices <= 16
+    check ctx.scratchCaps.frames <= 16
+
+  test "it still gives repetitions back one at a time":
+    check search("aaa", re("a*a")).boundaries[0] == 0 .. 3
+    check search("aaaa", re("^a{2,3}a$")).found
+    check not search("aaaaa", re("^a{2,3}a$")).found
+    check search("abcbc", re("[a-c]*c")).boundaries[0] == 0 .. 5
+    check search("12345", re("\\d*5")).boundaries[0] == 0 .. 5
+    check search("aaab", re("a*ab")).boundaries[0] == 0 .. 4
+    check not search("aa", re("a{3,}")).found
+    check search("aaaa", re("a{3,}")).boundaries[0] == 0 .. 4
+    # Zero-width body: one repetition, then the continuation.
+    check search("b", re("(?:)*b")).found
+
+  test "handing a repetition back undoes what ran after it":
+    # The repetitions write only ``pos``, but the continuation is not so
+    # bounded: ``\K`` moves the match start and nothing pushes an undo for it,
+    # so the entry has to carry the scalars the way the general path's snapshot
+    # does. With only ``pos`` rolled back, a ``\K`` on the branch that failed
+    # kept its ``keepStart`` and moved the reported start of the branch that
+    # matched.
+    check search("aaa", re("a{1,3}(?i)a|\\b\\Kab")).boundaries[0] == 0 .. 3
+    check search("abcaaaaaaaaaaaa", re("a{1,3}(?i)a|\\b\\Kab")).boundaries[0] == 3 .. 7
+    # The flags a continuation changed have to come back too.
+    check search("aab", re("a*(?i:B)")).boundaries[0] == 0 .. 3
+
+  test "a body with two ways to match keeps the general path":
+    # Under (?i) ``ß`` also matches ``ss``, so the repetition has to be
+    # re-driven on backtracking and must not take the scan.
+    check search("ßss", re("(?i)ß*$")).boundaries[0] == 0 .. 4
+    check search("aAa", re("(?i)a*$")).boundaries[0] == 0 .. 3
+    check search("ss", re("(?i)ß*ss")).boundaries[0] == 0 .. 2
+
+  test "grapheme repetition still steps by grapheme":
+    check search("áb", re("\\X*b")).found
