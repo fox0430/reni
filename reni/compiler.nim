@@ -660,21 +660,69 @@ proc markQuantBodyPure(node: Node): bool =
     # writes nothing, so it is exactly the body's verdict.
     node.quantBodyPure = not result
 
-proc annotateTree(node: Node) =
+proc sameFirstChar(a, b: FirstCharInfo): bool =
+  ## Structural equality for two hints.  Spelled out because ``FirstCharInfo``
+  ## is a case object, for which Nim generates no ``==``.
+  if a.kind != b.kind:
+    return false
+  case a.kind
+  of fcByte:
+    a.byte == b.byte
+  of fcByteSet:
+    a.bytes == b.bytes
+  of fcNone, fcAnchorStart, fcLineStart:
+    true
+
+proc annotateTree(node: Node, hintFlags: RegexFlags, cache: var FirstCharCache) =
   ## Single post-parse walk over the finished AST: precomputes each character
   ## class's ASCII membership bitmap, so the matcher can answer ASCII input
-  ## with one bit test instead of walking the atoms.  Stored before negation,
-  ## which ``matchCharClassAt`` applies to the lookup's answer.
+  ## with one bit test instead of walking the atoms (stored before negation,
+  ## which ``matchCharClassAt`` applies to the lookup's answer), and records
+  ## each alternative's first-byte hint so the matcher can pass over a branch
+  ## that cannot start here.
+  ##
+  ## ``hintFlags`` is not tracked down the tree the way ``extractFirstChar``
+  ## tracks it across a concatenation: it carries ``rfIgnoreCase`` from the
+  ## start and stays put.  That flag is the only one the first-byte analysis
+  ## reads, and reading it as set only ever widens a hint or abandons it, so
+  ## a hint computed this way is a superset of the truth under any flags the
+  ## match actually runs with -- including an ``(?i)`` the pattern switches
+  ## on partway through, which no compile-time walk of the tree would see at
+  ## the right place anyway.
   if node == nil:
     return
-  if node.kind == nkCharClass:
+  case node.kind
+  of nkAlternation:
+    # Allocated on first use, so a pattern with no alternation in it pays for
+    # no table at all.
+    if cache.isNil:
+      cache = newTable[(uint, RegexFlags), FirstCharInfo]()
+    var hints = newSeq[FirstCharInfo](node.alternatives.len)
+    var discriminates = false
+    for i, alt in node.alternatives:
+      hints[i] = extractFirstChar(alt, hintFlags, cache)
+      if i > 0 and not sameFirstChar(hints[i], hints[0]):
+        discriminates = true
+    # Hints that are all the same one can never pass over a branch: whatever
+    # byte is in front of the matcher, either every branch survives the test
+    # or none does.  Keeping them would buy a pointer chase into ``altFirst``
+    # per branch per visit and nothing else -- measurably so, since a
+    # ``FirstCharInfo`` carries a 32-byte set and a handful of them span
+    # several cache lines.  The alternation that could still gain, one whose
+    # branches all fail together partway through a pattern, gives back less
+    # than the test costs everywhere else.
+    if discriminates:
+      node.altFirst = hints
+  of nkCharClass:
     var ascii: set[uint8]
     var nonAscii, predicate: bool
     if classAsciiMatches(node, ascii, nonAscii, predicate):
       node.asciiSet = ascii
       node.asciiSetOk = true
+  else:
+    discard
   for child in node.childNodes:
-    annotateTree(child)
+    annotateTree(child, hintFlags, cache)
 
 proc hasTopLevelFindLongest(node: Node): bool =
   ## True when a scoped ``(?L:...)`` spans the whole pattern. The parser
@@ -769,7 +817,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   bodies = @[]
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
-  annotateTree(ast)
+  var firstCharCache: FirstCharCache = nil
+  annotateTree(ast, finalFlags + {rfIgnoreCase}, firstCharCache)
   initRegex(
     pattern = pattern,
     ast = ast,

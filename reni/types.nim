@@ -12,7 +12,7 @@
 ## contract.  User code should consume the documented API re-exported from
 ## ``reni`` instead.
 
-import std/unicode
+import std/[hashes, tables, unicode]
 
 type
   RegexError* = object of CatchableError
@@ -222,6 +222,14 @@ type
       children*: seq[Node]
     of nkAlternation:
       alternatives*: seq[Node]
+      altFirst*: seq[FirstCharInfo]
+        ## Per-alternative first-byte hint, filled in by the compiler, so the
+        ## matcher can pass over a branch whose first byte is not the one in
+        ## front of it.  Computed as if ``(?i)`` were on: ``rfIgnoreCase`` is
+        ## the only flag the analysis reads, and switching it on only ever
+        ## widens a hint or gives up, so the entry stays a superset whatever
+        ## flags are live at match time.  Empty means "no hints" and every
+        ## alternative is tried.
     of nkCapture:
       captureIndex*: int
       captureBody*: Node
@@ -1086,10 +1094,38 @@ proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
   # them (``codeIsClassifiable``), so the ASCII set is the whole hint.
   byteSetInfo(ascii)
 
-proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
+type FirstCharCache* = TableRef[(uint, RegexFlags), FirstCharInfo]
+  ## Memo for ``extractFirstChar``, keyed by node identity and the flags it
+  ## was asked under.  The analysis is a pure function of those two, and one
+  ## caller -- the compiler annotating every alternative of every alternation
+  ## -- asks about overlapping subtrees: without the memo a chain of nested
+  ## alternations re-walks everything below it once per level.
+
+proc extractFirstCharUncached(
+  node: Node, flags: RegexFlags, cache: FirstCharCache
+): FirstCharInfo
+
+proc extractFirstChar*(
+    node: Node, flags: RegexFlags, cache: FirstCharCache = nil
+): FirstCharInfo =
   ## Extract optimization hint about the first character/anchor of a pattern.
+  ## ``cache``, when given, is consulted and filled as the walk descends.
   if node == nil:
     return FirstCharInfo(kind: fcNone)
+  if cache.isNil:
+    return extractFirstCharUncached(node, flags, nil)
+  # ``hasKey`` then ``[]`` rather than ``getOrDefault``: the latter compares
+  # the hit against the default, and ``FirstCharInfo`` is a case object, for
+  # which Nim generates no ``==``.
+  let key = (cast[uint](node), flags)
+  if cache.hasKey(key):
+    return cache[key]
+  result = extractFirstCharUncached(node, flags, cache)
+  cache[key] = result
+
+proc extractFirstCharUncached(
+    node: Node, flags: RegexFlags, cache: FirstCharCache
+): FirstCharInfo =
   case node.kind
   of nkAnchor:
     case node.anchor
@@ -1120,7 +1156,7 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
         continue
-      let info = extractFirstChar(child, currentFlags)
+      let info = extractFirstChar(child, currentFlags, cache)
       if info.kind == fcLineStart:
         # ``^`` is zero-width: remember it, but keep looking for a byte hint,
         # which skips over more of the subject than jumping line to line.
@@ -1144,34 +1180,35 @@ proc extractFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
     else:
       FirstCharInfo(kind: fcNone)
   of nkCapture:
-    extractFirstChar(node.captureBody, flags)
+    extractFirstChar(node.captureBody, flags, cache)
   of nkNamedCapture:
-    extractFirstChar(node.namedCaptureBody, flags)
+    extractFirstChar(node.namedCaptureBody, flags, cache)
   of nkGroup:
-    extractFirstChar(node.groupBody, flags)
+    extractFirstChar(node.groupBody, flags, cache)
   of nkFlagGroup:
     if node.flagBody != nil:
-      extractFirstChar(node.flagBody, flags + node.flagsOn - node.flagsOff)
+      extractFirstChar(node.flagBody, flags + node.flagsOn - node.flagsOff, cache)
     else:
       FirstCharInfo(kind: fcNone)
   of nkQuantifier:
     if node.quantMin >= 1 and (node.quantMax < 0 or node.quantMax >= node.quantMin):
-      extractFirstChar(node.quantBody, flags)
+      extractFirstChar(node.quantBody, flags, cache)
     else:
       FirstCharInfo(kind: fcNone)
   of nkAlternation:
     if node.alternatives.len == 0:
       return FirstCharInfo(kind: fcNone)
-    var merged = extractFirstChar(node.alternatives[0], flags)
+    var merged = extractFirstChar(node.alternatives[0], flags, cache)
     if merged.kind == fcNone:
       return merged
     for i in 1 ..< node.alternatives.len:
-      merged = mergeFirstChar(merged, extractFirstChar(node.alternatives[i], flags))
+      merged =
+        mergeFirstChar(merged, extractFirstChar(node.alternatives[i], flags, cache))
       if merged.kind == fcNone:
         return merged
     merged
   of nkAtomicGroup:
-    extractFirstChar(node.atomicBody, flags)
+    extractFirstChar(node.atomicBody, flags, cache)
   of nkCharType:
     byteSetInfo(charTypeBytes(node.charType))
   of nkCharClass:
