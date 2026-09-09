@@ -111,6 +111,29 @@ except RegexLimitError:
   echo "step limit exceeded"
 ```
 
+### Stack budget (stack-overflow protection)
+
+Matching keeps its backtrack state on the heap, so native stack usage does
+not grow with the subject length. The budget bounds only pattern-nested
+re-entry such as nested lookarounds, measured in bytes of native stack.
+Exceeding it raises `RegexLimitError`, both when matching and when parsing
+with `re()`.
+
+The default is 1 MiB, half of a 2 MiB worker thread. A main thread has 8 MiB.
+When the target's budget is known, set it explicitly:
+
+```
+nim c -d:reniMaxStackBytes=4194304 yourapp.nim
+```
+
+Raise it for main-thread-only builds that match deeply nested patterns;
+lower it for small stacks such as musl's 128 KiB default. Keep the budget at
+no more than half of the real thread stack, and no less than 16 KiB.
+
+What bounds the *work* a match may do is `stepLimit`, described above.
+Debug builds may additionally stop at Nim's call-depth limit before reaching
+the byte budget.
+
 ## Internal API notice
 
 `Regex.ast`, the `Node` type, and `NodeKind` are exposed by the library but

@@ -65,3 +65,51 @@ jobs:
       - name: Gen docs
         run: |
           nim doc --project --index:on --outdir:./htmldocs ./reni.nim
+
+  tests-small-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache nimble
+        id: cache-nimble
+        uses: actions/cache@v5
+        with:
+          path: ~/.nimble
+          key: ${{ runner.os }}-nimble-v2-${{ hashFiles('*.nimble') }}
+          restore-keys: |
+            ${{ runner.os }}-nimble-v2-
+
+      - name: Setup Nim (stable/release)
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: nimble install -y --depsOnly
+
+      - name: Setup paths
+        run: nimble setup -y
+
+      - name: Run engine tests with a tiny stack budget
+        # The first-interval probing guard only fires under a small
+        # -d:reniMaxStackBytes, so the default suite cannot observe it.
+        # Scoped to test_engine, which holds all guard tests: the ported
+        # conformance suites pin default-budget semantics and need more
+        # than 16 KiB of native stack for deep recursion by design.
+        run: nim c -r -d:reniMaxStackBytes=16384 tests/test_engine.nim
+
+      - name: Run engine tests with setjmp exceptions and no stack traces
+        # The configuration the byte budget exists for: a recursion level costs
+        # ~12 KB instead of ~750 B, and with stack traces off Nim's own
+        # call-depth abort is gone, so the byte guard is the only thing between
+        # a delegated construct in a quantifier body and a segfault. Every
+        # other job builds with goto exceptions and traces on, where a missing
+        # guard still answers rather than crashing.
+        #
+        # Not a release build: -O3 over setjmp's expanded control flow takes
+        # tens of minutes on this file, and what is being exercised is the
+        # frame size, which a debug build only makes larger.
+        run: nim c -r --exceptions:setjmp --stacktrace:off tests/test_engine.nim
