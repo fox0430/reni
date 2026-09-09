@@ -1,7 +1,7 @@
 import std/unicode
 from std/strutils import toUpperAscii, find, parseInt
 
-import types, charclass, unicode_utils
+import types, charclass, unicode_utils, stackguard
 
 type Parser* = object
   src: string
@@ -10,6 +10,9 @@ type Parser* = object
   captureCount*: int
   namedCaptures*: seq[(string, int)]
   depth: int
+  stackBase: int
+    ## Parse start frame for the byte-budget check.
+    ## Level caps alone cannot bound bytes since per-level cost varies.
   captureDepth: int ## nesting depth inside capture groups
   concatNodeCount: int ## number of nodes already parsed at current concat level
   inNonFirstBranch: bool ## true when parsing non-first alternation branch
@@ -26,7 +29,8 @@ const
   FlagChars = {'i', 'm', 's', 'x', 'W', 'D', 'S', 'P', 'I', 'L'}
 
 proc initParser*(pattern: string, flags: RegexFlags = {}): Parser =
-  Parser(src: pattern, pos: 0, flags: flags)
+  ## Records ``stackBase`` here so nested lookaround re-entry shares one base.
+  Parser(src: pattern, pos: 0, flags: flags, stackBase: currentStackAddr())
 
 proc atEnd*(p: Parser): bool =
   p.pos >= p.src.len
@@ -902,7 +906,7 @@ proc parseAtom(p: var Parser): Node =
     p.advance()
     result = Node(kind: nkAnchor, anchor: akLineEnd)
   of '[':
-    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags)
+    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase)
     p.pos = newPos
     result = node
   of ')', '|':
@@ -1190,6 +1194,8 @@ proc parseConditional(p: var Parser): Node =
 
   if condKind == ckRegexCond and condBodyNode == nil:
     var condParser = initParser(condName, p.flags)
+    # Shares the outer budget; runs on top of already-spent frames.
+    condParser.stackBase = p.stackBase
     condBodyNode = condParser.parseRegex()
 
   let yesStart = p.pos
@@ -1221,6 +1227,11 @@ proc parseGroup(p: var Parser): Node =
   inc p.depth
   if p.depth > MaxNestingDepth:
     p.error("nesting too deep")
+  # Level cap is a complexity limit; this is the resource guard.
+  # Parser levels are cheap, so check every level.
+  if stackUsedFrom(p.stackBase) > MaxStackBytes:
+    raise
+      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
   let savedFlags = p.flags
 

@@ -5,7 +5,10 @@
 
 import std/[unicode, tables]
 
-import types, unicode_utils
+import types, unicode_utils, stackguard
+
+# Re-exported so callers can read the compiled-in budget (used by tests).
+export stackguard.MaxStackBytes
 
 type
   ContId = int32

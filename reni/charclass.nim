@@ -1,12 +1,18 @@
 import std/unicode
 
-import types, unicode_utils
+import types, unicode_utils, stackguard
 
 type CcParser* = object
   src: string
   pos: int
   flags: RegexFlags
   pendingAtoms*: seq[CcAtom]
+  stackBase: int ## Outer parse start frame; shared base for the byte-budget check.
+  depth: int
+    ## Nesting depth in `parseCharClassBody`; level-based guard for debug builds.
+
+const MaxCcNestingDepth = 256
+  ## Same limit as `MaxNestingDepth` in `parser.nim` (separate to avoid import cycle).
 
 const HexDigits* = {'0' .. '9', 'a' .. 'f', 'A' .. 'F'}
 
@@ -28,8 +34,14 @@ proc parseOctInt*(s: string): int =
     if result > 0x10FFFF:
       raise newException(RegexError, "octal escape value too large")
 
-proc initCcParser*(src: string, pos: int, flags: RegexFlags): CcParser =
-  CcParser(src: src, pos: pos, flags: flags)
+proc initCcParser*(src: string, pos: int, flags: RegexFlags, stackBase: int): CcParser =
+  CcParser(src: src, pos: pos, flags: flags, stackBase: stackBase)
+
+template checkCcBudget(p: CcParser) =
+  ## Byte-budget check covering `[` nesting and `&&` right sides.
+  if stackUsedFrom(p.stackBase) > MaxStackBytes:
+    raise
+      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
 proc position*(p: CcParser): int =
   p.pos
@@ -469,6 +481,7 @@ proc isPosixClass(p: CcParser): bool =
 
 proc parseCcAtom(p: var CcParser): CcAtom =
   ## Parse a single atom inside a character class.
+  checkCcBudget(p)
   # Skip stray \E (end of literal quote or standalone)
   while not p.atEnd and p.peek == '\\' and p.peekAt(1) == 'E':
     p.advance()
@@ -522,6 +535,10 @@ proc isCharTypeAtom(a: CcAtom): bool =
 proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
   ## Parse the body of a character class (after the opening '[').
   ## Returns (negated, atoms).
+  inc p.depth
+  if p.depth > MaxCcNestingDepth:
+    p.error("nesting too deep")
+  checkCcBudget(p)
   var negated = false
   if p.peek == '^':
     negated = true
@@ -631,12 +648,15 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
       p.error("invalid code point value")
     atoms.add(atom)
 
+  dec p.depth
   result = (negated, atoms)
 
-proc parseCharClass*(src: string, pos: int, flags: RegexFlags): (int, Node) =
+proc parseCharClass*(
+    src: string, pos: int, flags: RegexFlags, stackBase: int
+): (int, Node) =
   ## Parse a character class starting at `[` at position pos.
   ## Returns (new position after `]`, Node).
-  var p = initCcParser(src, pos, flags)
+  var p = initCcParser(src, pos, flags, stackBase)
   p.advance() # skip '['
 
   let (negated, atoms) = p.parseCharClassBody()
