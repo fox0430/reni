@@ -333,7 +333,7 @@ type
     of fcNone, fcAnchorStart, fcLineStart:
       discard
 
-when sizeof(pointer) == 8:
+when sizeof(pointer) == 8 and not defined(nimdoc):
   # One AST node, one cache line.  The matcher walks these, so the size is not
   # free -- and it is easy to grow by accident, since a variant is as wide as
   # its widest branch and a field landing between a seq and a set can cost a
@@ -343,6 +343,11 @@ when sizeof(pointer) == 8:
   # The number is the 64-bit layout; other word sizes are not pinned rather
   # than pinned wrongly.  If a new field genuinely needs the room, measure the
   # cost and move this line -- do not delete it.
+  #
+  # ``nimdoc`` is excluded because doc generation never reaches the backend,
+  # and Nim 2.0.x's compile-time layout for this variant disagrees with the
+  # one it emits (56 vs 64); the check belongs to the build that lays the
+  # node out for real.
   static:
     doAssert sizeof(typeof(default(Node)[])) == 64,
       "Node grew to " & $sizeof(typeof(default(Node)[])) & " bytes; see the note here"
