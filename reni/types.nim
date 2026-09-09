@@ -249,14 +249,18 @@ type
         ## ``false`` is the safe value, so a node the pass never visits
         ## degrades to "always snapshot", never to "never".
     of nkCharClass:
-      negated*: bool
+      # The widest branch in the variant, so its layout alone decides
+      # ``sizeof(Node[])`` -- see the check under the type.  Keep the bools
+      # together at the end: split up by the seq and the set, each one takes a
+      # padding slot of its own and the node grows past 64 bytes.
       atoms*: seq[CcAtom]
-      bracketClass*: bool ## true when from [...] syntax (enables case-fold matching)
       asciiSet*: set[uint8]
         ## The ASCII bytes the class's atoms match, *before* negation — the
         ## same contract as ``classHasByte``, whose caller applies ``negated``.
         ## Filled in by the compiler when ``asciiSetOk``; the matcher then
         ## answers ASCII input with one bit test instead of walking the atoms.
+      negated*: bool
+      bracketClass*: bool ## true when from [...] syntax (enables case-fold matching)
       asciiSetOk*: bool
         ## ``asciiSet`` is exact.  Only true for classes whose atoms all read
         ## the same below U+0080 whatever the ASCII-restriction flags say;
@@ -328,6 +332,20 @@ type
       bytes*: set[uint8]
     of fcNone, fcAnchorStart, fcLineStart:
       discard
+
+when sizeof(pointer) == 8:
+  # One AST node, one cache line.  The matcher walks these, so the size is not
+  # free -- and it is easy to grow by accident, since a variant is as wide as
+  # its widest branch and a field landing between a seq and a set can cost a
+  # padding slot rather than its own size.  Pinning it means growing the node
+  # has to be a decision someone makes, not a side effect they never see.
+  #
+  # The number is the 64-bit layout; other word sizes are not pinned rather
+  # than pinned wrongly.  If a new field genuinely needs the room, measure the
+  # cost and move this line -- do not delete it.
+  static:
+    doAssert sizeof(typeof(default(Node)[])) == 64,
+      "Node grew to " & $sizeof(typeof(default(Node)[])) & " bytes; see the note here"
 
 const
   acWord* = 0x0001'u16
