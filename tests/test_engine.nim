@@ -3746,6 +3746,18 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
     # Zero-width body: one repetition, then the continuation.
     check search("b", re("(?:)*b")).found
 
+  test "a repetition over malformed bytes is given back one at a time":
+    # The differential above quantifies only ``\d+`` and ``\s*``, neither of
+    # which matches a stray 0x80..0xBF byte, so no generated pattern builds a
+    # run *over* malformed input and then forces a give-back.  A stray
+    # continuation byte decodes as a code point of its own, and each
+    # repetition has to end where the decoder said it ended -- give back two
+    # characters at once and the count desynchronises from the position it
+    # counts, reporting the wrong span and then indexing out of range.
+    check search("\x0A\x85", re("[^a]*(.)")).boundaries[1] == 1 .. 2
+    check search("\x80\x80", re("\\W*(\\S)")).boundaries[1] == 1 .. 2
+    check search("\x85\xE3\x81\x82x", re("[^a]*(x)")).boundaries[1] == 4 .. 5
+
   test "handing a repetition back undoes what ran after it":
     # The repetitions write only ``pos``, but the continuation is not so
     # bounded: ``\K`` moves the match start and nothing pushes an undo for it,
