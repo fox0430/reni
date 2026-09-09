@@ -16,7 +16,15 @@ type Parser* = object
   captureDepth: int ## nesting depth inside capture groups
   concatNodeCount: int ## number of nodes already parsed at current concat level
   inNonFirstBranch: bool ## true when parsing non-first alternation branch
-  requiresExclusive: bool ## true when (?Ii:...) requires being the only node
+  atOptionPrefix: bool
+    ## Still inside the run of ``(?:`` / ``(?flags:`` wrappers the pattern opens
+    ## with, which is the only place a [LeadingOnlyFlags] group may sit.
+  sawLeadingOnlyOption: bool ## a [LeadingOnlyFlags] group has already been taken
+  requiresExclusive: bool
+    ## true once a [LeadingOnlyFlags] group has been taken and now requires
+    ## being the only node of the pattern -- both the scoped ``(?I:a)`` form
+    ## and the isolated ``(?I)a`` one, which spans the rest of its own group
+    ## but still may not have siblings outside the wrappers around it.
   inLookbehind: bool ## true when inside lookbehind assertion
   inLiteralQuote: bool ## true when inside \Q...\E
   sawPlainGroup*: bool
@@ -27,10 +35,19 @@ const
   MaxNestingDepth = 256
   MaxRepeat = 100_000
   FlagChars = {'i', 'm', 's', 'x', 'W', 'D', 'S', 'P', 'I', 'L'}
+  LeadingOnlyFlags = {rfIgnoreCaseAscii, rfFindLongest}
+    ## ``I`` and ``L``.  Oniguruma takes these in one group at the very start of
+    ## the pattern and nowhere else, and never lets them be cleared.
 
 proc initParser*(pattern: string, flags: RegexFlags = {}): Parser =
   ## Records ``stackBase`` here so nested lookaround re-entry shares one base.
-  Parser(src: pattern, pos: 0, flags: flags, stackBase: currentStackAddr())
+  Parser(
+    src: pattern,
+    pos: 0,
+    flags: flags,
+    stackBase: currentStackAddr(),
+    atOptionPrefix: true,
+  )
 
 proc atEnd*(p: Parser): bool =
   p.pos >= p.src.len
@@ -984,6 +1001,21 @@ proc parseConcat(p: var Parser): Node =
     # including across alternation branches. Restructure the AST so the flag
     # wraps the remaining regex as a scoped flag group.
     if node.kind == nkFlagGroup and node.flagBody == nil:
+      # An isolated flag group still counts as a sibling of what precedes it,
+      # even though it wraps the rest: Oniguruma rejects ``(?I:a)(?i)`` just
+      # like ``(?I:a)b``. The add-and-break below bypasses the exclusive check
+      # at the end of the loop, so check here before wrapping the rest.
+      if p.requiresExclusive:
+        p.error("invalid combination of options")
+      # The rest is wrapped by this group, but it no longer opens the pattern:
+      # Oniguruma rejects ``(?i)(?I)a`` for exactly this reason.
+      p.atOptionPrefix = false
+      # An isolated [LeadingOnlyFlags] group spans the rest of its own group,
+      # but the wrappers around it may hold nothing else: Oniguruma takes
+      # ``(?:(?I)a)`` and rejects ``(?:(?I)a)b``, ``b(?:(?I)a)`` and
+      # ``(?:(?I)a)|b`` alike.  Raise the flag only after the body is parsed,
+      # so the body's own nodes -- the ``ab`` of ``(?I)ab`` -- are not counted.
+      let isolatedNeedsExclusive = (node.flagsOn * LeadingOnlyFlags).card > 0
       let rest = p.parseAlternation()
       nodes.add(
         Node(
@@ -994,6 +1026,8 @@ proc parseConcat(p: var Parser): Node =
           graphemeMode: node.graphemeMode,
         )
       )
+      if isolatedNeedsExclusive:
+        p.requiresExclusive = true
       break
     # Skip empty nodes from \E; if a quantifier follows, attach to previous atom
     if node.kind == nkConcat and node.children.len == 0:
@@ -1010,8 +1044,11 @@ proc parseConcat(p: var Parser): Node =
     # (?Ii:...) requires being the sole node in the pattern
     if p.requiresExclusive and nodes.len > 1:
       p.error("invalid combination of options")
-  # Check requiresExclusive at end: if set and there are trailing tokens after this concat
-  if p.requiresExclusive and nodes.len == 1 and not p.atEnd and p.peek notin {')', '|'}:
+  # Check requiresExclusive at end: if set and there are trailing tokens after
+  # this concat.  ``)`` is the close of a transparent wrapper and is fine --
+  # ``(?:(?I:a))`` is accepted -- but an alternation is not: Oniguruma rejects
+  # ``(?I:a)|b`` while taking ``(?I:a|b)``, where the bar is inside the body.
+  if p.requiresExclusive and nodes.len == 1 and not p.atEnd and p.peek != ')':
     p.error("invalid combination of options")
   p.concatNodeCount = savedConcatCount
   case nodes.len
@@ -1037,6 +1074,31 @@ proc parseAlternation(p: var Parser): Node =
 
 proc parseRegex*(p: var Parser): Node =
   parseAlternation(p)
+
+proc validateLeadingOnlyPosition*(p: Parser, root: Node) =
+  ## Reject a quantified [LeadingOnlyFlags] group at the top of the pattern.
+  ## Sibling cases are already caught while parsing; only a lone quantified
+  ## node slips through since ``requiresExclusive`` sees a single node at the
+  ## end. Oniguruma rejects ``(?I:a)+`` and ``(?:(?I:a))+`` the same way.
+  ## A quantified group nested inside ``(?flags:...)`` stays valid --
+  ## Oniguruma takes ``(?i:(?I:a)+)`` -- so ``nkFlagGroup`` masks the inside
+  ## and only transparent ``(?:...)`` wrappers are unwrapped here.
+  if not p.sawLeadingOnlyOption:
+    return
+  var node = root
+  while node != nil:
+    case node.kind
+    of nkGroup:
+      node = node.groupBody
+    of nkConcat:
+      if node.children.len == 1:
+        node = node.children[0]
+      else:
+        return
+    else:
+      break
+  if node != nil and node.kind == nkQuantifier:
+    p.error("invalid combination of options")
 
 proc parseNamedCapture(p: var Parser, closeChar: char): Node =
   ## Parse a named capture group. `closeChar` is '>' for (?<name>...) and
@@ -1234,6 +1296,10 @@ proc parseGroup(p: var Parser): Node =
       newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
   let savedFlags = p.flags
+  # Only ``(?:...)`` and ``(?flags:...)`` wrap without ending the run of
+  # wrappers a [LeadingOnlyFlags] group may sit in; those two put it back.
+  let outerAtOptionPrefix = p.atOptionPrefix
+  p.atOptionPrefix = false
 
   if p.peek == '*':
     p.advance() # skip '*'
@@ -1247,6 +1313,7 @@ proc parseGroup(p: var Parser): Node =
     of ':':
       # (?:...) non-capturing group
       p.advance()
+      p.atOptionPrefix = outerAtOptionPrefix
       let body = p.parseRegex()
       p.sawPlainGroup = true
       result = Node(kind: nkGroup, groupBody: body)
@@ -1438,30 +1505,32 @@ proc parseGroup(p: var Parser): Node =
         var flagsOn: RegexFlags = {}
         var flagsOff: RegexFlags = {}
         var parsingOff = false
-        # Track order: did I appear before i in the on set?
-        var iOnSeen = false
-        var bigIBeforeLittleI = false
         while not p.atEnd and (p.peek in FlagChars or p.peek == '-'):
           if p.peek == '-':
             parsingOff = true
             p.advance()
           else:
             let flag = charToFlag(p.peek)
-            if not parsingOff:
-              if flag == rfIgnoreCase:
-                iOnSeen = true
-              elif flag == rfIgnoreCaseAscii and not iOnSeen:
-                bigIBeforeLittleI = true
             if parsingOff:
               flagsOff.incl(flag)
             else:
               flagsOn.incl(flag)
             p.advance()
 
-        # Validate flag combinations
-        # (?-L) is not allowed
-        if rfFindLongest in flagsOff:
+        # [LeadingOnlyFlags] can only be switched on, and only by a group that
+        # opens the pattern: the wrappers before it must all be ``(?:`` or
+        # ``(?flags:``, nothing may have been parsed yet, and one such group is
+        # the most a pattern gets.  A capture, a lookaround, an atomic group or
+        # an isolated ``(?flags)`` all end that run -- which is why Oniguruma
+        # takes ``(?I)a`` and ``(?:(?I)a)`` but rejects ``(?i)(?I)a``.
+        if (flagsOff * LeadingOnlyFlags).card > 0:
           p.error("invalid combination of options")
+        let leadingOnly = (flagsOn * LeadingOnlyFlags).card > 0
+        if leadingOnly:
+          if p.sawLeadingOnlyOption or not outerAtOptionPrefix or p.concatNodeCount > 0 or
+              p.captureDepth > 0 or p.inNonFirstBranch:
+            p.error("invalid combination of options")
+          p.sawLeadingOnlyOption = true
 
         if p.peek == ':':
           # Scoped: (?imx:...)
@@ -1472,7 +1541,6 @@ proc parseGroup(p: var Parser): Node =
           let iAndIBothPresent =
             (rfIgnoreCase in flagsOn or rfIgnoreCase in flagsOff) and
             (rfIgnoreCaseAscii in flagsOn or rfIgnoreCaseAscii in flagsOff)
-          var scopedNeedsExclusive = false
           if iAndIBothPresent:
             let ok = rfIgnoreCaseAscii in flagsOn and rfIgnoreCase in flagsOff
               # (?I-i:...) OK
@@ -1480,13 +1548,12 @@ proc parseGroup(p: var Parser): Node =
               # (?iI:...) or (?Ii:...) OK
             if not ok and not ok2:
               p.error("invalid combination of options")
-            if ok2:
-              # (?Ii:...) / (?iI:...) must be at top level, sole node
-              if p.concatNodeCount > 0 or p.captureDepth > 0 or p.inNonFirstBranch:
-                p.error("invalid combination of options")
-              scopedNeedsExclusive = true
           p.advance()
           p.flags = (p.flags + flagsOn) - flagsOff
+          # The scoped form has to span the pattern: Oniguruma rejects
+          # ``(?I:a)b`` and ``(?I:a)|b`` though it takes ``(?I:a)``.
+          let scopedNeedsExclusive = leadingOnly
+          p.atOptionPrefix = outerAtOptionPrefix
           let body = p.parseRegex()
           result = Node(
             kind: nkFlagGroup, flagsOn: flagsOn, flagsOff: flagsOff, flagBody: body
@@ -1495,12 +1562,6 @@ proc parseGroup(p: var Parser): Node =
             p.requiresExclusive = true
         elif p.peek == ')':
           # Isolated: (?imx) — affects rest of enclosing group
-          # (?Ii) and (?L) only allowed at pattern start position
-          let iAndIBothOn = rfIgnoreCase in flagsOn and rfIgnoreCaseAscii in flagsOn
-          let hasSpecialFlags = iAndIBothOn or rfFindLongest in flagsOn
-          if hasSpecialFlags:
-            if p.concatNodeCount > 0 or p.captureDepth > 0 or p.inNonFirstBranch:
-              p.error("invalid combination of options")
           p.flags = (p.flags + flagsOn) - flagsOff
           result =
             Node(kind: nkFlagGroup, flagsOn: flagsOn, flagsOff: flagsOff, flagBody: nil)
