@@ -3558,7 +3558,9 @@ proc deepFullOnThread(arg: DeepQuantArg) {.thread.} =
     except CatchableError:
       arg.outcome[] = dqUnexpected
 
-proc outcomeFullAt(reps: int, maxDepth: int = DefaultMaxRecursionDepth): DeepQuantOutcome =
+proc outcomeFullAt(
+    reps: int, maxDepth: int = DefaultMaxRecursionDepth
+): DeepQuantOutcome =
   var t: Thread[DeepQuantArg]
   result = dqUnexpected
   createThread(

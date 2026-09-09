@@ -122,8 +122,7 @@ type
     choices: seq[Choice]
       ## Backtrack buffer; live length is ``choicesLen``. Never shrinks; stale
       ## entries own nothing (cursors and plain values only).
-    choicesLen: int
-      ## Live length of ``choices``. LIFO with ``frames`` and ``capSaves``.
+    choicesLen: int ## Live length of ``choices``. LIFO with ``frames`` and ``capSaves``.
     repPositions: seq[int]
       ## Repetition end positions for ``chSimpleRepeat``, LIFO with ``choices``.
       ## One ``int`` per rep; no snapshot needed since only ``pos`` changes.
@@ -132,16 +131,14 @@ type
     repPeak: int
       ## High-water mark of ``repLen``. Needed because simple repeats push no
       ## choice point, so ``choicesPeak`` cannot see them.
-    capSaves: seq[Span]
-      ## Capture vectors for live ``SavedState`` snapshots (bulk copy).
+    capSaves: seq[Span] ## Capture vectors for live ``SavedState`` snapshots (bulk copy).
     capSavesPeak: int ## High-water mark of ``capSaves`` for the current search.
     capSavesHigh: int ## Highest peak seen since the buffer was last released.
     stackLensSaves: seq[seq[int]]
       ## ``captureStacks`` length snapshots for ``chLookbehindAlt`` entries.
     choicesPeak: int
       ## High-water mark of ``choices``; measures whether a search was big.
-    scratchQuiet: int
-      ## Consecutive small searches within the keep marks.
+    scratchQuiet: int ## Consecutive small searches within the keep marks.
     flBestLen: int ## findLongest: best match length so far (-1 if none)
     flBestMatch: Match ## findLongest: deepest match recorded
 
@@ -243,35 +240,25 @@ type
     of chUndoSubjectEnd:
       useAbsentPos: int
     of chWidenSubjectEnd:
-      wsSavedEnd: int
-        ## ``subjectEnd`` before narrowing; popping widens it back.
+      wsSavedEnd: int ## ``subjectEnd`` before narrowing; popping widens it back.
     of chAbsentFunc:
       afCont: ContId
       afFramesLen: int32
       afStart: int
-      afTry: int
-        ## Last tried end; next retry steps one back.
+      afTry: int ## Last tried end; next retry steps one back.
     of chUndoPos:
-      upPos: int
-        ## ``pos`` before a backreference advanced it.
+      upPos: int ## ``pos`` before a backreference advanced it.
     of chSubexpScope:
-      ssCapIdx: int32
-        ## Referenced group (0-based), or -1 for ``\g<0>``.
-      ssFlags: RegexFlags
-        ## Flags before the called group's flags.
+      ssCapIdx: int32 ## Referenced group (0-based), or -1 for ``\g<0>``.
+      ssFlags: RegexFlags ## Flags before the called group's flags.
     of chLookbehindAlt:
-      lbaNode {.cursor.}: Node
-        ## Lookaround node under test.
-      lbaNext: int32
-        ## Next alternative index to try.
+      lbaNode {.cursor.}: Node ## Lookaround node under test.
+      lbaNext: int32 ## Next alternative index to try.
       lbaCont: ContId
       lbaFramesLen: int32
-      lbaTarget: int
-        ## Position the lookbehind ends at (entry ``pos``).
-      lbaSaved: SavedState
-        ## Entry snapshot, replayed until exhausted.
-      lbaLensOff: int32
-        ## Stack-length snapshot offset in `stackLensSaves`.
+      lbaTarget: int ## Position the lookbehind ends at (entry ``pos``).
+      lbaSaved: SavedState ## Entry snapshot, replayed until exhausted.
+      lbaLensOff: int32 ## Stack-length snapshot offset in `stackLensSaves`.
     of chUndoCallout:
       ucoNode {.cursor.}: Node
         ## Callout node whose counter was incremented (cursor; tree outlives match).
@@ -379,14 +366,11 @@ const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 # explicitly, so the checks would only cost the hot path instructions.
 {.push overflowChecks: off.}
 
-const CapSavesKeep = 4096
-  ## ``capSaves`` entries kept between searches (~64 KB).
+const CapSavesKeep = 4096 ## ``capSaves`` entries kept between searches (~64 KB).
 
-const FramesKeep = 1600
-  ## ``frames`` entries kept between searches (~64 KB).
+const FramesKeep = 1600 ## ``frames`` entries kept between searches (~64 KB).
 
-const ChoicesKeep = 768
-  ## ``choices`` entries kept between searches (~66 KB).
+const ChoicesKeep = 768 ## ``choices`` entries kept between searches (~66 KB).
 
 const RepPositionsKeep = 8192
   ## ``repPositions`` entries kept between searches (64 KB). Higher since one
@@ -1028,8 +1012,7 @@ proc classFirstVariant(ctx: MatchContext, node: Node): int {.inline.} =
   ## First variant for ``classAdvance``: folds first, else plain match.
   if classFoldsApply(ctx, node): 0 else: MultiCharFolds.len
 
-const ClassVariants = MultiCharFolds.len + 1
-  ## Fold variants plus the plain match.
+const ClassVariants = MultiCharFolds.len + 1 ## Fold variants plus the plain match.
 
 proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
   ## End offset of the ``variant``-th way ``node`` matches, or -1.
@@ -1676,8 +1659,7 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
   of ckRegexCond:
     # Match the condition regex at current position (consuming)
     if node.condBody != nil:
-      if node.condBody.kind == nkLookaround and
-          node.condBody.lookKind == lkNegAhead:
+      if node.condBody.kind == nkLookaround and node.condBody.lookKind == lkNegAhead:
         # For negative lookaround conditions, evaluate the body directly.
         # When the body matches (negative lookaround fails -> condition
         # false), still preserve captures from the body match.
@@ -2568,9 +2550,7 @@ proc runMachine(
               ctx.groupRecursionDepth.setLen(captureIdx + 1)
             inc ctx.groupRecursionDepth[captureIdx]
           ctx.pushChoice Choice(
-            kind: chSubexpScope,
-            ssCapIdx: int32(captureIdx),
-            ssFlags: savedFlags,
+            kind: chSubexpScope, ssCapIdx: int32(captureIdx), ssFlags: savedFlags
           )
           if captureIdx >= 0 and captureIdx + 1 < ctx.captures.len:
             let index = captureIdx
@@ -2922,8 +2902,7 @@ proc runMachine(
         # Retry the continuation with the next shorter end position.
         var tryPos = ctx.choices[top].afTry - 1
         let startPos = ctx.choices[top].afStart
-        while tryPos > startPos and
-            (ctx.subject[tryPos].ord and 0xC0) == 0x80:
+        while tryPos > startPos and (ctx.subject[tryPos].ord and 0xC0) == 0x80:
           dec tryPos
         if tryPos < startPos:
           ctx.pos = startPos
@@ -2961,12 +2940,9 @@ proc runMachine(
         let n = ctx.choices[top].ucoNode
         let tag =
           case n.kind
-          of nkCalloutMax:
-            n.maxTag
-          of nkCalloutCount:
-            n.countTag
-          else:
-            ""
+          of nkCalloutMax: n.maxTag
+          of nkCalloutCount: n.countTag
+          else: ""
         if ctx.choices[top].ucoExisted:
           ctx.calloutCounters[tag] = ctx.choices[top].ucoPrev
         else:
