@@ -608,6 +608,11 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       ctx.subjectEnd = ctx.subject.len
       inc i
       continue
+    if i + 1 >= nodes.len:
+      # Last child: its continuation *is* ``tail``, so skip the frame entirely.
+      let ok = matchWithCont(ctx, nodes[i], tail)
+      unwindAbsentFrames(ctx, base)
+      return ok
     let fid = pushFrame(
       ctx, Frame(kind: ckSeqContinue, parent: tail, sNode: parent, sIdx: int32(i + 1))
     )
@@ -2715,12 +2720,17 @@ proc runMachine(
         if seqIdx >= seqNode.children.len:
           mode = mCont
         else:
-          cont = pushFrame(
-            ctx,
-            Frame(
-              kind: ckSeqContinue, parent: cont, sNode: seqNode, sIdx: int32(seqIdx + 1)
-            ),
-          )
+          # A last child needs no frame: its continuation *is* ``cont``.
+          if seqIdx + 1 < seqNode.children.len:
+            cont = pushFrame(
+              ctx,
+              Frame(
+                kind: ckSeqContinue,
+                parent: cont,
+                sNode: seqNode,
+                sIdx: int32(seqIdx + 1),
+              ),
+            )
           node = seqNode.children[seqIdx]
           mode = mMatch
     of mCont:
