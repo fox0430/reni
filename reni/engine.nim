@@ -94,10 +94,11 @@ type
       ## holding the value would make ``resetForRegex`` deep-copy the pattern
       ## string and the group tables, which a findAll loop pays per search,
       ## not per pattern.  Each entry point passes the address of its own
-      ## ``regex`` parameter, whose frame outlives every read below.  Only
-      ## matching code may read it, and only past ``resetForRegex``: an entry
-      ## point's quick-reject return runs before the reset and has to read
-      ## the parameter directly.
+      ## ``regex`` parameter, whose frame outlives every read below, and
+      ## clears it again on the way out.  Only matching code may read it,
+      ## and only past ``resetForRegex``: an entry point's quick-reject
+      ## return runs before the reset and has to read the parameter
+      ## directly.
     subjectEnd: int ## effective end of subject (for absent expression limiting)
     recursionDepth: int ## for detecting never-ending recursion
     captureStacks: seq[seq[Span]]
@@ -3270,6 +3271,12 @@ proc searchImplInto*(
   ## In-place variant of ``searchImpl``: writes into ``m``, reusing
   ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
   ## ``ctx`` must be caller-owned and single-threaded.
+  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
+  # must not survive the return: clearing them turns a stale read into a nil
+  # dereference instead of a silent read of a dead frame.
+  defer:
+    ctx.regex = nil
+    ctx.subject = Subject(data: nil, size: 0)
   let findLongest = rfFindLongest in regex.flags
   if findLongest:
     ctx.flBestLen = -1
@@ -3418,6 +3425,12 @@ proc searchBackwardImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
+  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
+  # must not survive the return: clearing them turns a stale read into a nil
+  # dereference instead of a silent read of a dead frame.
+  defer:
+    ctx.regex = nil
+    ctx.subject = Subject(data: nil, size: 0)
   writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
@@ -3529,6 +3542,12 @@ proc matchAtImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
+  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
+  # must not survive the return: clearing them turns a stale read into a nil
+  # dereference instead of a silent read of a dead frame.
+  defer:
+    ctx.regex = nil
+    ctx.subject = Subject(data: nil, size: 0)
   writeNotFound(m)
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
