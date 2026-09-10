@@ -324,6 +324,9 @@ type
       cmpRight*: string ## right variable tag
     of nkString:
       runes*: seq[Rune] ## consecutive literal runes
+      bytes*: string
+        ## ``runes`` encoded as UTF-8, for the case-sensitive compare. Built
+        ## only by ``newStringNode``, which keeps it in step with ``runes``.
 
   FirstCharKind* = enum
     fcNone ## no optimization possible

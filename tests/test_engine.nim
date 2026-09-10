@@ -3182,6 +3182,27 @@ suite "a case-sensitive literal is compared as bytes":
     check search("\xC0\xB1\xC0\xB1", re("(.)\\1")).matchSpan == 0 .. 4
     check not search("\xC3\xA9\xE0\x83\xA9", re("(.)\\1")).found
 
+  test "a run longer than the bulk-compare threshold is compared the same way":
+    # A long run goes through ``memcmp``, a short one through a byte loop.
+    let long = "abcdefghijklmnopqrst" # 20 bytes
+    check search("xx" & long & "yy", re(long)).matchSpan == 2 .. 22
+    check not search("xx" & long[0 ..^ 2] & "Zyy", re(long)).found
+    check not search("Zbcdefghijklmnopqrst", re(long)).found
+    check not search("abcdefghijklmnopqrsZ", re(long)).found
+    # A run that reaches the threshold only with its multibyte characters.
+    let wide = "日本語日本語" # 18 bytes
+    check search("x" & wide, re(wide)).matchSpan == 1 .. 19
+    # A subject of the run's own length, differing in one byte, so the
+    # comparison itself has to reject it rather than the length check.
+    check not search(wide[0 ..^ 4] & "\xE8\xAA\x9A", re(wide)).found
+    check not search("x" & wide[0 ..^ 4] & "\xE8\xAA\x9A", re(wide)).found
+
+  test "a run that runs off the end of the subject does not match":
+    check not search("abcdefghijklmnop", re("abcdefghijklmnopq")).found
+    check not search("abc", re("abcd")).found
+    # Nor off the end of a narrowed subject: (?~|...) caps where it may read.
+    check not search("abcdef", re("(?~|cd)abcdef")).found
+
   test "segmentation steps back over the same characters the matcher does":
     # The character before offset 2 is the stray ``\x80``, U+0080, a GCB
     # Control that GB4 breaks after — not the ``a`` a raw continuation-byte
