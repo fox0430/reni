@@ -673,13 +673,19 @@ proc sameFirstChar(a, b: FirstCharInfo): bool =
   of fcNone, fcAnchorStart, fcLineStart:
     true
 
-proc annotateTree(node: Node, hintFlags: RegexFlags, cache: var FirstCharCache) =
+proc annotateTree(
+    node: Node,
+    hintFlags: RegexFlags,
+    cache: var FirstCharCache,
+    levelBackrefs: var bool,
+) =
   ## Single post-parse walk over the finished AST: precomputes each character
   ## class's ASCII membership bitmap, so the matcher can answer ASCII input
   ## with one bit test instead of walking the atoms (stored before negation,
-  ## which ``matchCharClassAt`` applies to the lookup's answer), and records
+  ## which ``matchCharClassAt`` applies to the lookup's answer), records
   ## each alternative's first-byte hint so the matcher can pass over a branch
-  ## that cannot start here.
+  ## that cannot start here, and reports whether the pattern uses a
+  ## recursion-level backreference.
   ##
   ## ``hintFlags`` is not tracked down the tree the way ``extractFirstChar``
   ## tracks it across a concatenation: it carries ``rfIgnoreCase`` from the
@@ -719,10 +725,16 @@ proc annotateTree(node: Node, hintFlags: RegexFlags, cache: var FirstCharCache) 
     if classAsciiMatches(node, ascii, nonAscii, predicate):
       node.asciiSet = ascii
       node.asciiSetOk = true
+  of nkBackreference:
+    if node.backrefLevel != 0:
+      levelBackrefs = true
+  of nkNamedBackref:
+    if node.namedBackrefLevel != 0:
+      levelBackrefs = true
   else:
     discard
   for child in node.childNodes:
-    annotateTree(child, hintFlags, cache)
+    annotateTree(child, hintFlags, cache, levelBackrefs)
 
 proc hasTopLevelFindLongest(node: Node): bool =
   ## True when a scoped ``(?L:...)`` spans the whole pattern. The parser
@@ -818,7 +830,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
   var firstCharCache: FirstCharCache = nil
-  annotateTree(ast, finalFlags + {rfIgnoreCase}, firstCharCache)
+  var levelBackrefs = false
+  annotateTree(ast, finalFlags + {rfIgnoreCase}, firstCharCache, levelBackrefs)
   initRegex(
     pattern = pattern,
     ast = ast,
@@ -832,4 +845,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredByte = extractRequiredByte(ast, finalFlags),
     semiEndAnchored = semiEndAnchored(ast),
     semiEndDMax = maxByteLen(ast, finalFlags),
+    levelBackrefs = levelBackrefs,
   )
