@@ -3205,15 +3205,6 @@ proc resetForRegex(
   if capCount > ctx.captureStacks.len:
     ctx.captureStacks.setLen(capCount)
 
-proc initMatchContext(
-    subject: string, regex: Regex, stepLimit: int, maxRecursionDepth: int
-): MatchContext =
-  ## Legacy entry point: allocates a fresh ``MatchContext`` each call.
-  ## Retained so the value-returning ``searchImpl`` et al keep their
-  ## existing semantics (no shared state between calls).
-  result = newMatchContext(regex.captureCount)
-  resetForRegex(result, subject, regex, stepLimit, maxRecursionDepth)
-
 proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ## Reset per-position state without reallocating.
   ctx.pos = startPos
