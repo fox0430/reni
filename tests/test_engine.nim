@@ -3170,10 +3170,47 @@ suite "the hints and the scans agree by construction":
   # the skip could jump off the character chain unnoticed.  Generating means
   # a skip added for a new anchor is covered the day it lands.
   const Bodies = [
-    "", "1", "a", "\xC3\xA9", "\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "\\h", "\\H",
-    ".", "\\N", "\\R", "\\X", "[0-9]", "[a-z]", "[^a]", "[^0-9]", "[[:ascii:]]",
-    "[[:^ascii:]]", "[[:alpha:]]", "[[:xdigit:]]", "[a-\xC3\xBF]", "\\x{85}",
-    "[\\x{85}]", "\\p{L}", "a|1", "\\d+", "(?i)A", "(?i)[A-Z]", "(?i)ff", "..", "\\s*",
+    "",
+    "1",
+    "a",
+    "\xC3\xA9",
+    "\\d",
+    "\\D",
+    "\\w",
+    "\\W",
+    "\\s",
+    "\\S",
+    "\\h",
+    "\\H",
+    ".",
+    "\\N",
+    "\\R",
+    "\\X",
+    "[0-9]",
+    "[a-z]",
+    "[^a]",
+    "[^0-9]",
+    "[[:ascii:]]",
+    "[[:^ascii:]]",
+    "[[:alpha:]]",
+    "[[:xdigit:]]",
+    "[a-\xC3\xBF]",
+    "\\x{85}",
+    "[\\x{85}]",
+    "\\p{L}",
+    "a|1",
+    "\\d+",
+    "(?i)A",
+    "(?i)[A-Z]",
+    "(?i)ff",
+    "..",
+    "\\s*",
+    # Alternations whose branches carry *different* first-byte hints, so the
+    # branch filter is live here and a branch it wrongly passes over shows up
+    # as a disagreement with the brute-force walk (which runs a hintless AST,
+    # see ``hintless``).
+    "a|\xC3\xA9|1",
+    "\\d|\\s|[^a]",
   ]
 
   const Anchors = ["", "\\z", "\\Z", "$", "^", "\\b", "\\B", "(?m)^", "(?m)$", "\\A"]
@@ -3210,6 +3247,24 @@ suite "the hints and the scans agree by construction":
           result.add(lead & b & tail)
 
   let Patterns = generatedPatterns()
+
+  proc withoutAltHints(n: Node) =
+    ## Clear the alternation branch filter's hints in place.
+    if n == nil:
+      return
+    if n.kind == nkAlternation:
+      n.altFirst = @[]
+    for c in n.childNodes:
+      withoutAltHints(c)
+
+  proc hintless(pattern: string): Regex =
+    ## ``re`` with the branch filter's hints stripped, for the brute-force
+    ## oracles below.  An oracle that ran the same ``altFirst`` through the
+    ## same matcher could not check the filter: a hint that passes over a
+    ## branch the pattern needs would be passed over by both sides, and the
+    ## two would still agree.  These oracles must stay filter-independent.
+    result = re(pattern)
+    withoutAltHints(result.ast)
 
   proc semiEndWindowStart(subject: string, rx: Regex): int =
     ## Where ``onig_search`` begins for a ``\Z``-anchored pattern:
@@ -3321,13 +3376,14 @@ suite "the hints and the scans agree by construction":
     # that one has to be taught about each new skip, and this one does not.
     for pattern in Patterns:
       let rx = re(pattern)
+      let plain = hintless(pattern)
       for subject in wellFormedSubjects():
         var want = -1
         for p in 0 .. subject.len:
           # On well-formed input a match can only begin at a character start.
           if p < subject.len and (subject[p].uint8 and 0xC0'u8) == 0x80'u8:
             continue
-          if matchAt(subject, rx, p).found:
+          if matchAt(subject, plain, p).found:
             want = p
             break
         let got = search(subject, rx)
@@ -3342,9 +3398,10 @@ suite "the hints and the scans agree by construction":
       # so it is a superset and only checked one way below.
       if rx.literalScan:
         continue
+      let plain = hintless(pattern)
       for subject in subjects():
         let got = search(subject, rx)
-        let want = bruteForce(subject, rx)
+        let want = bruteForce(subject, plain)
         check got.found == want.found
         if got.found and want.found:
           check got.matchSpan == want.matchSpan
@@ -3354,8 +3411,9 @@ suite "the hints and the scans agree by construction":
       let rx = re(pattern)
       if not rx.literalScan:
         continue
+      let plain = hintless(pattern)
       for subject in subjects():
-        if bruteForce(subject, rx).found:
+        if bruteForce(subject, plain).found:
           check search(subject, rx).found
 
   test "searchBackward walks back the way Oniguruma steps back":
@@ -3368,9 +3426,10 @@ suite "the hints and the scans agree by construction":
       # superset and only checked one way.
       if rx.literalScan:
         continue
+      let plain = hintless(pattern)
       for subject in subjects():
         let got = searchBackward(subject, rx)
-        let want = bruteForceBackward(subject, rx)
+        let want = bruteForceBackward(subject, plain)
         check got.found == want.found
         if got.found and want.found:
           check got.matchSpan == want.matchSpan
@@ -3380,8 +3439,9 @@ suite "the hints and the scans agree by construction":
       let rx = re(pattern)
       if not rx.literalScan:
         continue
+      let plain = hintless(pattern)
       for subject in subjects():
-        if bruteForceBackward(subject, rx).found:
+        if bruteForceBackward(subject, plain).found:
           check searchBackward(subject, rx).found
 
   test "the end of the subject is a start position, however it is reached":
@@ -3452,6 +3512,7 @@ suite "the hints and the scans agree by construction":
       generatedPatterns(["", "a", ".", "\\w", "\\s*", "[^A]"], ["", "\\s*", "[^A]"])
     for pattern in linePatterns:
       let rx = re(pattern)
+      let plain = hintless(pattern)
       for b0 in Bytes:
         for b1 in Bytes:
           for b2 in Bytes:
@@ -3459,12 +3520,12 @@ suite "the hints and the scans agree by construction":
               let subject = $b0 & $b1 & $b2 & $b3
               let got = search(subject, rx)
               if not rx.literalScan:
-                let want = bruteForce(subject, rx)
+                let want = bruteForce(subject, plain)
                 check got.found == want.found
                 if got.found and want.found:
                   check got.matchSpan == want.matchSpan
               if not rx.literalScan:
-                let wantBack = bruteForceBackward(subject, rx)
+                let wantBack = bruteForceBackward(subject, plain)
                 let gotBack = searchBackward(subject, rx)
                 check gotBack.found == wantBack.found
                 if gotBack.found and wantBack.found:
@@ -3975,3 +4036,115 @@ suite "ASCII-only case folding is a restriction on both ends":
     check not search("y", re("(?I)[A-Z]")).found
     check not search("Y", re("(?I)[a-z]")).found
     check not search("k", re("(?I)[K]")).found
+
+suite "an alternation passes over branches whose first byte cannot match":
+  # Each alternative carries a first-byte hint, and the matcher skips a branch
+  # whose hint excludes the byte in front of it.  The hint is a *superset* of
+  # what the branch can start with, so a skip is only ever a branch that
+  # provably could not have matched -- the invariant the whole thing rests on.
+  # The generated differential above runs alternations with distinct hints
+  # against a brute-force walk; the cases here are the ones a generator over
+  # short subjects does not reach.
+
+  proc altHints(pattern: string): int =
+    ## How many hints the compiler stored for the pattern's first
+    ## alternation, 0 when it stored none.
+    proc find(n: Node): Node =
+      if n == nil:
+        return nil
+      if n.kind == nkAlternation:
+        return n
+      for c in n.childNodes:
+        let r = find(c)
+        if r != nil:
+          return r
+      nil
+
+    let a = find(re(pattern).ast)
+    if a == nil: 0 else: a.altFirst.len
+
+  test "a branch is only skipped when it could not have matched":
+    # Every branch is reachable through the filter at the byte that starts it.
+    let rx = re("(?:alpha|bravo|charlie|delta)")
+    check search("xx alpha", rx).matchSpan == 3 .. 8
+    check search("xx bravo", rx).matchSpan == 3 .. 8
+    check search("xx charlie", rx).matchSpan == 3 .. 10
+    check search("xx delta", rx).matchSpan == 3 .. 8
+    # Order still decides: the first branch that matches wins, not the
+    # longest or the last one the filter admitted.
+    check search("abcd", re("(?:a|ab|abc)")).matchSpan == 0 .. 1
+    check search("abcd", re("(?:abc|ab|a)")).matchSpan == 0 .. 3
+
+  test "a zero-width branch survives the end of the subject":
+    # At the end there is no byte to test.  A branch that must consume one
+    # cannot match, but an empty branch still can -- and an empty branch
+    # yields no byte hint, so the filter has to let it through.
+    check search("", re("(?:abc|)")).matchSpan == 0 .. 0
+    check search("z", re("z(?:abc|)")).matchSpan == 0 .. 1
+    check search("z", re("z(?:abc|\\b)")).matchSpan == 0 .. 1
+    check not search("z", re("z(?:abc|def)")).found
+
+  test "a branch the analysis cannot read is always tried":
+    # ``fcNone`` means "no hint", never "no match": a backreference leads a
+    # branch the filter must not touch, and a leading lookahead or bare
+    # anchor is read through to the byte that follows it.
+    check search("ab", re("(?:(?=a)ab|zz)")).matchSpan == 0 .. 2
+    check search("aa", re("(a)(?:\\1|zz)")).matchSpan == 0 .. 2
+    check search("ab", re("(?:^ab|zz)")).matchSpan == 0 .. 2
+
+  test "an (?i) switched on at match time skips nothing it should not":
+    # Hints are computed as if ``(?i)`` were on, so they stay a superset when
+    # the pattern turns it on partway through -- which no walk of the tree at
+    # compile time sees at the alternation's own position.
+    check search("abc", re("(?:(?i)ABC|zz)")).matchSpan == 0 .. 3
+    check search("ABC", re("(?:(?i)abc|zz)")).matchSpan == 0 .. 3
+    check search("ss", re("(?:(?i)\xC3\x9F|zz)")).matchSpan == 0 .. 2
+    check search("\xC3\x9F", re("(?:(?i)ss|zz)")).matchSpan == 0 .. 2
+
+  test "a malformed byte reaches the branch that admits it":
+    # A stray continuation byte is a character of its own, and the hint for a
+    # negated or non-ASCII branch has to keep every byte above 0x7F in.
+    check search("\x80", re("(?:[^a]|zz)")).matchSpan == 0 .. 1
+    check search("\x80", re("(?:\\W|zz)")).matchSpan == 0 .. 1
+    check search("\xC3\xA9", re("(?:\xC3\xA9|zz)")).matchSpan == 0 .. 2
+    check search("\xF5\x80\x80\x80", re("(?:.|zz)")).matchSpan == 0 .. 1
+
+  test "hints are stored only when they can tell branches apart":
+    # Branches that all carry the same hint can never be told apart: whatever
+    # byte is in front, either all of them survive the test or none does.
+    # Storing hints there would buy a lookup per branch per visit and nothing
+    # else, so the compiler leaves them off -- and the matcher then runs the
+    # path it ran before any of this existed.
+    check altHints("(?:foo|fob|foc)") == 0
+    check altHints("(?:a|a)") == 0
+    check altHints("(?:\\w|\\w)") == 0
+    check altHints("(?:foo|bar|baz)") == 3
+    check altHints("(?:a|\\d)") == 2
+    # A branch with no hint differs from one with a hint, so the pair is
+    # still worth filtering: the hinted branch can be skipped, and the
+    # unhinted one is still tried where only it can match.
+    check altHints("(?:a|(?=x))") == 2
+    check search("x", re("(?:a|(?=x))")).matchSpan == 0 .. 0
+    # A leading lookahead is read through, so both branches here carry a hint
+    # taken from the byte after it.
+    check altHints("(?:a|(?=x)y)") == 2
+
+  test "an alternation every branch of which is skipped fails at once":
+    check not search("zzzz", re("(?:aaa|bbb|ccc)")).found
+    check not search("zzzz", re("z(?:aaa|bbb|ccc)")).found
+    # ...and does not disturb what follows it on the way back out.
+    check search("zzzz", re("z(?:aaa|bbb|ccc)|zz")).matchSpan == 0 .. 2
+
+  test "a branch passed over under a narrow end is retried once it widens":
+    # ``(?~|b)`` narrows the subject end to the byte before ``b``, and
+    # ``(?~|)`` clears the limit for good.  At the narrow end there is no byte
+    # in front of the matcher, so the ``b`` branch cannot be admitted; when
+    # the continuation clears the end and then fails, the branch has to be
+    # there to backtrack into.  A hint decision cached from entry time -- the
+    # end it was made under is not the end backtracking sees -- loses it.
+    check search("b", re("\\A(?~|b)(?:|b)(?~|)\\z")).matchSpan == 0 .. 1
+    check search("b", re("(?~|b)(?:|b)(?~|)\\z")).matchSpan == 0 .. 1
+    # The passed-over branch need not be the one right after the first.
+    check search("b", re("(?~|b)(?:|b|b)(?~|)\\z")).matchSpan == 0 .. 1
+    # ``(?~)`` clears the limit the same way.
+    check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 0 .. 1

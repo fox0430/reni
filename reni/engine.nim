@@ -154,6 +154,7 @@ type
     ## Backtrack entry action. The first four offer an untried alternative;
     ## the rest undo an effect and keep failing.
     chAlt ## alternation: try the next branch
+    chAltHinted ## alternation carrying first-byte hints: skip dead branches
     chLeafVariant ## literal / class: try the next way it can match
     chQuantGreedy ## greedy quantifier: stop repeating, run the continuation
     chQuantLazy ## lazy quantifier: the continuation failed, repeat once more
@@ -179,7 +180,7 @@ type
     ## alternation leaves ``flags`` alone so ``(?i)`` spans branches.
     ## ``Node`` fields are cursors to avoid ref-count traffic on the hot path.
     case kind: ChoiceKind
-    of chAlt:
+    of chAlt, chAltHinted:
       aNode {.cursor.}: Node
       aIdx: int32 ## next branch to try
       aCont: ContId
@@ -1125,6 +1126,36 @@ proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inli
     classAdvance(ctx, node, variant)
   else:
     -1
+
+proc altBranchPossible(node: Node, i: int, b: uint8, hasByte: bool): bool {.inline.} =
+  ## Whether alternative ``i`` can start on the byte in front of the matcher.
+  ## ``altFirst`` is a superset of the bytes the branch can begin with, so a
+  ## miss here is a branch that provably cannot match at this position; an
+  ## alternative the analysis could not read carries ``fcNone`` and is always
+  ## tried.  ``hasByte`` is false at the end of the subject, where a branch
+  ## that must consume a byte cannot match either, but a zero-width one still
+  ## can -- and a zero-width branch never yields a byte hint.
+  case node.altFirst[i].kind
+  of fcByte:
+    hasByte and node.altFirst[i].byte == b
+  of fcByteSet:
+    hasByte and b in node.altFirst[i].bytes
+  else:
+    true
+
+proc nextAltBranch(node: Node, start: int, b: uint8, hasByte: bool): int {.inline.} =
+  ## First alternative at or after ``start`` that ``altBranchPossible``
+  ## admits, or -1.  Callers hold the next *untried* index and run this again
+  ## on every visit, so the test always sees the state at the moment it runs:
+  ## ``subjectEnd`` can change while a branch executes (``(?~|)`` clears it
+  ## with no undo), and a branch passed over while the end was narrow has to
+  ## stay reachable once it widens.
+  var i = start
+  while i < node.alternatives.len:
+    if altBranchPossible(node, i, b, hasByte):
+      return i
+    inc i
+  -1
 
 proc prevCharCode(s: openArray[char], pos: int): int32 =
   ## Code point ending just before ``pos``, or -1 at 0. Always defined for
@@ -2124,7 +2155,12 @@ proc runMachine(
       of nkAlternation:
         if node.alternatives.len == 0:
           mode = mFail
-        else:
+        elif node.altFirst.len != node.alternatives.len:
+          # No usable hints here: the untouched path, which reads no subject
+          # byte and tests nothing.  ``annotateTree`` leaves ``altFirst``
+          # empty both for an alternation it never reached and for one whose
+          # branches share a single hint, where a test could never pass over
+          # anything.
           if node.alternatives.len > 1:
             # Save pos, captures, keepStart — but NOT flags.
             # Isolated flag groups (?i) extend across alternation branches.
@@ -2140,6 +2176,36 @@ proc runMachine(
             )
           node = node.alternatives[0]
           mode = mMatch
+        else:
+          let hasByte = ctx.pos < ctx.subjectEnd
+          let b =
+            if hasByte:
+              ctx.subject[ctx.pos].uint8
+            else:
+              0'u8
+          let first = nextAltBranch(node, 0, b, hasByte)
+          if first < 0:
+            # Every branch was passed over, so the alternation cannot match
+            # here at all -- the whole point of carrying the hints.
+            mode = mFail
+          else:
+            if first + 1 < node.alternatives.len:
+              # The stored index is the next *untried* branch, not the next
+              # one the hints admitted for this state.  The filter is re-run
+              # on every backtrack, so a branch it passes over here is not
+              # passed over for good.
+              ctx.pushChoice Choice(
+                kind: chAltHinted,
+                aNode: node,
+                aIdx: int32(first + 1),
+                aCont: cont,
+                aFramesLen: ctx.framesLen.int32,
+                aCapOff: pushCaptures(ctx),
+                aPos: ctx.pos,
+                aKeepStart: ctx.keepStart,
+              )
+            node = node.alternatives[first]
+            mode = mMatch
       of nkGroup:
         # Groups save/restore flags — isolated flag groups inside don't leak out
         ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
@@ -2778,6 +2844,46 @@ proc runMachine(
         else:
           ctx.choices[top].aIdx = int32(idx + 1)
         mode = mMatch
+      of chAltHinted:
+        # As ``chAlt``, but a branch is only tried when the hints admit it
+        # for the state at hand.  ``aIdx`` is the next raw alternative index
+        # left untried, so the filter runs again on every backtrack and its
+        # verdict is never cached past a ``subjectEnd`` change: ``(?~|)``
+        # widens the end with no undo, and a branch passed over under the
+        # narrow end can still match under the wide one.  Telling the two
+        # kinds apart is what keeps an unhinted alternation at exactly its
+        # old cost -- the case dispatch already had to happen.
+        ctx.pos = ctx.choices[top].aPos
+        ctx.keepStart = ctx.choices[top].aKeepStart
+        copyCaptures(
+          ctx.captures[0], ctx.capSaves[int(ctx.choices[top].aCapOff)], ctx.captures.len
+        )
+        ctx.framesLen = ctx.choices[top].aFramesLen
+        cont = ctx.choices[top].aCont
+        let altNode = ctx.choices[top].aNode
+        # ``pos`` was just restored to the alternation's own position, so the
+        # byte the hints read is the one in front of the matcher here.
+        let hasByte = ctx.pos < ctx.subjectEnd
+        let b =
+          if hasByte:
+            ctx.subject[ctx.pos].uint8
+          else:
+            0'u8
+        let nxt = nextAltBranch(altNode, int(ctx.choices[top].aIdx), b, hasByte)
+        if nxt < 0:
+          # No untried branch can start here: drop the choice and keep
+          # failing, as ``chAlt`` does when its index runs out.
+          ctx.capSaves.setLen(ctx.choices[top].aCapOff)
+          ctx.choicesLen = top
+          mode = mFail
+        else:
+          if nxt + 1 >= altNode.alternatives.len:
+            ctx.capSaves.setLen(ctx.choices[top].aCapOff)
+            ctx.choicesLen = top
+          else:
+            ctx.choices[top].aIdx = int32(nxt + 1)
+          node = altNode.alternatives[nxt]
+          mode = mMatch
       of chLeafVariant:
         ctx.pos = ctx.choices[top].lPos
         ctx.framesLen = ctx.choices[top].lFramesLen
