@@ -695,9 +695,31 @@ proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
     p = sn
   p
 
-proc stringAdvance(ctx: MatchContext, runes: seq[Rune]): int =
-  ## End offset of ``runes`` matched at ``ctx.pos``, or -1. Single parse, no
-  ## variants. Leaves ``ctx.pos`` alone.
+const BulkCompareLen = 16
+  ## Byte length from which a run goes through ``memcmp``; below it the call
+  ## costs more than the compares it saves.
+
+proc stringAdvance(ctx: MatchContext, node: Node): int =
+  ## End offset of ``node``'s run of literals matched at ``ctx.pos``, or -1.
+  ## Single parse, no variants. Leaves ``ctx.pos`` alone.
+  if rfIgnoreCase notin ctx.flags:
+    # Every character has one encoding here, so comparing the run's bytes is
+    # the same test as comparing it character by character.
+    let n = node.bytes.len
+    if n == 0:
+      return -1
+    if ctx.pos + n > ctx.subjectEnd:
+      return -1
+    if n >= BulkCompareLen:
+      if not equalMem(addr ctx.subject.data[ctx.pos], unsafeAddr node.bytes[0], n):
+        return -1
+    else:
+      for i in 0 ..< n:
+        if ctx.subject[ctx.pos + i] != node.bytes[i]:
+          return -1
+    return ctx.pos + n
+
+  let runes {.cursor.} = node.runes
   var p = ctx.pos
   var i = 0
   while i < runes.len:
@@ -705,14 +727,6 @@ proc stringAdvance(ctx: MatchContext, runes: seq[Rune]): int =
       return -1
     let target = runes[i]
     let posBeforeSubjChar = p
-    if rfIgnoreCase notin ctx.flags:
-      # Case-sensitive: the whole string is compared as bytes.
-      let e = matchBytes(ctx, target, p)
-      if e < 0:
-        return -1
-      p = e
-      inc i
-      continue
     var code: int32
     var next: int
     if not decodeChar(ctx, p, code, next):
@@ -724,6 +738,7 @@ proc stringAdvance(ctx: MatchContext, runes: seq[Rune]): int =
     if classifiable and (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
       inc i
       continue
+
     # Try forward multi-char fold: pattern char folds to multiple subject chars (e.g., ß → ss)
     if rfIgnoreCaseAscii notin ctx.flags or int32(target) <= 127:
       let fold = getMultiCharFold(target)
@@ -744,6 +759,7 @@ proc stringAdvance(ctx: MatchContext, runes: seq[Rune]): int =
         if matched:
           inc i
           continue
+
     # Try reverse multi-char fold: subject char folds to consecutive pattern chars
     # e.g., subject "ß" matches pattern "ss" because ß full-folds to ss
     if rfIgnoreCaseAscii notin ctx.flags:
@@ -2149,7 +2165,7 @@ proc runMachine(
           ctx.pos = e
           mode = mCont
       of nkString:
-        let e = stringAdvance(ctx, node.runes)
+        let e = stringAdvance(ctx, node)
         if e < 0:
           mode = mFail
         else:
@@ -3118,7 +3134,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
       var e = -1
       case node.kind
       of nkString:
-        e = stringAdvance(ctx, node.runes)
+        e = stringAdvance(ctx, node)
       of nkCharType:
         e = charTypeAdvance(ctx, node.charType)
       else:
