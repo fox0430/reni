@@ -538,14 +538,18 @@ proc flattenLiteralGroups(node: Node) =
     discard
 
 proc newStringNode(runes: seq[Rune]): Node =
-  ## An ``nkString`` over ``runes``, with their UTF-8 encoding precomputed.
+  ## An ``nkString`` over ``runes``, with their UTF-8 encoding and its ASCII
+  ## fold precomputed.
   var size = 0
   for r in runes:
     size += r.size
   var bytes = newStringOfCap(size)
   for r in runes:
     bytes.add $r
-  Node(kind: nkString, runes: runes, bytes: bytes)
+  var folded = newString(bytes.len)
+  for i in 0 ..< bytes.len:
+    folded[i] = char(asciiFoldByte(uint8(bytes[i])))
+  Node(kind: nkString, runes: runes, bytes: bytes, foldedBytes: folded)
 
 proc mergeLiterals(node: Node): Node =
   ## Merge consecutive nkLiteral/nkEscapedLiteral children in nkConcat into nkString.

@@ -3055,6 +3055,18 @@ suite "the reverse fold reads a run of literals, groups and all":
     # A backreference still counts the captures it always did.
     check search("abab", re("(?:x)?(ab)\\1")).matchSpan == 0 .. 4
 
+  test "a fold reached part way into an ASCII run":
+    # An ASCII run compares as bytes, so the wider character has to pull it
+    # back onto the character walk wherever it falls.  Checked against
+    # Oniguruma 6.9.10.
+    check search("ma\xC3\x9F", re("(?i)mass")).matchSpan == 0 .. 4
+    check search("ma\xC3\x9Fx", re("(?i)mass")).matchSpan == 0 .. 4
+    check search("a\xC3\x9Fx", re("(?i)assx")).matchSpan == 0 .. 4
+    check search("as\xE2\x84\xAA", re("(?i)ask")).matchSpan == 0 .. 5
+    check search("a\xC5\xBFs", re("(?i)ass")).matchSpan == 0 .. 4
+    check search("x\xEF\xAC\x83", re("(?i)xffi")).matchSpan == 0 .. 4
+    check not search("ma\xC3\x9F", re("(?i)mast")).found
+
 suite "extractFirstChar does not look past a consuming ^ subtree":
   # A subtree such as (^a*) reports fcLineStart yet can consume input, so the
   # following child's byte is not the pattern's first byte.  Using it as a

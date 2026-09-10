@@ -327,6 +327,10 @@ type
       bytes*: string
         ## ``runes`` encoded as UTF-8, for the case-sensitive compare. Built
         ## only by ``newStringNode``, which keeps it in step with ``runes``.
+      foldedBytes*: string
+        ## ``bytes`` under ``asciiFoldByte``, for the ignore-case compare of an
+        ## ASCII run. Built alongside ``bytes`` so the compare loop tests a
+        ## folded subject byte against a constant.
 
   FirstCharKind* = enum
     fcNone ## no optimization possible
@@ -760,6 +764,13 @@ iterator childNodes*(node: Node): Node =
       yield node.absentExpr
   else:
     discard
+
+func asciiFoldByte*(b: uint8): uint8 {.inline.} =
+  ## ASCII letters folded to lower case, every other byte unchanged.
+  if b >= uint8('A') and b <= uint8('Z'):
+    b + 32
+  else:
+    b
 
 proc asciiFoldBytes(b: uint8): set[uint8] =
   ## Return {lower, upper} for ASCII letters, {b} otherwise.

@@ -725,6 +725,22 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
     return ctx.pos + n
 
   let runes {.cursor.} = node.runes
+  if node.bytes.len == runes.len and ctx.pos + runes.len <= ctx.subjectEnd:
+    # One byte per character: the run is pure ASCII, and no multi-character
+    # fold starts from ASCII, so while the subject stays ASCII the two line up
+    # byte for character.  A high byte can still match through a fold (ſ for
+    # s), so it hands the run back to the general loop instead of rejecting.
+    var k = 0
+    while k < runes.len:
+      let sb = uint8(ctx.subject[ctx.pos + k])
+      if sb >= 0x80'u8:
+        break
+      if asciiFoldByte(sb) != uint8(node.foldedBytes[k]):
+        return -1
+      inc k
+    if k == runes.len:
+      return ctx.pos + runes.len
+
   var p = ctx.pos
   var i = 0
   while i < runes.len:
@@ -3383,16 +3399,22 @@ proc searchImplInto*(
         if not found:
           exhausted = true
       of fcByteSet:
+        # One load per byte: the lead byte decides both whether the position is
+        # a candidate and how far the next one is.
         var found = false
         while startPos < subject.len:
-          if subject[startPos].uint8 in fc.bytes:
+          let b = subject[startPos].uint8
+          if b in fc.bytes:
             found = true
             break
-          startPos =
-            if byteScan:
-              startPos + 1
+          let step =
+            if byteScan or b < 0x80'u8:
+              1
             else:
-              nextScanPos(subject, startPos)
+              encLen(b)
+          startPos += step
+        if startPos > subject.len:
+          startPos = subject.len
         if not found:
           exhausted = true
       of fcNone:
