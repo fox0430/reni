@@ -2028,6 +2028,85 @@ suite "firstCharInfo optimization":
     check r.firstCharInfo.kind == fcByte
     check r.firstCharInfo.byte == uint8('1')
 
+suite "leadRun scan skip":
+  # A broken disqualifier silently drops matches, so each is pinned twice:
+  # the ``leadRun`` verdict and, where a wrong skip drops a match, the match.
+  proc skips(pattern: string, flags: RegexFlags = {}): bool =
+    re(pattern, flags).leadRun != nil
+
+  proc all(subject, pattern: string, flags: RegexFlags = {}): seq[string] =
+    for m in findAll(subject, re(pattern, flags)):
+      result.add captureText(m, 0, subject).get("")
+
+  test "the plain shape skips the leading run":
+    check skips("\\w+=")
+    # Attempt at 0 ends its run at 3, so the scan resumes at 3.
+    check all("aaa bbb=", "\\w+=") == @["bbb="]
+
+  test "zero-width wrappers are peeled":
+    check skips("(\\w*)=")
+    check skips("(?:\\w*)=")
+    check skips("(?<n>\\w*)=")
+    check all("aaa bbb=", "(\\w*)=") == @["bbb="]
+    check all("aaa bbb=", "(?:\\w*)=") == @["bbb="]
+    check all("aaa bbb=", "(?<n>\\w*)=") == @["bbb="]
+
+  test "a bounded maximum is refused":
+    # Bounded: on "AAAAA=" the match starts at 1, inside the skipped run.
+    check not skips("A{0,4}=")
+    check all("AAAAA=", "A{0,4}=") == @["AAAA="]
+
+  test "only a greedy repeat qualifies":
+    check not skips("\\w*?=")
+    check not skips("\\w*+=")
+
+  test "a fixed leaf may lead only while it is a subset of the body":
+    check skips("[A-Za-z_][A-Za-z0-9_]*=")
+    check all("ab cd=", "[A-Za-z_][A-Za-z0-9_]*=") == @["cd="]
+    # Leaves accept digits the body rejects, so on "ab0cd=" the match starts at 1.
+    check not skips("[A-Za-z0-9_][A-Za-z0-9_][a-z]*=")
+    check all("ab0cd=", "[A-Za-z0-9_][A-Za-z0-9_][a-z]*=") == @["b0cd="]
+
+  test "case folding disqualifies a leading leaf":
+    # Folding adds members the atoms never named, so the subset test is void.
+    check not skips("[a-z][a-z]*=", {rfIgnoreCase})
+    check not skips("(?i)[a-z][a-z]*=")
+    # Bare repeat needs no byte set, so it still qualifies.
+    check skips("[a-z]*=", {rfIgnoreCase})
+
+  test "a variable-width body is refused":
+    check not skips("\\R*=")
+    check not skips("\\X*=")
+
+  test "state carried across an attempt disqualifies the skip":
+    check not skips("(\\w+)\\s*\\1") # backreference
+    check not skips("(\\w+)(?(1)a|b)") # conditional
+    check not skips("(\\w+)\\g<1>") # subexpression call
+    check not skips("\\w+(?~x)") # absent operator
+    check not skips("\\w+(*MAX{2})") # counted callout
+    check not skips("\\G\\w+=") # \G anchor
+    check all("aa aa", "(\\w+)\\s*\\1") == @["aa aa"]
+
+  test "findLongest disqualifies the skip":
+    # findLongest fails every start on purpose, so no skip applies.
+    check not skips("\\w*=", {rfFindLongest})
+    check not skips("(?L)\\w+=")
+    check not skips("(?L:\\w+=)")
+
+  test "a predicate atom in a leaf is refused":
+    # Even ASCII-staying ``[\h]`` is refused: its table reports lead bytes
+    # (a superset), which cannot prove exactness.
+    check not skips("[\\h][0-9a-fA-F]*=")
+    check not skips("[\\h][\\h]*=")
+    check not skips("[a-f][\\h]*=")
+    check all("ab 0f=", "[\\h][0-9a-fA-F]*=") == @["0f="]
+    # Bare repeat needs no byte set, so a predicate body still qualifies.
+    check skips("[\\h]*=")
+
+  test "\\K only moves a successful attempt's start":
+    check skips("\\w+\\K=")
+    check all("aaa bbb=", "\\w+\\K=") == @["="]
+
 suite "UTF-8 validation":
   test "overlong 2-byte encoding (0xC0 0x80)":
     expect RegexError:

@@ -158,6 +158,11 @@ type
     scratchQuiet: int ## Consecutive small searches within the keep marks.
     flBestLen: int ## findLongest: best match length so far (-1 if none)
     flBestMatch: Match ## findLongest: deepest match recorded
+    leadRun {.cursor.}: Node
+      ## Cached ``Regex.leadRun``; cursor since the tree outlives the search.
+    leadRunEnd: int
+      ## End of ``leadRun``'s run at this start, or -1 if never reached.
+      ## Valid only after a failed attempt.
 
   ScalarState = object
     ## Rollback snapshot without captures; for bodies that write none.
@@ -2336,6 +2341,9 @@ proc runMachine(
                 break # zero-width: a single-way leaf cannot vary, so stop
               ctx.pushRepPos ctx.pos
               inc count
+            if ctx.leadRunEnd < 0 and node == ctx.leadRun:
+              # First visit to the leading repeat: record its run end.
+              ctx.leadRunEnd = ctx.pos
             if count < int32(qmin):
               restoreScalars(ctx, scalars)
               ctx.repLen = posOff
@@ -3234,6 +3242,7 @@ proc resetForRegex(
   ctx.flags = regex[].flags
   ctx.regex = regex
   ctx.trackCaptureStacks = regex[].levelBackrefs
+  ctx.leadRun = regex[].leadRun
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
@@ -3262,6 +3271,7 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.flags = ctx.regex[].flags
   ctx.searchStart = searchStart
   ctx.keepStart = startPos
+  ctx.leadRunEnd = -1
   ctx.subjectEnd = ctx.subject.len
   ctx.recursionDepth = 0
   ctx.callDepth = 0
@@ -3311,12 +3321,13 @@ proc searchImplInto*(
   ## In-place variant of ``searchImpl``: writes into ``m``, reusing
   ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
   ## ``ctx`` must be caller-owned and single-threaded.
-  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
-  # must not survive the return: clearing them turns a stale read into a nil
-  # dereference instead of a silent read of a dead frame.
+  # Borrowed refs must not survive the return; clearing turns stale reads
+  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
+  # against recycled allocations.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
+    ctx.leadRun = nil
   let findLongest = rfFindLongest in regex.flags
   if findLongest:
     ctx.flBestLen = -1
@@ -3426,11 +3437,17 @@ proc searchImplInto*(
     # sequence — so ``nextScanPos`` skips only what the decoder really covers.
     if startPos >= subject.len:
       break
-    startPos =
-      if byteScan:
-        startPos + 1
-      else:
-        nextScanPos(subject, startPos)
+    if not byteScan and ctx.leadRunEnd > startPos + 1:
+      # Failed attempt already refuted the continuation at every position the
+      # skipped starts would retry, so jump to the run end. Byte scan
+      # excluded: it may land mid-character.
+      startPos = ctx.leadRunEnd
+    else:
+      startPos =
+        if byteScan:
+          startPos + 1
+        else:
+          nextScanPos(subject, startPos)
 
   if findLongest and ctx.flBestMatch.found:
     # ctx.flBestMatch lives on the reusable context.  Copy its
@@ -3465,12 +3482,13 @@ proc searchBackwardImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
-  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
-  # must not survive the return: clearing them turns a stale read into a nil
-  # dereference instead of a silent read of a dead frame.
+  # Borrowed refs must not survive the return; clearing turns stale reads
+  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
+  # against recycled allocations.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
+    ctx.leadRun = nil
   writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
@@ -3582,12 +3600,13 @@ proc matchAtImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
-  # ``ctx.subject`` and ``ctx.regex`` borrow this call's parameters, so they
-  # must not survive the return: clearing them turns a stale read into a nil
-  # dereference instead of a silent read of a dead frame.
+  # Borrowed refs must not survive the return; clearing turns stale reads
+  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
+  # against recycled allocations.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
+    ctx.leadRun = nil
   writeNotFound(m)
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
