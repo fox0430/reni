@@ -89,7 +89,15 @@ type
     captures: seq[Span]
     searchStart: int
     keepStart: int
-    regex: Regex
+    regex: ptr Regex
+      ## Borrowed for one matcher entry point, exactly like ``subject``:
+      ## holding the value would make ``resetForRegex`` deep-copy the pattern
+      ## string and the group tables, which a findAll loop pays per search,
+      ## not per pattern.  Each entry point passes the address of its own
+      ## ``regex`` parameter, whose frame outlives every read below.  Only
+      ## matching code may read it, and only past ``resetForRegex``: an entry
+      ## point's quick-reject return runs before the reset and has to read
+      ## the parameter directly.
     subjectEnd: int ## effective end of subject (for absent expression limiting)
     recursionDepth: int ## for detecting never-ending recursion
     captureStacks: seq[seq[Span]]
@@ -1704,7 +1712,7 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
     return false
   of ckNamedRef:
     # Check ALL capture groups with matching name
-    for (name, i) in ctx.regex.namedCaptures:
+    for (name, i) in ctx.regex[].namedCaptures:
       if name == node.condRefName:
         let capIdx = i + 1
         if capIdx < ctx.captures.len and ctx.captures[capIdx].a >= 0:
@@ -1757,7 +1765,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
   of nkNamedBackref:
     # Loop answers these itself.
     var anyFound = false
-    for (name, i) in ctx.regex.namedCaptures:
+    for (name, i) in ctx.regex[].namedCaptures:
       if name == node.backrefName:
         anyFound = true
         let idx = i + 1 # captures are 1-indexed in boundaries
@@ -1776,17 +1784,17 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
     var captureIdx = -1 # 0-based index for matchCapture
     if node.callIndex == 0:
       # \g<0> = entire pattern recursion
-      body = ctx.regex.ast
+      body = ctx.regex[].ast
     elif node.callIndex > 0:
       let idx = node.callIndex - 1 # 0-based in groupBodies
-      if idx < ctx.regex.groupBodies.len:
-        body = ctx.regex.groupBodies[idx]
+      if idx < ctx.regex[].groupBodies.len:
+        body = ctx.regex[].groupBodies[idx]
       captureIdx = idx
     elif node.callName.len > 0:
-      for (name, i) in ctx.regex.namedCaptures:
+      for (name, i) in ctx.regex[].namedCaptures:
         if name == node.callName:
-          if i < ctx.regex.groupBodies.len:
-            body = ctx.regex.groupBodies[i]
+          if i < ctx.regex[].groupBodies.len:
+            body = ctx.regex[].groupBodies[i]
           captureIdx = i
           break
     if body == nil:
@@ -1802,8 +1810,8 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
       inc ctx.groupRecursionDepth[captureIdx]
     # Apply the flags that were active when the group was defined
     let savedFlags = ctx.flags
-    if captureIdx >= 0 and captureIdx < ctx.regex.groupFlags.len:
-      ctx.flags = ctx.regex.groupFlags[captureIdx]
+    if captureIdx >= 0 and captureIdx < ctx.regex[].groupFlags.len:
+      ctx.flags = ctx.regex[].groupFlags[captureIdx]
     var ok: bool
     if captureIdx >= 0 and captureIdx + 1 < ctx.captures.len:
       ok = matchCapture(ctx, captureIdx, body, cont)
@@ -2597,7 +2605,7 @@ proc runMachine(
       of nkNamedBackref:
         # First same-named group that matches wins.
         var e = -1
-        for (name, i) in ctx.regex.namedCaptures:
+        for (name, i) in ctx.regex[].namedCaptures:
           if name == node.backrefName:
             e = backrefEnd(ctx, i + 1, node.namedBackrefLevel)
             if e >= 0:
@@ -2616,17 +2624,17 @@ proc runMachine(
         var body: Node = nil
         var captureIdx = -1
         if node.callIndex == 0:
-          body = ctx.regex.ast
+          body = ctx.regex[].ast
         elif node.callIndex > 0:
           let idx = node.callIndex - 1
-          if idx < ctx.regex.groupBodies.len:
-            body = ctx.regex.groupBodies[idx]
+          if idx < ctx.regex[].groupBodies.len:
+            body = ctx.regex[].groupBodies[idx]
           captureIdx = idx
         elif node.callName.len > 0:
-          for (name, i) in ctx.regex.namedCaptures:
+          for (name, i) in ctx.regex[].namedCaptures:
             if name == node.callName:
-              if i < ctx.regex.groupBodies.len:
-                body = ctx.regex.groupBodies[i]
+              if i < ctx.regex[].groupBodies.len:
+                body = ctx.regex[].groupBodies[i]
               captureIdx = i
               break
         if body == nil:
@@ -2635,8 +2643,8 @@ proc runMachine(
           mode = mFail # too deep recursion — treat as no match
         else:
           let savedFlags = ctx.flags
-          if captureIdx >= 0 and captureIdx < ctx.regex.groupFlags.len:
-            ctx.flags = ctx.regex.groupFlags[captureIdx]
+          if captureIdx >= 0 and captureIdx < ctx.regex[].groupFlags.len:
+            ctx.flags = ctx.regex[].groupFlags[captureIdx]
           inc ctx.recursionDepth
           if captureIdx >= 0:
             if captureIdx >= ctx.groupRecursionDepth.len:
@@ -3175,13 +3183,15 @@ proc noteScratchUsage(ctx: MatchContext) =
 proc resetForRegex(
     ctx: MatchContext,
     subject: string,
-    regex: Regex,
+    regex: ptr Regex,
     stepLimit: int,
     maxRecursionDepth: int,
 ) =
   ## Reset per-regex buffers, reusing ``ctx``'s existing seq capacity.
+  ## ``regex`` is borrowed, so every caller passes the address of its own
+  ## parameter, never of a local that dies before the match runs.
   ctx.subject = toSubject(subject)
-  ctx.flags = regex.flags
+  ctx.flags = regex[].flags
   ctx.regex = regex
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
@@ -3195,7 +3205,7 @@ proc resetForRegex(
   ctx.choicesLen = 0
   ctx.stackBase = currentStackAddr()
   noteScratchUsage(ctx)
-  let capCount = regex.captureCount
+  let capCount = regex[].captureCount
   # ``captures`` is sized exactly (it is copied into ``Match.boundaries``).
   # The internal buffers only grow, so their capacity survives a switch to
   # a regex with fewer captures; ``resetForPosition`` clears stale state.
@@ -3208,7 +3218,7 @@ proc resetForRegex(
 proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ## Reset per-position state without reallocating.
   ctx.pos = startPos
-  ctx.flags = ctx.regex.flags
+  ctx.flags = ctx.regex[].flags
   ctx.searchStart = searchStart
   ctx.keepStart = startPos
   ctx.subjectEnd = ctx.subject.len
@@ -3274,7 +3284,7 @@ proc searchImplInto*(
   if rb.valid and indexOfByte(subject, start, rb.byte) < 0:
     noteScratchUsage(ctx)
     return
-  resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
+  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   # A case-sensitive literal prefix is looked for as raw bytes, the way
   # Oniguruma's exact-string optimization does, so every byte offset is a
@@ -3417,7 +3427,7 @@ proc searchBackwardImplInto*(
   if rb.valid and indexOfByte(subject, 0, rb.byte) < 0:
     noteScratchUsage(ctx)
     return
-  resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
+  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   let fc = regex.firstCharInfo
   var startPos =
     if start >= 0:
@@ -3520,7 +3530,7 @@ proc matchAtImplInto*(
 ) =
   ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
   writeNotFound(m)
-  resetForRegex(ctx, subject, regex, stepLimit, maxRecursionDepth)
+  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
   if matchNode(ctx, regex.ast):
     ctx.captures[0] = span(pos, ctx.pos)
