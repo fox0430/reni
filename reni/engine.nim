@@ -2065,9 +2065,9 @@ proc runMachine(
   let stackLensBase = ctx.stackLensSaves.len
 
   var mode = startMode
-  var node = startNode
+  var node {.cursor.} = startNode
   var cont = startCont
-  var seqNode: Node = nil
+  var seqNode {.cursor.}: Node = nil
   var seqIdx = 0
 
   template releaseToBase(): untyped =
