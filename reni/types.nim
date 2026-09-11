@@ -623,6 +623,9 @@ type
     levelBackrefs: bool
       ## The pattern uses a recursion-level backreference, so the matcher has
       ## to maintain the per-group capture history.
+    leadRun: Node
+      ## Leading greedy unbounded repeat over a one-way leaf, or nil. A failed
+      ## run rules out starts inside it, so the scan jumps to its end.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -682,6 +685,10 @@ proc levelBackrefs*(r: Regex): bool {.inline.} =
   ## capture history, which costs a write on every capture.
   r.levelBackrefs
 
+proc leadRun*(r: Regex): Node {.inline.} =
+  ## Leading repeat whose run a failed attempt may skip, or nil.
+  r.leadRun
+
 proc initRegex*(
     pattern: string,
     ast: Node,
@@ -696,6 +703,7 @@ proc initRegex*(
     semiEndAnchored: bool = false,
     semiEndDMax: int = -1,
     levelBackrefs: bool = true,
+    leadRun: Node = nil,
 ): Regex =
   Regex(
     pattern: pattern,
@@ -711,6 +719,7 @@ proc initRegex*(
     semiEndAnchored: semiEndAnchored,
     semiEndDMax: semiEndDMax,
     levelBackrefs: levelBackrefs,
+    leadRun: leadRun,
   )
 
 proc span*(a, b: int): Span {.inline.} =

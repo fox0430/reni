@@ -750,6 +750,104 @@ proc annotateTree(
   for child in node.childNodes:
     annotateTree(child, hintFlags, cache, levelBackrefs)
 
+proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
+  ## Exact ASCII byte set a leaf accepts, or false when it is not one ASCII
+  ## byte. Refuses negated classes, non-ASCII members, and predicates:
+  ## ``charTypeBytes`` reports start bytes (a superset), so it cannot prove
+  ## exactness. Callers must have ruled out case folding first.
+  case node.kind
+  of nkLiteral, nkEscapedLiteral:
+    let cp = int32(if node.kind == nkLiteral: node.rune else: node.escapedRune)
+    if cp >= 128:
+      return false
+    s = {uint8(cp)}
+    true
+  of nkCharClass:
+    if node.negated:
+      return false
+    var ascii: set[uint8]
+    var nonAscii, predicate: bool
+    if not classAsciiMatches(node, ascii, nonAscii, predicate):
+      return false
+    if nonAscii or predicate:
+      return false
+    s = ascii
+    true
+  else:
+    false
+
+proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
+  ## Unbounded greedy repeat over a one-way leaf every match must start
+  ## inside, or nil. Peels only zero-width wrappers (groups, captures).
+  ## Must be unbounded: a bounded repeat reaches further from the next start.
+  ## Fixed-width prefix leaves are allowed only as a subset of the repeat
+  ## body, so skipped starts share the same run end.
+  if node == nil:
+    return nil
+  case node.kind
+  of nkConcat:
+    if node.children.len == 0:
+      return nil
+    let head = leadSimpleRepeat(node.children[0], flags)
+    if head != nil:
+      return head
+    # Case folding widens ASCII leaves; an inline ``(?i)`` needs no test
+    # since the parser wraps it in a flag group, which is no leaf.
+    if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+      return nil
+    var prefix: set[uint8]
+    for child in node.children:
+      var leaf: set[uint8]
+      if exactAsciiLeaf(child, leaf):
+        prefix = prefix + leaf
+        continue
+      let q = leadSimpleRepeat(child, flags)
+      var body: set[uint8]
+      if q == nil or not exactAsciiLeaf(q.quantBody, body) or not (prefix <= body):
+        return nil
+      return q
+    nil
+  of nkCapture:
+    leadSimpleRepeat(node.captureBody, flags)
+  of nkNamedCapture:
+    leadSimpleRepeat(node.namedCaptureBody, flags)
+  of nkGroup:
+    leadSimpleRepeat(node.groupBody, flags)
+  of nkQuantifier:
+    let body = node.quantBody
+    if node.quantKind != qkGreedy or node.quantMax >= 0 or body == nil:
+      return nil
+    case body.kind
+    of nkLiteral, nkEscapedLiteral, nkCharClass:
+      node
+    of nkCharType:
+      # ``\R`` and ``\X`` have variable-length runs, so neighbouring starts diverge.
+      if body.charType in {ctNewlineSeq, ctGraphemeCluster}: nil else: node
+    else:
+      nil
+  else:
+    nil
+
+proc leadRunSkipSafe(node: Node): bool =
+  ## Whether starts inside the leading run may be skipped. Holds only while
+  ## the continuation verdict depends on position alone, not on captures,
+  ## recursion state, or per-attempt side effects.
+  if node == nil:
+    return true
+  case node.kind
+  of nkBackreference, nkNamedBackref, nkConditional, nkSubexpCall, nkAbsent,
+      nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    return false
+  of nkAnchor:
+    if node.anchor == akSearchBegin:
+      return false
+  else:
+    discard
+  for child in node.childNodes:
+    if not leadRunSkipSafe(child):
+      return false
+  true
+
 proc hasTopLevelFindLongest(node: Node): bool =
   ## True when a scoped ``(?L:...)`` spans the whole pattern. The parser
   ## restores ``p.flags`` on scoped-group exit, so ``p.currentFlags`` only
@@ -860,4 +958,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     semiEndAnchored = semiEndAnchored(ast),
     semiEndDMax = maxByteLen(ast, finalFlags),
     levelBackrefs = levelBackrefs,
+    leadRun =
+      if rfFindLongest in finalFlags:
+        # findLongest fails every start on purpose, so no skip applies.
+        nil
+      else:
+        let q = leadSimpleRepeat(ast, finalFlags)
+        if q != nil and leadRunSkipSafe(ast): q else: nil,
   )
