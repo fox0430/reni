@@ -23,7 +23,7 @@ This project aims to implement a tmLanguage parser.
 
 ## Requirements
 
-- Nim >= 2.0.0
+- Nim >= 2.0.2
 
 ## Usage
 
