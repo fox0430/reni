@@ -130,6 +130,14 @@ type
       ## true when at least one ``captureStacks[i]`` is non-empty, letting
       ## ``resetForPosition`` skip the per-group ``setLen(0)`` loop in the
       ## common case.
+    capturesDirty: bool
+      ## true when ``captures`` may hold something other than ``UnsetSpan``,
+      ## letting ``resetForPosition`` skip the clearing loop.  Set wherever a
+      ## capture span is written; a copy back from ``capSaves`` needs none,
+      ## since what was pushed there went through one of those sites.
+    groupDepthDirty: bool
+      ## true when some ``groupRecursionDepth[i]`` may be non-zero. Only
+      ## subexpression recursion ever increments one.
     frames: seq[Frame]
       ## Frame buffer; live length is ``framesLen``. Never shrinks, so push/pop
       ## avoids destructors. Stale entries own nothing (``Node`` is a cursor).
@@ -1391,6 +1399,7 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
   let endPos = ctx.pos
   let savedCap = ctx.captures[capIdx]
   ctx.captures[capIdx] = span(startPos, endPos)
+  ctx.capturesDirty = true
   var savedStackEntry = UnsetSpan
   let trackStacks = ctx.trackCaptureStacks and myDepth >= 0
   if trackStacks:
@@ -1859,6 +1868,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
       if captureIdx >= ctx.groupRecursionDepth.len:
         ctx.groupRecursionDepth.setLen(captureIdx + 1)
       inc ctx.groupRecursionDepth[captureIdx]
+      ctx.groupDepthDirty = true
     # Apply the flags that were active when the group was defined
     let savedFlags = ctx.flags
     if captureIdx >= 0 and captureIdx < ctx.regex[].groupFlags.len:
@@ -2704,6 +2714,7 @@ proc runMachine(
             if captureIdx >= ctx.groupRecursionDepth.len:
               ctx.groupRecursionDepth.setLen(captureIdx + 1)
             inc ctx.groupRecursionDepth[captureIdx]
+            ctx.groupDepthDirty = true
           ctx.pushChoice Choice(
             kind: chSubexpScope, ssCapIdx: int32(captureIdx), ssFlags: savedFlags
           )
@@ -2792,6 +2803,7 @@ proc runMachine(
         let parent = ctx.frames[cont].parent
         let savedCap = ctx.captures[capIdx]
         ctx.captures[capIdx] = span(startPos, ctx.pos)
+        ctx.capturesDirty = true
         var savedStackEntry = UnsetSpan
         # ``-1`` is the established "no history entry" marker, so recording it
         # in the choice point is what makes ``chUndoCapture`` skip the restore
@@ -3208,6 +3220,8 @@ proc newMatchContext*(maxCapCount: int = 0): MatchContext =
   result.stepLimit = int.high
   if maxCapCount > 0:
     result.captures = newSeq[Span](maxCapCount + 1)
+    # ``newSeq`` zero-fills, and ``Span(0, 0)`` is not ``UnsetSpan``.
+    result.capturesDirty = true
     result.groupRecursionDepth = newSeq[int](maxCapCount)
     result.captureStacks = newSeq[seq[Span]](maxCapCount)
 
@@ -3276,6 +3290,8 @@ proc resetForRegex(
   # The internal buffers only grow, so their capacity survives a switch to
   # a regex with fewer captures; ``resetForPosition`` clears stale state.
   ctx.captures.setLen(capCount + 1)
+  # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
+  ctx.capturesDirty = true
   if capCount > ctx.groupRecursionDepth.len:
     ctx.groupRecursionDepth.setLen(capCount)
   if capCount > ctx.captureStacks.len:
@@ -3294,16 +3310,25 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.chainDepth = 0
   ctx.choicesLen = 0
   ctx.stackBase = currentStackAddr()
-  # ``setLen(0)`` is a single length store; guarding it would cost more.
   ctx.framesLen = 0
-  ctx.captureSnapshots.setLen(0)
-  ctx.capSaves.setLen(0)
-  ctx.stackLensSaves.setLen(0)
   ctx.repLen = 0
-  for i in 0 ..< ctx.captures.len:
-    ctx.captures[i] = UnsetSpan
-  for i in 0 ..< ctx.groupRecursionDepth.len:
-    ctx.groupRecursionDepth[i] = 0
+  # Almost every attempt fails having touched none of these, so each clear is
+  # guarded: ``setLen`` is an out-of-line call that walks destructors for
+  # ``stackLensSaves``, and the loops are waste when nothing was written.
+  if ctx.captureSnapshots.len > 0:
+    ctx.captureSnapshots.setLen(0)
+  if ctx.capSaves.len > 0:
+    ctx.capSaves.setLen(0)
+  if ctx.stackLensSaves.len > 0:
+    ctx.stackLensSaves.setLen(0)
+  if ctx.capturesDirty:
+    for i in 0 ..< ctx.captures.len:
+      ctx.captures[i] = UnsetSpan
+    ctx.capturesDirty = false
+  if ctx.groupDepthDirty:
+    for i in 0 ..< ctx.groupRecursionDepth.len:
+      ctx.groupRecursionDepth[i] = 0
+    ctx.groupDepthDirty = false
   if ctx.captureStacksDirty:
     for i in 0 ..< ctx.captureStacks.len:
       ctx.captureStacks[i].setLen(0)
@@ -3446,6 +3471,7 @@ proc searchImplInto*(
       ctx.framesLen = fid
     else:
       if matchNode(ctx, regex.ast):
+        ctx.capturesDirty = true
         ctx.captures[0] = span(startPos, ctx.pos)
         if ctx.keepStart != startPos:
           ctx.captures[0].a = ctx.keepStart
@@ -3577,6 +3603,7 @@ proc searchBackwardImplInto*(
     resetForPosition(ctx, startPos, subject.len)
 
     if matchNode(ctx, regex.ast):
+      ctx.capturesDirty = true
       ctx.captures[0] = span(startPos, ctx.pos)
       if ctx.keepStart != startPos:
         ctx.captures[0].a = ctx.keepStart
@@ -3633,6 +3660,7 @@ proc matchAtImplInto*(
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
   if matchNode(ctx, regex.ast):
+    ctx.capturesDirty = true
     ctx.captures[0] = span(pos, ctx.pos)
     if ctx.keepStart != pos:
       ctx.captures[0].a = ctx.keepStart
