@@ -3,8 +3,9 @@
 ## passing, giving correct backtracking through alternations,
 ## quantifiers, and flag groups without per-call closure allocations.
 
-import std/[unicode, tables]
+import std/[unicode, tables, macros]
 from std/strutils import find
+from std/typetraits import supportsCopyMem
 
 import types, unicode_utils, stackguard
 
@@ -472,13 +473,97 @@ template checkCont(ctx: MatchContext, id: ContId) =
   ## Bounds check for the explicit-length ``frames`` buffer. Dropped under danger.
   assert id < ctx.framesLen, "continuation outlives its frame"
 
+macro requireBitwiseCopyable(t: typedesc): untyped =
+  ## Assert at compile time that every field of ``t`` survives a bitwise copy:
+  ## either its type owns nothing, or the field is a ``{.cursor.}`` borrow that
+  ## is never released.  Walks the variant, so branch fields are covered too,
+  ## and the base objects, so an inherited field cannot slip past unchecked.
+  result = newStmtList()
+  let
+    checks = result
+    tname = t.getTypeInst[1].strVal
+  proc walk(n: NimNode) =
+    case n.kind
+    of nnkRecList, nnkRecCase, nnkRecWhen:
+      for c in n:
+        walk(c)
+    of nnkOfBranch, nnkElifBranch, nnkElse:
+      walk(n[^1])
+    of nnkIdentDefs:
+      # ``a, b: T`` declares every name but the last two nodes, which are the
+      # type and the default value.
+      let typ = parseExpr(n[^2].repr)
+      for i in 0 ..< n.len - 2:
+        var
+          name = n[i]
+          cursor = false
+        if name.kind == nnkPragmaExpr:
+          for p in name[1]:
+            if p.eqIdent("cursor"):
+              cursor = true
+          name = name[0]
+        if name.kind == nnkPostfix:
+          # ``payload*: T`` -- the export marker wraps the identifier, and
+          # ``name.strVal`` would abort the macro instead of checking the field.
+          name = name[1]
+        if not cursor:
+          checks.add nnkStaticStmt.newTree(
+            newCall(
+              # ``doAssert``, not ``assert``: ``--assertions:off`` (implied by
+              # ``-d:danger``, a build mode the benchmarks use) erases the
+              # latter even inside ``static``, dropping the guard exactly where
+              # the ``copyMem`` below would turn into silent corruption.
+              bindSym"doAssert",
+              newCall(bindSym"supportsCopyMem", typ.copyNimTree),
+              newLit(tname & "." & name.strVal & " is not bitwise-copyable"),
+            )
+          )
+    else:
+      discard
+
+  proc walkObject(sym: NimNode) =
+    ## Walk one object's own fields, then its base's.  Reaching for the
+    ## typedef's ``RecList`` directly would silently skip everything inherited,
+    ## and an owning inherited field would then pass the guard.
+    # ``getImpl``, not ``getTypeImpl``: only the declaration keeps the field
+    # pragmas, and without them every ``{.cursor.}`` borrow reads as owning.
+    let impl = sym.getImpl
+    if impl.kind != nnkTypeDef or impl[2].kind != nnkObjectTy:
+      error(tname & " is not a plain object: the bitwise-copy guard does not " &
+            "know how to walk it", sym)
+    walk(impl[2][2])
+    if impl[2][1].kind == nnkOfInherit:
+      walkObject(impl[2][1][0])
+
+  walkObject(t.getTypeInst[1])
+
+# The precondition for ``pushFrame``'s ``copyMem`` store below.  An owning
+# field added to the variant -- the ``seq[Span]`` ``ckCapturesChanged``
+# deliberately keeps out, say -- would otherwise compile silently and then
+# leak the overwritten slot and double-free the pushed temporary.
+requireBitwiseCopyable(Frame)
+
 proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
   ## Push a frame and return its index.  The pusher must pop it
   ## (``ctx.framesLen = fid``) before returning to its caller.
+  ##
+  ## ``sink`` keeps the parameter callee-owned: an lvalue argument -- say
+  ## ``pushFrame(ctx, ctx.frames[i])`` -- is materialised into a temporary, so
+  ## the growth below cannot reallocate the buffer out from under the
+  ## ``copyMem`` source.  The temporary costs nothing to discard for the same
+  ## reason the store below is a plain move.
+  ##
+  ## Stored with ``copyMem``: assignment would call the ``=sink`` Nim gives
+  ## every variant object, which first zeroes the destination's old branch and
+  ## then copies the new one in field by field.  The zeroing is dead work on a
+  ## popped slot holding nothing that needs releasing, and the second switch
+  ## collapses to a single ``sizeof(Frame)`` move -- ``Node`` fields are
+  ## cursors and the rest is plain values, so ``Frame``'s ``=destroy`` is
+  ## empty and ``requireBitwiseCopyable`` above keeps it that way.
   if ctx.framesLen >= ctx.frames.len:
     ctx.frames.setLen(max(16, ctx.frames.len * 2))
   result = ctx.framesLen.int32
-  ctx.frames[ctx.framesLen] = frame
+  copyMem(addr ctx.frames[ctx.framesLen], addr frame, sizeof(Frame))
   inc ctx.framesLen
 
 template copyCaptures(dst, src, n: untyped) =
