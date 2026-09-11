@@ -1211,6 +1211,36 @@ proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inli
   else:
     -1
 
+proc isLeafLookbehindBody(node: Node): bool {.inline.} =
+  ## Whether a lookbehind body is a single leaf, and so answerable in place by
+  ## [leafBodyEndsAt].  Only the kinds [lengthBounds] gives a fixed width are
+  ## listed, since a fixed width is what every caller gates on.
+  node != nil and node.kind in {nkString, nkLiteral, nkEscapedLiteral}
+
+proc leafBodyEndsAt(ctx: MatchContext, body: Node, targetEnd: int, fbl: int): bool =
+  ## Whether leaf ``body`` matches the ``fbl`` bytes ending at ``targetEnd``.
+  ##
+  ## The general path's frame, matcher re-entry and save/restore roll back
+  ## what a leaf never writes: ``ctx.pos`` is all of it, restored here.  The
+  ## caller must have checked [isLeafLookbehindBody].
+  let st = targetEnd - fbl
+  if st < 0:
+    return false
+  inc ctx.steps
+  if ctx.steps > ctx.stepLimit:
+    raise newException(RegexLimitError, "match step limit exceeded")
+  let entryPos = ctx.pos
+  ctx.pos = st
+  # Only the first way need be tried: a literal's second is the
+  # multi-character fold, and one that has it carries no fixed width.
+  let matched =
+    if body.kind == nkString:
+      stringAdvance(ctx, body) == targetEnd
+    else:
+      leafVariantAdvance(ctx, body, 0) == targetEnd
+  ctx.pos = entryPos
+  matched
+
 proc altBranchPossible(node: Node, i: int, b: uint8, hasByte: bool): bool {.inline.} =
   ## Whether alternative ``i`` can start on the byte in front of the matcher.
   ## ``altFirst`` is a superset of the bytes the branch can begin with, so a
@@ -1436,6 +1466,8 @@ proc lookbehindBodyMatches(
 ): bool =
   ## Whether ``body`` matches ending at ``targetEnd`` from ``fbl`` bytes
   ## before it. Restores ``ctx`` either way.
+  if isLeafLookbehindBody(body):
+    return leafBodyEndsAt(ctx, body, targetEnd, fbl)
   let st = targetEnd - fbl
   if st < 0:
     return false
@@ -1507,18 +1539,8 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
       let altLen = ctx.altBounds(node, i, alt)
       let altFbl = altLen.fixedLen
       if altFbl >= 0:
-        let st = targetEnd - altFbl
-        if st >= 0:
-          let stackSnap = saveStackLens(ctx)
-          let saved = save(ctx)
-          ctx.pos = st
-          let fid = pushFrame(ctx, endCheckFrame(targetEnd))
-          let matched = matchWithCont(ctx, alt, fid)
-          ctx.framesLen = fid
-          restore(ctx, saved)
-          restoreStackLens(ctx, stackSnap)
-          if matched:
-            return false
+        if lookbehindBodyMatches(ctx, alt, targetEnd, altFbl):
+          return false
       else:
         let altMbl = altLen.maxLen
         let altMinPos =
@@ -2517,6 +2539,10 @@ proc runMachine(
               mode = mFail
           elif fbl < 0:
             mode = if lookbehindVarHolds(ctx, node, bodyLen): mCont else: mFail
+          elif isLeafLookbehindBody(node.lookBody):
+            # Leaf body: tested in place, without a frame or a re-entry.
+            mode =
+              if leafBodyEndsAt(ctx, node.lookBody, ctx.pos, fbl): mCont else: mFail
           elif ctx.pos - fbl < 0:
             mode = mFail
           else:
