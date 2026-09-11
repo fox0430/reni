@@ -1,6 +1,6 @@
 import std/[tables, sets, unicode]
 
-import types, parser
+import types, unicode_utils, parser
 
 proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
   ## When named captures exist, convert unnamed nkCapture to nkGroup
@@ -696,7 +696,7 @@ proc annotateTree(
   ## Single post-parse walk over the finished AST: precomputes each character
   ## class's ASCII membership bitmap, so the matcher can answer ASCII input
   ## with one bit test instead of walking the atoms (stored before negation,
-  ## which ``matchCharClassAt`` applies to the lookup's answer), records
+  ## which ``classAdvance`` applies to the lookup's answer), records
   ## each alternative's first-byte hint so the matcher can pass over a branch
   ## that cannot start here, and reports whether the pattern uses a
   ## recursion-level backreference.
@@ -734,10 +734,21 @@ proc annotateTree(
     if discriminates:
       node.altFirst = hints
   of nkCharClass:
+    # The shape reader first; [exactAsciiClassSet] only for what it gives up
+    # on -- a ``\p{...}``, a nested class, an intersection.  Asking every atom
+    # about every ASCII byte costs microseconds per pattern (``re()`` on
+    # ``[a-z&&[^aeiou]]+`` goes 0.4 -> 4.0 us, -d:danger), which is worth it
+    # against a decode at every position of every attempt, but only where it
+    # buys something.
     var ascii: set[uint8]
     var nonAscii, predicate: bool
-    if classAsciiMatches(node, ascii, nonAscii, predicate):
-      node.asciiSet = ascii
+    if classAsciiMatches(node, ascii, nonAscii, predicate) or
+        exactAsciiClassSet(node.atoms, ascii):
+      # Masked, so the field means the same whichever producer filled it:
+      # [classAsciiMatches] fills 0x80..0xFF for a range written across the
+      # ASCII boundary (what [classFirstChar] wants), [exactAsciiClassSet]
+      # never does, and no reader of ``asciiSet`` looks above 0x7F.
+      node.asciiSet = ascii * AllAsciiBytes
       node.asciiSetOk = true
   of nkBackreference:
     if node.backrefLevel != 0:

@@ -640,17 +640,6 @@ proc unwindAbsentFrames(ctx: MatchContext, base: int) =
     if ctx.frames[ctx.framesLen].kind == ckRestoreSubjectEnd:
       ctx.subjectEnd = ctx.frames[ctx.framesLen].reSavedEnd
 
-proc caseInsensitiveMatch(r, target: Rune, flags: RegexFlags): bool =
-  ## Case-insensitive comparison respecting rfIgnoreCaseAscii flag.
-  if rfIgnoreCase notin flags:
-    return r == target
-  if rfIgnoreCaseAscii in flags:
-    # ASCII-only: only fold if both are ASCII
-    if int32(r) <= 127 and int32(target) <= 127:
-      return simpleFold(r) == simpleFold(target)
-    return r == target
-  simpleFold(r) == simpleFold(target)
-
 proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
   ## Compare the encoding of ``target`` against the subject at ``p``.
   ## Returns the position just past it, or -1 on mismatch.  Oniguruma holds a
@@ -962,110 +951,6 @@ proc tryCaptureChangingMatch(ctx: MatchContext, body: Node): bool {.inline.} =
   ctx.framesLen = fid
   ctx.captureSnapshots.setLen(snapStart)
 
-proc matchCcAtom(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
-  case atom.kind
-  of ccLiteral:
-    r == atom.rune or caseInsensitiveMatch(r, atom.rune, flags)
-  of ccRange:
-    let lo = int32(atom.rangeFrom)
-    let hi = int32(atom.rangeTo)
-    let ri = int32(r)
-    if ri >= lo and ri <= hi:
-      true
-    elif rfIgnoreCase in flags:
-      if rfIgnoreCaseAscii in flags:
-        # ASCII-only: the subject and the variant it folds to must both be
-        # ASCII, so ``k`` never reaches U+212A and U+212A never reaches ``k``.
-        #
-        # Walk the variants rather than folding once.  A range is not a value
-        # that can be folded alongside the subject the way [caseInsensitiveMatch]
-        # folds both sides of a literal, and ``simpleFold`` maps toward one
-        # case only -- testing it against the range's own endpoints answers
-        # only for a range written in that case, so ``[a-z]`` would match ``Y``
-        # while ``[A-Z]`` missed ``y``.
-        if ri <= 127:
-          for variant in caseFoldVariants(r):
-            let vi = int32(variant)
-            if vi <= 127 and vi >= lo and vi <= hi:
-              return true
-          false
-        else:
-          false
-      else:
-        # Check if any case variant of r falls in the original range
-        for variant in caseFoldVariants(r):
-          if int32(variant) >= lo and int32(variant) <= hi:
-            return true
-        false
-    else:
-      false
-  of ccCharType:
-    case atom.charType
-    of ctWord:
-      # Inside [...] Oniguruma uses the raw CR_Word ranges: no Latin-1 extras.
-      isWordChar(r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false)
-    of ctNotWord:
-      not isWordChar(
-        r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false
-      )
-    of ctDigit:
-      isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
-    of ctNotDigit:
-      not isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
-    of ctSpace:
-      isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
-    of ctNotSpace:
-      not isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
-    of ctHexDigit:
-      isHexDigitChar(r)
-    of ctNotHexDigit:
-      not isHexDigitChar(r)
-    of ctDot, ctAnyChar:
-      true
-    of ctNotNewline:
-      r != Rune(0x0A)
-    of ctNewlineSeq:
-      let c = int32(r)
-      c == 0x0A or c == 0x0D or c == 0x0B or c == 0x0C or c == 0x85 or c == 0x2028 or
-        c == 0x2029
-    of ctGraphemeCluster:
-      true # \X in character classes: any character
-  of ccPosix:
-    matchPosixClass(r, atom.posixClass, posixAsciiOnly(atom.posixClass, flags))
-  of ccNegPosix:
-    not matchPosixClass(r, atom.posixClass, posixAsciiOnly(atom.posixClass, flags))
-  of ccUnicodeProp:
-    matchUnicodeProp(r, atom.prop, flags)
-  of ccNegUnicodeProp:
-    not matchUnicodeProp(r, atom.prop, flags)
-  of ccNestedClass:
-    var anyMatch = false
-    for nested in atom.nestedAtoms:
-      if matchCcAtom(r, nested, flags):
-        anyMatch = true
-        break
-    if atom.nestedNegated:
-      not anyMatch
-    else:
-      anyMatch
-  of ccIntersection:
-    # Character must match BOTH left and right sides
-    var leftMatch = false
-    for a in atom.interLeft:
-      if matchCcAtom(r, a, flags):
-        leftMatch = true
-        break
-    if atom.interLeftNeg:
-      leftMatch = not leftMatch
-    var rightMatch = false
-    for a in atom.interRight:
-      if matchCcAtom(r, a, flags):
-        rightMatch = true
-        break
-    if atom.interRightNeg:
-      rightMatch = not rightMatch
-    leftMatch and rightMatch
-
 proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
   ## Match a character class atom, checking case-fold variants for
   ## POSIX, char type, and Unicode property atoms when case-insensitive.
@@ -1092,13 +977,20 @@ proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
       discard
   false
 
+proc classBitmapAnswers*(node: Node, b: uint8, flags: RegexFlags): bool {.inline.} =
+  ## Whether ``node``'s precomputed ASCII bitmap settles byte ``b`` on its own.
+  ## The one place this gate is written; every reader of ``asciiSet`` must ask
+  ## here instead of restating it.  Below 0x80 the byte is a one-byte character
+  ## that decodes to itself, and the bitmap is built without case folding, so
+  ## ``rfIgnoreCase`` sends the matcher back to the atoms.
+  b < 0x80 and node.asciiSetOk and rfIgnoreCase notin flags
+
 proc classHasByte(node: Node, b: uint8, flags: RegexFlags): bool =
   ## Whether one-byte char ``b`` is in the class byte set. Below U+0080 the
   ## member test answers; above only ranges crossing the ASCII boundary reach.
+  ## No bitmap read here: the only caller is [classAdvance], past its fast
+  ## path, so a byte the bitmap settles never arrives.
   if b < 0x80:
-    if node.asciiSetOk and rfIgnoreCase notin flags:
-      # Precomputed bitmap: exact below U+0080 as long as nothing folds.
-      return b in node.asciiSet
     let r = Rune(int32(b))
     for atom in node.atoms:
       if node.bracketClass and matchCcAtomWithFold(r, atom, flags):
@@ -1128,6 +1020,20 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
   let start = ctx.pos
   if start >= ctx.subjectEnd:
     return -1
+
+  # ASCII fast path: one bit test on an exact bitmap, the same answer
+  # [classHasByte] gives but without the decode, negation applied here.  The
+  # gate rules out ``rfIgnoreCase``, so no fold variant exists and the variant
+  # arm below is answered with -1 rather than run.
+  let lead = ctx.subject[start].uint8
+  if classBitmapAnswers(node, lead, ctx.flags):
+    if variant < MultiCharFolds.len:
+      return -1
+    return
+      if (lead in node.asciiSet) != node.negated:
+        start + 1
+      else:
+        -1
 
   if variant < MultiCharFolds.len:
     # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss".

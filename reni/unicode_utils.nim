@@ -2233,3 +2233,189 @@ proc nextWordSegmentEnd*(subject: openArray[char], pos: int): int =
       break
     nextCharAt(subject, p, r)
   return p
+
+proc caseInsensitiveMatch*(r, target: Rune, flags: RegexFlags): bool =
+  ## Case-insensitive comparison respecting rfIgnoreCaseAscii flag.
+  if rfIgnoreCase notin flags:
+    return r == target
+  if rfIgnoreCaseAscii in flags:
+    # ASCII-only: only fold if both are ASCII
+    if int32(r) <= 127 and int32(target) <= 127:
+      return simpleFold(r) == simpleFold(target)
+    return r == target
+  simpleFold(r) == simpleFold(target)
+
+proc matchCcAtom*(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
+  case atom.kind
+  of ccLiteral:
+    r == atom.rune or caseInsensitiveMatch(r, atom.rune, flags)
+  of ccRange:
+    let lo = int32(atom.rangeFrom)
+    let hi = int32(atom.rangeTo)
+    let ri = int32(r)
+    if ri >= lo and ri <= hi:
+      true
+    elif rfIgnoreCase in flags:
+      if rfIgnoreCaseAscii in flags:
+        # ASCII-only: the subject and the variant it folds to must both be
+        # ASCII, so ``k`` never reaches U+212A and U+212A never reaches ``k``.
+        #
+        # Walk the variants rather than folding once.  A range is not a value
+        # that can be folded alongside the subject the way [caseInsensitiveMatch]
+        # folds both sides of a literal, and ``simpleFold`` maps toward one
+        # case only -- testing it against the range's own endpoints answers
+        # only for a range written in that case, so ``[a-z]`` would match ``Y``
+        # while ``[A-Z]`` missed ``y``.
+        if ri <= 127:
+          for variant in caseFoldVariants(r):
+            let vi = int32(variant)
+            if vi <= 127 and vi >= lo and vi <= hi:
+              return true
+          false
+        else:
+          false
+      else:
+        # Check if any case variant of r falls in the original range
+        for variant in caseFoldVariants(r):
+          if int32(variant) >= lo and int32(variant) <= hi:
+            return true
+        false
+    else:
+      false
+  of ccCharType:
+    case atom.charType
+    of ctWord:
+      # Inside [...] Oniguruma uses the raw CR_Word ranges: no Latin-1 extras.
+      isWordChar(r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false)
+    of ctNotWord:
+      not isWordChar(
+        r, rfAsciiWord in flags or rfAsciiPosix in flags, latin1Digits = false
+      )
+    of ctDigit:
+      isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
+    of ctNotDigit:
+      not isDigitChar(r, rfAsciiDigit in flags or rfAsciiPosix in flags)
+    of ctSpace:
+      isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
+    of ctNotSpace:
+      not isSpaceChar(r, rfAsciiSpace in flags or rfAsciiPosix in flags)
+    of ctHexDigit:
+      isHexDigitChar(r)
+    of ctNotHexDigit:
+      not isHexDigitChar(r)
+    of ctDot, ctAnyChar:
+      true
+    of ctNotNewline:
+      r != Rune(0x0A)
+    of ctNewlineSeq:
+      let c = int32(r)
+      c == 0x0A or c == 0x0D or c == 0x0B or c == 0x0C or c == 0x85 or c == 0x2028 or
+        c == 0x2029
+    of ctGraphemeCluster:
+      true # \X in character classes: any character
+  of ccPosix:
+    matchPosixClass(r, atom.posixClass, posixAsciiOnly(atom.posixClass, flags))
+  of ccNegPosix:
+    not matchPosixClass(r, atom.posixClass, posixAsciiOnly(atom.posixClass, flags))
+  of ccUnicodeProp:
+    matchUnicodeProp(r, atom.prop, flags)
+  of ccNegUnicodeProp:
+    not matchUnicodeProp(r, atom.prop, flags)
+  of ccNestedClass:
+    var anyMatch = false
+    for nested in atom.nestedAtoms:
+      if matchCcAtom(r, nested, flags):
+        anyMatch = true
+        break
+    if atom.nestedNegated:
+      not anyMatch
+    else:
+      anyMatch
+  of ccIntersection:
+    # Character must match BOTH left and right sides
+    var leftMatch = false
+    for a in atom.interLeft:
+      if matchCcAtom(r, a, flags):
+        leftMatch = true
+        break
+    if atom.interLeftNeg:
+      leftMatch = not leftMatch
+    var rightMatch = false
+    for a in atom.interRight:
+      if matchCcAtom(r, a, flags):
+        rightMatch = true
+        break
+    if atom.interRightNeg:
+      rightMatch = not rightMatch
+    leftMatch and rightMatch
+
+const AsciiRestrictFlags = {rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix}
+  ## The flags a class atom can read below U+0080.  Each only ever turns some
+  ## test's ``asciiOnly`` argument on (``posixAsciiOnly`` and
+  ## ``asciiRestricted`` are disjunctions over this set), so all four set and
+  ## none set are the two extremes: an atom that answers the same at both ends
+  ## answers the same for every combination in between.  ``rfIgnoreCase`` is
+  ## out of reach here, since the matcher gates the bitset on its absence.
+
+proc atomAsciiFlagInvariant(atom: CcAtom): bool =
+  ## Whether ``atom`` reads every ASCII code point the same however the
+  ## ASCII-restriction flags are set.
+  ##
+  ## Only a ``\p{...}`` can answer no.  Every other atom settles its ASCII
+  ## answer before the flags are consulted: ``ccLiteral`` and ``ccRange`` never
+  ## read one, and ``matchPosixClass`` / ``isWordChar`` / ``isDigitChar`` /
+  ## ``isSpaceChar`` return from their ASCII tables above ``asciiOnly``.  A
+  ## restriction does not narrow a property, it swaps it for ``restrictCls``,
+  ## and nothing makes those two agree below U+0080.
+  ##
+  ## Today they do agree, so this probe rejects no atom and no test exercises
+  ## a rejection; it is here for the pairing that stops agreeing (a table
+  ## regenerated against a newer Unicode, or a ``restrictCls`` pointed at a
+  ## ctype that differs in the ASCII range).  Composites are checked child by
+  ## child: checking only the whole could miss two children that cancel at
+  ## both ends and disagree in between.
+  case atom.kind
+  of ccNestedClass:
+    for nested in atom.nestedAtoms:
+      if not atomAsciiFlagInvariant(nested):
+        return false
+    true
+  of ccIntersection:
+    for a in atom.interLeft:
+      if not atomAsciiFlagInvariant(a):
+        return false
+    for a in atom.interRight:
+      if not atomAsciiFlagInvariant(a):
+        return false
+    true
+  of ccUnicodeProp, ccNegUnicodeProp:
+    if atom.prop.restrict == uarNone:
+      return true
+    for cp in 0'i32 .. 127'i32:
+      let r = Rune(cp)
+      if matchCcAtom(r, atom, {}) != matchCcAtom(r, atom, AsciiRestrictFlags):
+        return false
+    true
+  else:
+    true
+
+proc exactAsciiClassSet*(atoms: seq[CcAtom], s: var set[uint8]): bool =
+  ## The ASCII bytes ``atoms`` match, *before* negation, or false when that
+  ## set is not exact.  Each byte is asked of the atoms themselves rather than
+  ## derived from their shape, so a ``\p{...}``, a nested class and an
+  ## intersection answer here too -- which the shape-reading
+  ## [classAsciiMatches] cannot do, hence this fallback.  A class an
+  ## ASCII-restriction flag can move gives up instead: those flags are
+  ## switched on inside the pattern, and no compile-time set stands for both
+  ## readings.
+  for atom in atoms:
+    if not atomAsciiFlagInvariant(atom):
+      return false
+  s = {}
+  for cp in 0'i32 .. 127'i32:
+    let r = Rune(cp)
+    for atom in atoms:
+      if matchCcAtom(r, atom, {}):
+        s.incl(uint8(cp))
+        break
+  true
