@@ -529,8 +529,11 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
     # pragmas, and without them every ``{.cursor.}`` borrow reads as owning.
     let impl = sym.getImpl
     if impl.kind != nnkTypeDef or impl[2].kind != nnkObjectTy:
-      error(tname & " is not a plain object: the bitwise-copy guard does not " &
-            "know how to walk it", sym)
+      error(
+        tname & " is not a plain object: the bitwise-copy guard does not " &
+          "know how to walk it",
+        sym,
+      )
     walk(impl[2][2])
     if impl[2][1].kind == nnkOfInherit:
       walkObject(impl[2][1][0])
