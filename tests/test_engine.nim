@@ -2107,6 +2107,55 @@ suite "leadRun scan skip":
     check skips("\\w+\\K=")
     check all("aaa bbb=", "\\w+\\K=") == @["="]
 
+  test "a mandatory repeat is looked through to its body's run":
+    # ``(?:\w+\s+){3,}`` leads with ``\w+`` exactly as ``\w+\s+...`` does,
+    # so the skip reaches the leading run through the outer repeat.
+    check skips("(?:\\w+\\s+){3,}")
+    check skips("(?:\\w+\\s+){3}") # the outer bound does not matter
+    check skips("(?:\\w+\\s+){3,}?") # nor does a lazy outer
+    check all("aa bb cc dd ", "(?:\\w+\\s+){3,}") == @["aa bb cc dd "]
+    # Attempt at 0 gives back to 1 and 2, so starts inside "aaa" are refuted.
+    check all("aaa bb=cc dd ee ", "(?:\\w+\\s+){3,}") == @["cc dd ee "]
+    check all("aaa bb=cc dd ee ", "(?:\\w+\\s+){3}") == @["cc dd ee "]
+
+  test "an optional repeat is not looked through":
+    # ``{0,}`` need not run at all, so its body does not have to match at the
+    # start: on "ab=" the match starts at 2, inside the run a skip would jump.
+    check not skips("(?:\\w+\\s*){0,}=")
+    check all("ab=", "(?:\\w+\\s*){0,}=") == @["ab="]
+    check not skips("(?:\\w+\\s+)*=")
+
+  test "an inverted-bound outer repeat is not looked through":
+    # ``{n,m}`` with ``n > m`` is normalised by swapping the bounds, so
+    # ``{1,0}`` need not run at all -- the same case as ``{0,1}``.
+    check not skips("(?:\\w+\\s+){1,0}b=")
+    check all("ab=", "(?:\\w+\\s+){1,0}b=") == @["b="]
+    check all("ab=", "(?:\\w+\\s+){0,1}b=") == @["b="]
+    # ``{3,1}`` turns possessive at match time, which is excluded by design.
+    check not skips("(?:\\w+\\s+){3,1}=")
+
+  test "a possessive outer repeat is not looked through":
+    # Its body match is atomic, which the skip argument does not cover.
+    check not skips("(?:\\w+\\s+)++=")
+    # An atomic group is refused for the same reason, one level up.
+    check not skips("(?>\\w+\\s+)+=")
+
+  test "the body's own disqualifiers still apply through the outer repeat":
+    check not skips("(?:\\w+?\\s+){2,}") # lazy inner repeat
+    check not skips("(?:\\w{1,4}\\s+){2,}") # bounded inner repeat
+    check not skips("(?:\\X+\\s+){2,}") # variable-width inner body
+    check not skips("(?:(?=\\w)\\w+\\s+){2,}") # leading zero-width assertion
+    check not skips("(?:(\\w+)\\s+){2,}\\1") # backreference
+
+  test "a fixed leaf may lead at every nesting level":
+    # The subset test runs once per level: ``a`` against the body of
+    # ``[ab]+`` at the outer concat, ``b`` against the same body inside.
+    check skips("a(?:b[ab]+c){2,}")
+    check all("xabbcbabc", "a(?:b[ab]+c){2,}") == @["abbcbabc"]
+    # The outer leaf accepts what the body rejects, so its starts differ.
+    check not skips("c(?:b[ab]+c){2,}")
+    check all("xcbbcbabc", "c(?:b[ab]+c){2,}") == @["cbbcbabc"]
+
 suite "UTF-8 validation":
   test "overlong 2-byte encoding (0xC0 0x80)":
     expect RegexError:

@@ -778,8 +778,10 @@ proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
 
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
   ## Unbounded greedy repeat over a one-way leaf every match must start
-  ## inside, or nil. Peels only zero-width wrappers (groups, captures).
-  ## Must be unbounded: a bounded repeat reaches further from the next start.
+  ## inside, or nil. The run must be unbounded: a bounded one reaches further
+  ## from the next start. Zero-width wrappers are peeled, as is a repeat with
+  ## ``min >= 1``, greedy/lazy, and non-inverted bounds, whose body must match
+  ## at the start -- ``(?:\w+\s+){3,}`` leads with ``\w+``.
   ## Fixed-width prefix leaves are allowed only as a subset of the repeat
   ## body, so skipped starts share the same run end.
   if node == nil:
@@ -815,16 +817,27 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
     leadSimpleRepeat(node.groupBody, flags)
   of nkQuantifier:
     let body = node.quantBody
-    if node.quantKind != qkGreedy or node.quantMax >= 0 or body == nil:
+    if body == nil:
       return nil
-    case body.kind
-    of nkLiteral, nkEscapedLiteral, nkCharClass:
-      node
-    of nkCharType:
-      # ``\R`` and ``\X`` have variable-length runs, so neighbouring starts diverge.
-      if body.charType in {ctNewlineSeq, ctGraphemeCluster}: nil else: node
-    else:
-      nil
+    if node.quantKind == qkGreedy and node.quantMax < 0:
+      case body.kind
+      of nkLiteral, nkEscapedLiteral, nkCharClass:
+        return node
+      of nkCharType:
+        # ``\R`` and ``\X`` have variable-width runs.
+        if body.charType notin {ctNewlineSeq, ctGraphemeCluster}:
+          return node
+        return nil
+      else:
+        discard
+    # Mandatory repeat: its body must match at the start, so look through to
+    # the body's run. Possessive is atomic, and inverted ``{n,m}`` is
+    # normalised to possessive, so both are left out.
+    if node.quantMax >= 0 and node.quantMin > node.quantMax:
+      return nil
+    if node.quantMin >= 1 and node.quantKind in {qkGreedy, qkLazy}:
+      return leadSimpleRepeat(body, flags)
+    nil
   else:
     nil
 
