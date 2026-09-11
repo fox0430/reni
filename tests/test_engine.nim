@@ -2,6 +2,7 @@ import std/[unittest, strutils, options, unicode]
 
 import ../reni
 import ../reni/engine
+import ../reni/unicode_utils
 
 suite "Step 1: Literal matching":
   test "empty pattern matches empty string":
@@ -4038,22 +4039,24 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
     check search("áb", re("\\X*b")).found
 
 suite "the ASCII class bitset and the atom walk agree by construction":
-  # ``classHasByte`` answers a one-byte class member test from a bitset the
+  # ``classAdvance`` answers a one-byte class member test from a bitset the
   # compiler precomputed, instead of walking the class's atoms.  The bitset is
-  # sound only because of one claim, made by [classAsciiMatches]: below U+0080
-  # every atom reads the same whatever the ASCII-restriction flags say, so the
-  # set is *exact* there and a negated class may complement it.  That claim is
-  # the whole safety argument, and it is the kind that decays quietly -- an
-  # atom kind added to ``classAsciiMatches`` later that does read a flag below
-  # U+0080 breaks it with every existing test still green.
+  # sound only because of one claim, made by [exactAsciiClassSet]: below
+  # U+0080 every atom reads the same whatever the ASCII-restriction flags say,
+  # so the set is *exact* there and a negated class may complement it.  That
+  # claim is the whole safety argument, and it is the kind that decays quietly
+  # -- an atom kind that does read a flag below U+0080 breaks it with every
+  # existing test still green.
   #
-  # So the invariant is checked against the walk the bitset replaced, using a
-  # property of ``classAsciiMatches`` itself: it gives up on a nested class,
-  # leaving ``asciiSetOk`` false.  ``[[C]]`` therefore matches exactly what
-  # ``[C]`` does while taking the atom walk, which makes the pair a
-  # same-semantics differential over the two paths.  The pairing is asserted
-  # below, not assumed: a change that starts annotating nested classes would
-  # otherwise turn this whole suite into a tautology.
+  # So the invariant is checked against the walk the bitset replaced, run
+  # directly: [matchCcAtom] over the class's own atoms is what the matcher
+  # would have called, and the suite asserts byte for byte that the compiled
+  # pattern agrees with it.  The oracle needs the flags in hand, so each
+  # prefix carries its own; under ``(?i)`` the bitset is not consulted at all
+  # (the matcher gates it on the flag's absence) and folding puts the answer
+  # out of [matchCcAtom]'s reach, so those prefixes are cross-checked against
+  # the nested spelling ``[[C]]`` instead, which parses to a different tree
+  # and matches the same thing.
 
   const ClassBodies = [
     "a",
@@ -4097,15 +4100,49 @@ suite "the ASCII class bitset and the atom walk agree by construction":
     "a-\xC3\xBF",
     "\x00-\xC2\x85",
     "\\x{41}-\\x{5A}",
+    # The atom kinds the bitset only started admitting once the exactness
+    # probe could clear them: a property, whose ASCII half has to be shown
+    # flag-invariant one byte at a time, and the two composites, which are
+    # exact only if every part they are built from is.
+    "\\p{Word}",
+    "\\p{Space}",
+    "\\p{Alpha}",
+    "\\P{Alpha}",
+    "[a-z]",
+    "[^a-z]",
+    "a-z&&[:alpha:]",
+    "\\p{Word}&&[^0-9]",
   ]
 
   const FlagPrefixes = [
-    "", "(?i)", "(?I)", "(?iI)", "(?W)", "(?D)", "(?S)", "(?P)", "(?W)(?D)(?S)(?P)",
-    "(?i)(?W)(?D)(?S)(?P)", "(?iI)(?W)(?D)(?S)(?P)",
+    ("", {}),
+    ("(?i)", {rfIgnoreCase}),
+    ("(?I)", {rfIgnoreCaseAscii}),
+    ("(?iI)", {rfIgnoreCase, rfIgnoreCaseAscii}),
+    ("(?W)", {rfAsciiWord}),
+    ("(?D)", {rfAsciiDigit}),
+    ("(?S)", {rfAsciiSpace}),
+    ("(?P)", {rfAsciiPosix}),
+    ("(?W)(?D)(?S)(?P)", {rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix}),
+    (
+      "(?i)(?W)(?D)(?S)(?P)",
+      {rfIgnoreCase, rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix},
+    ),
+    (
+      "(?iI)(?W)(?D)(?S)(?P)",
+      {
+        rfIgnoreCase, rfIgnoreCaseAscii, rfAsciiWord, rfAsciiDigit, rfAsciiSpace,
+        rfAsciiPosix,
+      },
+    ),
   ]
     ## Every flag a class atom can read.  ``(?W)``/``(?D)``/``(?S)``/``(?P)``
-    ## are the ASCII restrictions the exactness claim is about; ``(?i)``/``(?I)``
-    ## are the ones the fast path steps aside for.
+    ## are the ASCII restrictions the exactness claim is about; ``(?i)`` is the
+    ## one the fast path steps aside for.  ``(?I)`` alone is not: it narrows a
+    ## fold that ``(?i)`` has to turn on first, so it folds nothing by itself
+    ## and leaves the bitset answering -- which is why its row carries
+    ## ``rfIgnoreCaseAscii`` alone and is cross-checked against the atom walk
+    ## like the unfolded rows, not against the nested spelling.
     ##
     ## Ignore-case-ASCII is spelled ``(?iI)``, not ``(?i)(?I)``.  Oniguruma
     ## takes only the combined form -- it rejects the split one as an invalid
@@ -4130,24 +4167,101 @@ suite "the ASCII class bitset and the atom walk agree by construction":
         return found
     nil
 
-  test "the paired patterns really do take the two different paths":
-    # Guards the differential below: if either half stops holding, the
-    # comparison still passes while comparing nothing.
+  proc unannotate(node: Node) =
+    ## Clear ``asciiSetOk`` everywhere in the tree, so [classBitmapAnswers]
+    ## turns every class down and the matcher has to reach ``classHasByte``.
+    if node == nil:
+      return
+    if node.kind == nkCharClass:
+      node.asciiSetOk = false
+    for child in node.childNodes:
+      unannotate(child)
+
+  proc withoutBitset(pattern: string): Regex =
+    ## The same pattern compiled and then stripped of its annotation.  The
+    ## oracle for the unfolded rows has to stay the *engine's* atom walk: a
+    ## reimplementation over ``cls.atoms`` would agree with a ``classHasByte``
+    ## that had drifted, and since [exactAsciiClassSet] annotates both ``[C]``
+    ## and ``[[C]]`` there is no spelling left that reaches the slow path on
+    ## its own.  ``re()`` builds a fresh tree per call, so nothing else sees
+    ## this one.
+    result = re(pattern)
+    unannotate(result.ast)
+
+  test "the bitset really is what answers these classes":
+    # Guards the differential below: if the compiler stops annotating them,
+    # the comparison still passes while comparing nothing.
     for body in ClassBodies:
       for caret in ["", "^"]:
-        let fast = firstCharClass(re("[" & caret & body & "]").ast)
-        let slow = firstCharClass(re("[" & caret & "[" & body & "]]").ast)
-        require fast != nil
-        require slow != nil
-        check fast.asciiSetOk
-        check not slow.asciiSetOk
+        for spelling in ["[" & caret & body & "]", "[" & caret & "[" & body & "]]"]:
+          let cls = firstCharClass(re(spelling).ast)
+          require cls != nil
+          checkpoint("spelling=" & spelling)
+          check cls.asciiSetOk
 
-  test "every ASCII byte reads the same through the bitset and through the atoms":
-    for prefix in FlagPrefixes:
+  test "only a property atom can read an ASCII restriction below U+0080":
+    # What lets [exactAsciiClassSet] skip the probe for every other atom kind.
+    # ``matchPosixClass`` answers ASCII from its table above its ``asciiOnly``
+    # argument, and so do ``isWordChar`` / ``isDigitChar`` / ``isSpaceChar``;
+    # a literal and a range never see a restriction flag at all.  Move any of
+    # those ASCII short-circuits and the skip becomes unsound with the rest of
+    # the suite still green, so the reading is asserted here directly.
+    const Restrict = {rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix}
+    const NonPropBodies = [
+      "a", "a-z", "\\w", "\\W", "\\d", "\\D", "\\s", "\\S", "\\h", "\\H", "\\R",
+      "[:word:]", "[:^word:]", "[:digit:]", "[:space:]", "[:alpha:]", "[:alnum:]",
+      "[:ascii:]", "[:^ascii:]", "[:punct:]", "[:graph:]", "[:print:]", "[:cntrl:]",
+      "[:blank:]", "[:lower:]", "[:upper:]", "[:xdigit:]",
+    ]
+    for body in NonPropBodies:
+      let cls = firstCharClass(re("[" & body & "]").ast)
+      require cls != nil
+      for atom in cls.atoms:
+        require atom.kind notin {ccUnicodeProp, ccNegUnicodeProp}
+        for b in 0 .. 127:
+          let r = Rune(int32(b))
+          if matchCcAtom(r, atom, {}) != matchCcAtom(r, atom, Restrict):
+            checkpoint("body=" & body & " byte=" & $b)
+            fail()
+
+  test "which rows the bitset actually answers is what the differential assumes":
+    # The annotation above is only half the guard: [classBitmapAnswers] is the
+    # gate both readers consult, and the differential's oracle depends on which
+    # way it goes.  Without ``(?i)`` the bitset must answer, or the comparison
+    # compares the atom walk with itself; under ``(?i)`` it must *not*, because
+    # there the oracle is the nested spelling, which is only a second path as
+    # long as neither spelling reaches the bitset.  Widen the gate to folded
+    # input and both halves of those rows would run the same new code with the
+    # suite still green -- so the assumption is pinned here instead.
+    for (prefix, flags) in FlagPrefixes:
       for body in ClassBodies:
         for caret in ["", "^"]:
-          let fast = re(prefix & "[" & caret & body & "]")
-          let slow = re(prefix & "[" & caret & "[" & body & "]]")
+          let cls = firstCharClass(re(prefix & "[" & caret & body & "]").ast)
+          require cls != nil
+          for b in 0'u8 .. 127'u8:
+            if classBitmapAnswers(cls, b, flags) != (rfIgnoreCase notin flags):
+              checkpoint(
+                "prefix=" & prefix & " body=" & body & " caret=" & caret & " byte=" & $b
+              )
+              fail()
+
+  test "every ASCII byte reads the same through the bitset and through the atoms":
+    for (prefix, flags) in FlagPrefixes:
+      for body in ClassBodies:
+        for caret in ["", "^"]:
+          let spelling = prefix & "[" & caret & body & "]"
+          let fast = re(spelling)
+          require firstCharClass(fast.ast) != nil
+          # Both oracles run the whole engine, so a divergence anywhere on the
+          # slow path -- not only in the bitset -- shows up here.
+          let slow =
+            if rfIgnoreCase in flags:
+              # Under a fold neither spelling reaches the bitset anyway, and
+              # the nested one answers the same question through a different
+              # tree, so it stays the second path here.
+              re(prefix & "[" & caret & "[" & body & "]]")
+            else:
+              withoutBitset(spelling)
           for b in 0 .. 127:
             let subject = $chr(b)
             let viaBitset = search(subject, fast).found

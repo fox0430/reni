@@ -263,15 +263,22 @@ type
       # padding slot of its own and the node grows past 64 bytes.
       atoms*: seq[CcAtom]
       asciiSet*: set[uint8]
-        ## The ASCII bytes the class's atoms match, *before* negation — the
-        ## same contract as ``classHasByte``, whose caller applies ``negated``.
-        ## Filled in by the compiler when ``asciiSetOk``; the matcher then
-        ## answers ASCII input with one bit test instead of walking the atoms.
+        ## The ASCII bytes the class's atoms match, *before* negation — what
+        ## ``classHasByte`` answers below 0x80, with ``negated`` left to the
+        ## caller in the same way.  Nothing above 0x7F is ever set, so it says
+        ## nothing about a range written across the ASCII boundary:
+        ## ``[a-\u00FF]`` accepts a stray ``0xFF`` that is not in here.  Filled
+        ## in by the compiler when ``asciiSetOk``; the matcher then answers
+        ## ASCII input with one bit test instead of walking the atoms.  Every
+        ## reader must ask [classBitmapAnswers] first, which is where the
+        ## ``b < 0x80`` gate lives.
       negated*: bool
       bracketClass*: bool ## true when from [...] syntax (enables case-fold matching)
       asciiSetOk*: bool
         ## ``asciiSet`` is exact.  Only true for classes whose atoms all read
-        ## the same below U+0080 whatever the ASCII-restriction flags say;
+        ## the same below U+0080 whatever the ASCII-restriction flags say --
+        ## which [exactAsciiClassSet] establishes by asking the atoms, so a
+        ## ``\p{...}``, a nested class and an intersection are all in reach;
         ## under (?i) the matcher still falls back to the atoms.
     of nkAnchor:
       anchor*: AnchorKind
