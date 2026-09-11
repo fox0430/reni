@@ -838,6 +838,16 @@ proc charTypeAdvance(ctx: MatchContext, ct: CharTypeKind): int =
         nextGraphemeClusterEnd(ctx.subject.oa, start)
     return if clusterEnd > start: clusterEnd else: -1
 
+  # ASCII fast path.  A byte below 0x80 is a one-byte character that decodes
+  # to itself and that ``codeIsClassifiable`` admits, so the type is one
+  # membership test on it.  ``\R`` is the exception: "\r\n" is one match two
+  # bytes wide.
+  let lead = ctx.subject[start].uint8
+  if lead < 0x80 and ct != ctNewlineSeq:
+    if ct == ctDot and rfMultiLine in ctx.flags:
+      return start + 1
+    return if lead in AsciiCharTypeSets[ct]: start + 1 else: -1
+
   var code: int32
   var next: int
   if not decodeChar(ctx, start, code, next):

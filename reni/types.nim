@@ -444,6 +444,33 @@ const
   XdigitAsciiBytes* = asciiBytes(acXdigit, true)
   NotXdigitAsciiBytes* = asciiBytes(acXdigit, false)
 
+proc buildAsciiCharTypeSets(): array[CharTypeKind, set[uint8]] =
+  ## The ASCII bytes each character type matches.  No flag changes the answer
+  ## below U+0080: ``isWordChar`` and its neighbours read [AsciiClassTable]
+  ## before they look at their ASCII-only argument.
+  ##
+  ## ``ctDot`` is entered in its single-line reading, the only one that
+  ## excludes anything.  ``ctNewlineSeq`` (``"\r\n"`` is two bytes for one
+  ## match) and ``ctGraphemeCluster`` keep an empty set; both are handled
+  ## before the fast path.
+  for ct in CharTypeKind:
+    result[ct] =
+      case ct
+      of ctWord: WordAsciiBytes
+      of ctNotWord: NotWordAsciiBytes
+      of ctDigit: DigitAsciiBytes
+      of ctNotDigit: NotDigitAsciiBytes
+      of ctSpace: SpaceAsciiBytes
+      of ctNotSpace: NotSpaceAsciiBytes
+      of ctDot: AllAsciiBytes - {0x0A'u8}
+      of ctHexDigit: XdigitAsciiBytes
+      of ctNotHexDigit: NotXdigitAsciiBytes
+      of ctAnyChar: AllAsciiBytes
+      of ctNotNewline: AllAsciiBytes - {0x0A'u8}
+      of ctNewlineSeq, ctGraphemeCluster: {}
+
+const AsciiCharTypeSets* = buildAsciiCharTypeSets()
+
 ## Character decoding, following Oniguruma's UTF-8 encoding module.
 ##
 ## Oniguruma reads the length of a character straight out of a table indexed
