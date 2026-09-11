@@ -846,7 +846,11 @@ proc charTypeAdvance(ctx: MatchContext, ct: CharTypeKind): int =
   if lead < 0x80 and ct != ctNewlineSeq:
     if ct == ctDot and rfMultiLine in ctx.flags:
       return start + 1
-    return if lead in AsciiCharTypeSets[ct]: start + 1 else: -1
+    return
+      if lead in AsciiCharTypeSets[ct]:
+        start + 1
+      else:
+        -1
 
   var code: int32
   var next: int

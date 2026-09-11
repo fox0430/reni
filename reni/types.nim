@@ -456,18 +456,30 @@ proc buildAsciiCharTypeSets(): array[CharTypeKind, set[uint8]] =
   for ct in CharTypeKind:
     result[ct] =
       case ct
-      of ctWord: WordAsciiBytes
-      of ctNotWord: NotWordAsciiBytes
-      of ctDigit: DigitAsciiBytes
-      of ctNotDigit: NotDigitAsciiBytes
-      of ctSpace: SpaceAsciiBytes
-      of ctNotSpace: NotSpaceAsciiBytes
-      of ctDot: AllAsciiBytes - {0x0A'u8}
-      of ctHexDigit: XdigitAsciiBytes
-      of ctNotHexDigit: NotXdigitAsciiBytes
-      of ctAnyChar: AllAsciiBytes
-      of ctNotNewline: AllAsciiBytes - {0x0A'u8}
-      of ctNewlineSeq, ctGraphemeCluster: {}
+      of ctWord:
+        WordAsciiBytes
+      of ctNotWord:
+        NotWordAsciiBytes
+      of ctDigit:
+        DigitAsciiBytes
+      of ctNotDigit:
+        NotDigitAsciiBytes
+      of ctSpace:
+        SpaceAsciiBytes
+      of ctNotSpace:
+        NotSpaceAsciiBytes
+      of ctDot:
+        AllAsciiBytes - {0x0A'u8}
+      of ctHexDigit:
+        XdigitAsciiBytes
+      of ctNotHexDigit:
+        NotXdigitAsciiBytes
+      of ctAnyChar:
+        AllAsciiBytes
+      of ctNotNewline:
+        AllAsciiBytes - {0x0A'u8}
+      of ctNewlineSeq, ctGraphemeCluster:
+        {}
 
 const AsciiCharTypeSets* = buildAsciiCharTypeSets()
 
