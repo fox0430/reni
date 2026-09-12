@@ -506,15 +506,6 @@ proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int
 
 proc runCont(ctx: MatchContext, cont: ContId): bool
 
-proc pushChoice(ctx: MatchContext, choice: sink Choice) {.inline.} =
-  ## Push a backtrack entry, growing only when full.
-  if ctx.choicesLen >= ctx.choices.len:
-    ctx.choices.setLen(max(16, ctx.choices.len * 2))
-  ctx.choices[ctx.choicesLen] = choice
-  inc ctx.choicesLen
-  if ctx.choicesLen > ctx.choicesPeak:
-    ctx.choicesPeak = ctx.choicesLen
-
 proc pushCapUndo(ctx: MatchContext, idx: int32, span: Span) {.inline.} =
   ## Record one group's pre-image, growing only when full.
   if ctx.capUndosLen >= ctx.capUndos.len:
@@ -634,6 +625,23 @@ proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
   result = ctx.framesLen.int32
   copyMem(addr ctx.frames[ctx.framesLen], addr frame, sizeof(Frame))
   inc ctx.framesLen
+
+# The same precondition, for ``pushChoice``'s store below.  ``Choice`` has more
+# branches than ``Frame``, so an owning field is that much likelier to land in
+# one of them.
+requireBitwiseCopyable(Choice)
+
+proc pushChoice(ctx: MatchContext, choice: sink Choice) {.inline.} =
+  ## Push a backtrack entry, growing only when full.
+  ##
+  ## ``sink`` and ``copyMem`` for the reasons ``pushFrame`` above gives; like
+  ## ``Frame``, ``Choice`` holds only cursors and plain values.
+  if ctx.choicesLen >= ctx.choices.len:
+    ctx.choices.setLen(max(16, ctx.choices.len * 2))
+  copyMem(addr ctx.choices[ctx.choicesLen], addr choice, sizeof(Choice))
+  inc ctx.choicesLen
+  if ctx.choicesLen > ctx.choicesPeak:
+    ctx.choicesPeak = ctx.choicesLen
 
 template copyCaptures(dst, src, n: untyped) =
   ## ``Span`` is a plain two-int value, so a snapshot moves in one block.
