@@ -651,11 +651,11 @@ proc mergeLiterals(node: Node): Node =
     node
 
 proc markQuantBodyPure(node: Node): bool =
-  ## Records on every quantifier whether its body can write state that a
-  ## rollback snapshot restores: captures, ``keepStart`` (``\K``), flags /
-  ## grapheme mode or ``subjectEnd``.  ``nkSubexpCall`` counts conservatively.
-  ## Returns that verdict for ``node``'s own subtree; the flag stored on a
-  ## quantifier is its negation.
+  ## Records on every quantifier, lookaround and consuming conditional whether
+  ## its body can write state that a rollback snapshot restores: captures,
+  ## ``keepStart`` (``\K``), flags / grapheme mode or ``subjectEnd``.
+  ## ``nkSubexpCall`` counts conservatively.  Returns that verdict for
+  ## ``node``'s own subtree; the flag on the node is its negation.
   if node == nil:
     return false
   result =
@@ -666,13 +666,29 @@ proc markQuantBodyPure(node: Node): bool =
       node.anchor == akKeep
     else:
       false
+  # A conditional's flag is about ``condBody`` alone -- the branches run in
+  # the enclosing machine and undo themselves -- so pick its verdict out of
+  # the walk rather than from the OR below.
+  let wantCond = node.kind == nkConditional
+  var condImpure = false
   for child in node.childNodes:
-    if markQuantBodyPure(child):
+    let childImpure = markQuantBodyPure(child)
+    if wantCond and child == node.condBody:
+      condImpure = childImpure
+    if childImpure:
       result = true
-  if node.kind == nkQuantifier:
+  case node.kind
+  of nkQuantifier:
     # ``result`` is the OR over the children, and the quantifier node itself
     # writes nothing, so it is exactly the body's verdict.
     node.quantBodyPure = not result
+  of nkLookaround:
+    # Same reasoning: the only child is ``lookBody``.
+    node.lookBodyPure = not result
+  of nkConditional:
+    node.condBodyPure = not condImpure
+  else:
+    discard
 
 proc sameFirstChar(a, b: FirstCharInfo): bool =
   ## Structural equality for two hints.  Spelled out because ``FirstCharInfo``
