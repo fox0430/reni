@@ -716,6 +716,23 @@ proc restoreScalars(ctx: MatchContext, s: ScalarState) {.inline.} =
   ctx.subjectEnd = s.subjectEnd
   ctx.graphemeMode = s.graphemeMode
 
+proc restoreScalarsKeepingStart(ctx: MatchContext, s: ScalarState) {.inline.} =
+  ## Roll back to ``s`` as ``restoreScalars`` does, but leave ``keepStart``
+  ## where the body left it.  Oniguruma keeps a ``\K`` inside a positive
+  ## lookaround the way it keeps the captures: the assertion is zero-width, yet
+  ## the match start it moved survives.  The caller's rollback still carries the
+  ## old ``keepStart``, so backtracking past the lookaround undoes this along
+  ## with the captures -- except on the ``lookBodyPure`` path, which pushes
+  ## none, and is safe only because ``markQuantBodyPure`` calls ``akKeep``
+  ## impure.
+  ##
+  ## A body may run past where the outer match ends, so the kept start can sit
+  ## ahead of it.  Every site that reports it clamps to the match end, the way
+  ## Oniguruma's ``OP_END`` does with ``(pkeep > s) ? s : pkeep``.
+  let kept = ctx.keepStart
+  restoreScalars(ctx, s)
+  ctx.keepStart = kept
+
 proc restore(ctx: MatchContext, s: SavedState) {.inline.} =
   ## Roll back to ``s`` and release its slot on the side stack.
   restoreScalars(ctx, s.scalars)
@@ -773,12 +790,21 @@ proc keepCaptures(ctx: MatchContext, s: SavedState) =
   ## rollback in whichever shape ``keptCaptureChoice`` picks.
   ctx.pushChoice keptCaptureChoice(ctx, s, ctx.framesLen.int32)
 
-proc keepLookCaptures(ctx: MatchContext, node: Node, s: SavedState) =
+proc keepLookCaptures(
+    ctx: MatchContext, node: Node, s: SavedState, keepKeptStart = true
+) =
   ## Finish a positive lookaround that matched: roll the scalars back to ``s``
   ## and keep what the (zero-width) body captured.  A lookaround commits to
   ## its first answer, so the entry only ever undoes; alternation lookbehind,
   ## which does retry, keeps its own ``chLookbehindAlt`` snapshot instead.
-  restoreScalars(ctx, s.scalars)
+  ## ``\K`` is kept alongside the captures -- see
+  ## ``restoreScalarsKeepingStart``.  The two are separate policies: a caller
+  ## that wants only the captures passes ``keepKeptStart = false``, which is
+  ## what a *failed* negative assertion does.
+  if keepKeptStart:
+    restoreScalarsKeepingStart(ctx, s.scalars)
+  else:
+    restoreScalars(ctx, s.scalars)
   if node.lookBodyPure:
     releaseTo(ctx, s.capOff)
   else:
@@ -1776,8 +1802,8 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
         let bodyMatch = matchWithCont(ctx, alt, fid)
         ctx.framesLen = fid
         if bodyMatch:
-          # Keep captures; retry replays the entry snapshot.
-          restoreScalars(ctx, saved.scalars)
+          # Keep captures (and ``\K``); retry replays the entry snapshot.
+          restoreScalarsKeepingStart(ctx, saved.scalars)
           restoreStackLens(ctx, stackSnap)
           drop(ctx, saved)
           ctx.choices[top].lbaNext = int32(k + 1)
@@ -1801,7 +1827,7 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
         let bodyMatch = matchWithCont(ctx, alt, fid)
         ctx.framesLen = fid
         if bodyMatch:
-          restoreScalars(ctx, saved.scalars)
+          restoreScalarsKeepingStart(ctx, saved.scalars)
           restoreStackLens(ctx, stackSnap)
           # Commit with shortest priority: the entry has no retry left, so
           # its snapshot becomes the rollback for the captures kept here, as
@@ -1990,7 +2016,9 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
         let bodyMatch = matchWithCont(ctx, node.condBody.lookBody, TrueCont)
         if bodyMatch:
           result = false # negative lookaround failed, preserve captures
-          keepLookCaptures(ctx, node.condBody, saved)
+          # Captures only: the assertion did not hold, so a ``\K`` its body
+          # ran over keeps nothing, the way ``lkNegAhead`` proper restores.
+          keepLookCaptures(ctx, node.condBody, saved, keepKeptStart = false)
         else:
           result = true # negative lookaround succeeded
           restore(ctx, saved)
@@ -2161,7 +2189,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
 proc matchNode(ctx: MatchContext, node: Node): bool =
   matchWithCont(ctx, node, TrueCont)
 
-proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.}
+proc writeFoundCopy(m: var Match, captures: seq[Span], startChar: int) {.inline.}
 
 proc runCont(ctx: MatchContext, cont: ContId): bool =
   ## Walk the continuation chain starting at ``cont``: each ``Frame``
@@ -2244,10 +2272,10 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
     let mLen = ctx.pos - sp
     if mLen > ctx.flBestLen:
       ctx.flBestLen = mLen
-      writeFoundCopy(ctx.flBestMatch, ctx.captures)
+      writeFoundCopy(ctx.flBestMatch, ctx.captures, sp)
       ctx.flBestMatch.boundaries[0] = span(sp, ctx.pos)
       if ctx.keepStart != sp:
-        ctx.flBestMatch.boundaries[0].a = ctx.keepStart
+        ctx.flBestMatch.boundaries[0].a = min(ctx.keepStart, ctx.pos)
     false # force backtracking for more alternatives
 
 type MachineMode = enum
@@ -3148,10 +3176,10 @@ proc runMachine(
         let mLen = ctx.pos - sp
         if mLen > ctx.flBestLen:
           ctx.flBestLen = mLen
-          writeFoundCopy(ctx.flBestMatch, ctx.captures)
+          writeFoundCopy(ctx.flBestMatch, ctx.captures, sp)
           ctx.flBestMatch.boundaries[0] = span(sp, ctx.pos)
           if ctx.keepStart != sp:
-            ctx.flBestMatch.boundaries[0].a = ctx.keepStart
+            ctx.flBestMatch.boundaries[0].a = min(ctx.keepStart, ctx.pos)
         mode = mFail # force backtracking for more alternatives
     of mFail:
       if ctx.choicesLen <= choiceBase:
@@ -3610,17 +3638,23 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
     ctx.calloutCounters.clear()
   ctx.graphemeMode = gmNone
 
-proc writeFoundCopy(m: var Match, captures: seq[Span]) {.inline.} =
+proc writeFoundCopy(m: var Match, captures: seq[Span], startChar: int) {.inline.} =
   ## Fill ``m`` from a capture vector, reusing ``m.boundaries``' capacity.
   ## Used while ``captures`` is still live (e.g. in the findLongest frame,
   ## which may re-enter and mutate ``ctx.captures``).
+  ##
+  ## ``startChar`` is the position the attempt started at, and the caller has
+  ## to pass it alongside ``captures``: ``\K`` may have moved
+  ## ``captures[0].a`` off it in either direction -- see ``Match.startChar``.
   m.found = true
+  m.startChar = startChar
   m.boundaries.setLen(captures.len)
   for i in 0 ..< captures.len:
     m.boundaries[i] = captures[i]
 
 proc writeNotFound(m: var Match) {.inline.} =
   m.found = false
+  m.startChar = -1
   m.boundaries.setLen(0)
 
 proc searchImplInto*(
@@ -3747,9 +3781,9 @@ proc searchImplInto*(
         ctx.capturesDirty = true
         ctx.captures[0] = span(startPos, ctx.pos)
         if ctx.keepStart != startPos:
-          ctx.captures[0].a = ctx.keepStart
+          ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
         # Copy into m so that ctx.captures stays usable across calls.
-        writeFoundCopy(m, ctx.captures)
+        writeFoundCopy(m, ctx.captures, startPos)
         return
 
     # Advance to the next candidate start position.  Neither a plain
@@ -3773,7 +3807,7 @@ proc searchImplInto*(
   if findLongest and ctx.flBestMatch.found:
     # ctx.flBestMatch lives on the reusable context.  Copy its
     # boundaries into ``m`` so the next call may overwrite the slot.
-    writeFoundCopy(m, ctx.flBestMatch.boundaries)
+    writeFoundCopy(m, ctx.flBestMatch.boundaries, ctx.flBestMatch.startChar)
 
 proc searchImpl*(
     subject: string,
@@ -3879,8 +3913,8 @@ proc searchBackwardImplInto*(
       ctx.capturesDirty = true
       ctx.captures[0] = span(startPos, ctx.pos)
       if ctx.keepStart != startPos:
-        ctx.captures[0].a = ctx.keepStart
-      writeFoundCopy(m, ctx.captures)
+        ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
+      writeFoundCopy(m, ctx.captures, startPos)
       return
 
     if startPos == 0:
@@ -3936,8 +3970,8 @@ proc matchAtImplInto*(
     ctx.capturesDirty = true
     ctx.captures[0] = span(pos, ctx.pos)
     if ctx.keepStart != pos:
-      ctx.captures[0].a = ctx.keepStart
-    writeFoundCopy(m, ctx.captures)
+      ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
+    writeFoundCopy(m, ctx.captures, pos)
 
 proc matchAtImpl*(
     subject: string,

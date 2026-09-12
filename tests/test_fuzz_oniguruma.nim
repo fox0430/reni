@@ -34,7 +34,9 @@
 ##
 ## Patterns come from a small grammar weighted towards the constructs that
 ## stress rollback: captures inside quantified groups, lookarounds that keep
-## what they captured, conditionals, atomic groups and backreferences.
+## what they captured, conditionals, atomic groups, backreferences, and ``\K``
+## -- which a positive assertion keeps the way it keeps its captures, so the
+## same rollbacks own it.  Roughly a third of the patterns carry one.
 ## Subjects are short strings over a tiny alphabet, so a random pattern has a
 ## real chance of matching and of matching in several ways.
 ##
@@ -222,8 +224,26 @@ else:
       atom(g)
 
   proc lookBehindBody(g: var Gen): string =
-    ## One branch of a lookbehind: one or two pieces, so it stays bounded.
-    lookPiece(g) & (if g.r.rand(1) == 0: "" else: lookPiece(g))
+    ## One branch of a lookbehind: one or two pieces, so it stays bounded,
+    ## with a ``\K`` dropped between them often enough to matter.  A ``\K``
+    ## here is the shape that moves a reported start *behind* where the match
+    ## began -- and, at the end of the body, ahead of where it stops, which is
+    ## the clamp -- so the slot is picked from every position rather than one.
+    var pieces = @[lookPiece(g)]
+    if g.r.rand(1) != 0:
+      pieces.add lookPiece(g)
+    let keepAt =
+      if g.r.rand(2) == 0:
+        g.r.rand(pieces.len)
+      else:
+        -1
+    result = ""
+    for i, p in pieces:
+      if i == keepAt:
+        result &= r"\K"
+      result &= p
+    if keepAt == pieces.len:
+      result &= r"\K"
 
   proc group(g: var Gen, depth: int): string =
     ## A bracketing construct.  Each arm that captures bumps ``groups`` before
@@ -249,8 +269,27 @@ else:
       # the alternation one is the only construct that re-enters a lookbehind
       # after it has already matched once.
       let neg = g.r.rand(1) == 0
-      "(?<" & (if neg: "!" else: "=") & lookBehindBody(g) &
-        (if g.r.rand(2) == 0: "|" & lookBehindBody(g) else: "") & ")"
+      let closedBefore = g.closed.len
+      let first = lookBehindBody(g)
+      let alt = g.r.rand(2) == 0
+      let second =
+        if alt:
+          "|" & lookBehindBody(g)
+        else:
+          ""
+      if alt:
+        # A backreference *outside* an alternation lookbehind, naming a group
+        # one of its branches wrote, is another shape the engines split on --
+        # and this one splits Oniguruma from itself.  ``(?<=b|(b))\1`` on "bb"
+        # answers 1 in Ruby, whose Onigmo re-enters the lookbehind to try the
+        # other branch once ``\1`` fails, and no match in Oniguruma 6.9.10 and
+        # in PCRE2, which both commit to the branch that already succeeded.
+        # reni answers with Ruby.  Two engines make a quorum against it, so
+        # leaving the shape in would fail the sweep on a disagreement that is
+        # not about rollback at all.  The groups stay numbered; they just stop
+        # being nameable from outside.
+        g.closed.setLen(closedBefore)
+      "(?<" & (if neg: "!" else: "=") & first & second & ")"
     of 8:
       # Conditional.  Both the backreference and the consuming/lookahead
       # condition forms, since they take different paths through ``condHolds``.
@@ -293,6 +332,16 @@ else:
   proc branch(g: var Gen, depth: int): string =
     for _ in 0 .. g.r.rand(2):
       result &= piece(g, depth)
+      # ``\K`` parts the span a match reports from the one its attempt ran
+      # over, and a positive assertion keeps the start it moved the way it
+      # keeps its captures -- so every rollback that restores a capture has to
+      # restore this too, and the generator has to be able to put one inside a
+      # lookaround, an atomic group and a repetition.  It is never quantified
+      # directly -- all three engines reject ``\K*`` outright, so generating
+      # one would only inflate the skip count -- but a quantifier on the group
+      # around it reaches the same rollback.
+      if g.r.rand(9) == 0:
+        result &= r"\K"
 
   proc expr(g: var Gen, depth: int): string =
     result = branch(g, depth)

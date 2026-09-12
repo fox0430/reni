@@ -1415,6 +1415,279 @@ suite "Special escapes":
   test "\\K in replace":
     check replace("xyz", re("x\\Ky"), "!") == "x!z"
 
+  test "a plain \\K scans on what the attempt consumed":
+    # ``a\K`` reports an empty span at the end of every ``a`` it ran over, so
+    # a loop testing the *reported* span for zero width steps a rune past it
+    # and skips the next ``a``.  The attempt consumed a character, though, so
+    # stepping on ``consumedSpan`` resumes right after it and every ``a`` is
+    # matched.  Oniguruma's own ``gsub`` skips here and its ``split`` does
+    # not; these answers are the self-consistent ones.
+    var found: seq[string] = @[]
+    for m in findAll("aaa", re("a\\K")):
+      found.add $m.boundaries[0] & "@" & $m.startChar
+    check found == @[$(1 .. 1) & "@0", $(2 .. 2) & "@1", $(3 .. 3) & "@2"]
+    check replace("aaa", re("a\\K"), "!") == "a!a!a!"
+    check replace(
+      "aaa",
+      re("a\\K"),
+      proc(m: Match, s: string): string =
+        "!",
+    ) == "a!a!a!"
+    check split("aaa", re("a\\K")) == @["a", "a", "a", ""]
+
+  test "a positive lookaround keeps its \\K the way it keeps its captures":
+    # Oniguruma lets a ``\K`` inside a positive assertion move the match
+    # start even though the assertion itself is zero-width, so the kept
+    # side of a lookaround is ``keepStart`` plus the captures, not the
+    # captures alone.  Each of these answers ``0 .. 2`` when the scalar
+    # rollback takes ``keepStart`` back down with ``pos``.
+    check search("ab", re("(?=a\\Kb)ab")).boundaries[0] == 1 .. 2
+    check search("ab", re("(?=(a)\\Kb)ab")).boundaries[0] == 1 .. 2
+    check search("xab", re("x(?=a\\K)ab")).boundaries[0] == 2 .. 3
+    check search("ab", re("ab(?<=a\\Kb)")).boundaries[0] == 1 .. 2
+    check search("ab", re("ab(?<=(a)\\Kb)")).boundaries[0] == 1 .. 2
+    # Alternation lookbehind commits through its own path: a fixed-length
+    # alternative retries from the entry snapshot, a variable one writes the
+    # rollback over the entry.  Both have to keep ``\K`` as well.
+    check search("ab", re("ab(?<=(x)|a\\Kb)")).boundaries[0] == 1 .. 2
+    check search("aab", re("aab(?<=(x)|a+\\Kb)")).boundaries[0] == 2 .. 3
+    # A negative assertion keeps nothing, ``\K`` included.
+    check search("ab", re("(?!a\\Kq)ab")).boundaries[0] == 0 .. 2
+    check search("ab", re("(?<!a\\Kq)ab")).boundaries[0] == 0 .. 2
+    # And the kept ``\K`` is still undone by backtracking past it: the
+    # lookahead holds here, ``q`` does not, and the optional group is
+    # skipped -- with the start it moved restored along with the captures.
+    check search("ab", re("(?:(?=a\\Kb)q)?ab")).boundaries[0] == 0 .. 2
+    check search("ab", re("(?:(?=(a)\\Kb)q)?ab")).boundaries[0] == 0 .. 2
+
+  test "a kept \\K never starts a match past its end":
+    # The lookaround body can run past where the outer match stops, so the
+    # ``\K`` it keeps can sit ahead of the end.  Oniguruma clamps the start
+    # to the end there (``(pkeep > s) ? s : pkeep``); without that the span
+    # comes out inverted, and an inverted empty match never advances.
+    check search("ab", re("(?=ab\\K)a")).boundaries[0] == 1 .. 1
+    check search("ab", re("(?=ab\\K)")).boundaries[0] == 0 .. 0
+    check search("abc", re("(?=\\w+\\K)a")).boundaries[0] == 1 .. 1
+    check search("ab", re("((?=ab\\K))a")).boundaries[0] == 1 .. 1
+    check matchAt("ab", re("(?=ab\\K)a")).boundaries[0] == 1 .. 1
+    var found: seq[string] = @[]
+    for m in findAll("abab", re("(?=ab\\K)")):
+      found.add $m.boundaries[0]
+    check found == @[$(0 .. 0), $(2 .. 2)]
+    check replace("abababab", re("(?=ab\\K)"), "!") == "!ab!ab!ab!ab"
+    check replace("abcdefx", re("(?=abcdef\\K)a"), "!") == "a!bcdefx"
+
+  test "a kept \\K behind the scan start still lets a scan advance":
+    # A ``\K`` inside a lookbehind is the one shape whose kept start lands
+    # *behind* the position the attempt began at.  The reported span is then
+    # wide where the scan stood still, so a loop stepping on it would hand
+    # back the same match forever and slice text it has already written out.
+    # ``Match.startChar`` is what the attempt consumed, and the scanning
+    # loops step on that instead of on what the match reports.
+    let m = search("abab", re("(?<=\\Kab)"), start = 2)
+    check m.boundaries[0] == 0 .. 2
+    check m.startChar == 2
+    var found: seq[string] = @[]
+    for x in findAll("abab", re("(?<=\\Kab)")):
+      found.add $x.boundaries[0]
+    check found == @[$(0 .. 2), $(2 .. 4)]
+    # Reported start behind ``pos``: the text it covers is already in the
+    # output, so the match replaces only what is left of it -- rather than
+    # slicing backwards, which is a ``RangeDefect``, not a catchable error.
+    check replace("abcabcabc", re("c(?<=\\Kabcabc)"), "!") == "!!"
+    check replace(
+      "abcabcabc",
+      re("c(?<=\\Kabcabc)"),
+      proc(m: Match, s: string): string =
+        "!",
+    ) == "!!"
+    check split("abcabcabc", re("c(?<=\\Kabcabc)")) == @["", "", ""]
+    # A zero-width match whose reported start sits behind where the scan
+    # stood.  The character the scan stepped over to make progress is not the
+    # output's to keep on its own: the next match reports over it, and
+    # replacing it is what ``split`` says too -- its fields here are
+    # ``["xx", "", ""]`` and its separators ``2..4`` and ``4..6``, which do
+    # lay end to end over the subject.  The case above is the one where they
+    # do not: separators ``0..6`` and ``3..9`` over nine bytes.
+    check replace("xxabab", re("(?<=\\Kab)"), "!") == "xx!!"
+    check replace(
+      "xxabab",
+      re("(?<=\\Kab)"),
+      proc(m: Match, s: string): string =
+        "!",
+    ) == "xx!!"
+    check split("xxabab", re("(?<=\\Kab)")) == @["xx", "", ""]
+
+  test "the scan's divergence from Ruby over a \\K is pinned, not accidental":
+    # The scanning API steps on what an attempt *consumed*; Ruby's ``scan``
+    # and ``gsub`` step on what it *reported*.  The two rules cannot differ
+    # for a pattern that reports what it consumed, so the divergence is
+    # confined to ``\K``.  These are the shapes it takes, recorded against
+    # Ruby 3.4 so that moving one is a visible edit rather than a silent one.
+    # ``tests/test_fuzz_oniguruma.nim`` compares single matches only and
+    # cannot reach any of this; these expectations are the contract.
+    #
+    # Agreeing, because the report ends where the attempt did:
+    check replace("ab", re("a\\Kb"), "!") == "a!" # Ruby: "a!"
+    # Agreeing, because a report *at* the end of the attempt leaves the scan
+    # where the report leaves it -- a nullable prefix changes neither rule:
+    check replace("aaa", re("a*\\K"), "!") == "aaa!" # Ruby: "aaa!"
+    check replace("x1y", re("[0-9]*\\K"), "!") == "!x1!y!" # Ruby: "!x1!y!"
+    # Parting, because the report is shorter than the attempt: Ruby resumes
+    # at the report and so steps over text this scan still reaches.
+    check replace("aa", re("a\\K"), "!") == "a!a!" # Ruby's gsub: "a!a"
+    check replace("aaa", re("a\\K"), "!") == "a!a!a!" # Ruby's gsub: "a!aa!"
+    var n = 0
+    for _ in findAll("aaa", re("a\\K")):
+      n += 1
+    check n == 3 # Ruby's scan: 2
+    # ``split`` is not on the parting list: it takes the text *before* a
+    # report, which is where Ruby's ``split`` takes its field from too.
+    check split("aaa", re("a\\K")) == @["a", "a", "a", ""] # Ruby: the same
+    # And where Ruby has no answer to diverge from.  A report that reaches
+    # back behind the scan leaves Ruby with nowhere to resume that is ahead
+    # of where it stood: ``"aa".scan(/(?<=\Ka)/)`` never terminates there and
+    # ``"abcabcabc".gsub(/c(?<=\Kabcabc)/, "!")`` raises ``ArgumentError:
+    # negative string size``.  Stepping on the consumed span ends both.
+    check replace("aa", re("(?<=\\Ka)"), "!") == "!!"
+    check replace("abcabcabc", re("c(?<=\\Kabcabc)"), "!") == "!!"
+
+  test "a \\K after a nullable prefix is one answer, not two":
+    # ``a*\K`` reports an empty span at the end of what it ran over.  Resuming
+    # there is right -- the attempt consumed text -- but the next attempt
+    # stands exactly where that empty report sat, matches empty, and reports
+    # it again.  The second attempt is a different attempt with the same
+    # answer, and a scan hands it back once.  Oniguruma agrees on all of
+    # these; Ruby's ``scan`` is the reference for the spans.
+    var found: seq[string] = @[]
+    for m in findAll("aaa", re("a*\\K")):
+      found.add $m.boundaries[0]
+    check found == @[$(3 .. 3)]
+    check replace("aaa", re("a*\\K"), "!") == "aaa!"
+    check split("aaa", re("a*\\K")) == @["aaa", ""]
+    check replace("aaa", re(".*\\K"), "!") == "aaa!"
+    check replace("abcabc", re("\\w*\\K"), "!") == "abcabc!"
+    # The suppression is of a repeat, not of every empty report: an empty
+    # report at a position the previous one did not cover is its own answer.
+    found = @[]
+    for m in findAll("x1y", re("[0-9]*\\K")):
+      found.add $m.boundaries[0]
+    check found == @[$(0 .. 0), $(2 .. 2), $(3 .. 3)]
+    check replace("a b", re("\\s*\\K"), "!") == "!a !b!"
+    check replace("a_b", re("\\s*\\K"), "!") == "!a!_!b!"
+    found = @[]
+    for m in findAll("aabab", re("a*\\K(?=b)")):
+      found.add $m.boundaries[0]
+    check found == @[$(2 .. 2), $(4 .. 4)]
+
+  test "a scanner drives a hand-written loop the way findAll does":
+    # ``MatchScanner`` is what the library's own loops run on, and what a
+    # caller running its own scan needs: the cursor rule is not a function of
+    # one match's span, so it cannot live in the caller.
+    let ctx = newMatchContext()
+    for (subject, pattern) in [
+      ("a1 b22 c333", "\\d+"),
+      ("aaa", "a*\\K"),
+      ("aaa", "a\\K"),
+      ("x1y", "[0-9]*\\K"),
+      ("xxabab", "(?<=\\Kab)"),
+      ("abc", "x*"),
+    ]:
+      let rx = re(pattern)
+      var sc = initMatchScanner(subject)
+      var m: Match
+      var spans: seq[Span]
+      while scanNext(sc, ctx, subject, rx, m):
+        spans.add m.matchSpan
+      var expected: seq[Span]
+      for em in findAll(subject, rx):
+        expected.add em.matchSpan
+      check spans == expected
+
+  test "a scanner owns both cursors and is bound to one subject":
+    # The scan cursor and the output cursor move through the scanner, not
+    # through a loop that has to remember to move them, and the offsets they
+    # hold mean nothing in another string.
+    let ctx = newMatchContext()
+    let rx = re("\\d+")
+    let subject = "a1b22c"
+    var sc = initMatchScanner(subject)
+    var m: Match
+    check scanNext(sc, ctx, subject, rx, m)
+    check m.matchSpan == 1 .. 2
+    check sc.takeGap(m) == 0 .. 1
+    expect ValueError:
+      discard scanNext(sc, ctx, "zzz", rx, m)
+    expect ValueError:
+      discard initMatchScanner("abc", start = 4)
+    expect ValueError:
+      discard initMatchScanner("abc", start = -1)
+    # A match that is not there covers nothing and moves nothing.
+    var missing: Match
+    check sc.takeGap(missing) == 2 .. 2
+
+  test "a yielded match is already stepped past":
+    # The scan cursor a caller reads beside a match is the one the next
+    # attempt starts from, and not the one that produced the match it is
+    # holding: the step is made before the match is handed over, so the scan
+    # never stands at a position it has already answered from.
+    let ctx = newMatchContext()
+    let rx = re("\\d")
+    let subject = "1a2"
+    var sc = initMatchScanner(subject)
+    var m: Match
+    check scanNext(sc, ctx, subject, rx, m)
+    check m.matchSpan == 0 .. 1
+    check sc.scanPos == 1
+    check scanNext(sc, ctx, subject, rx, m)
+    check m.matchSpan == 2 .. 3
+    check sc.scanPos == 3
+    check not scanNext(sc, ctx, subject, rx, m)
+    # A match that ends the subject leaves the scan standing at the end of
+    # it, rather than back where the attempt behind that match began.
+    let kept = re("b\\K")
+    var sc2 = initMatchScanner("ab")
+    check scanNext(sc2, ctx, "ab", kept, m)
+    check m.matchSpan == 2 .. 2
+    check sc2.scanPos == 2
+
+  test "a scan's reported ends never decrease":
+    # This is what makes one step of memory enough to catch a repeated
+    # answer: a report ends where its attempt did, and attempts only ever
+    # start further along, so an answer left behind cannot come back.
+    for (subject, pattern) in [
+      ("aaa", "a*\\K"),
+      ("aaa", "a\\K"),
+      ("x1y", "[0-9]*\\K"),
+      ("xxabab", "(?<=\\Kab)"),
+      ("abcabcabc", "c(?<=\\Kabcabc)"),
+      ("aabab", "a*\\K(?=b)"),
+      ("abc", "x*"),
+    ]:
+      var prev = -1
+      for m in findAll(subject, re(pattern)):
+        check m.boundaries[0].b >= prev
+        prev = m.boundaries[0].b
+
+  test "consumedSpan answers like matchSpan on a match that is not there":
+    # Both are reached for before the ``found`` test in an ordinary loop, and
+    # an ``IndexDefect`` out of one of them is not catchable by default.
+    var m: Match
+    check consumedSpan(m) == UnsetSpan
+    check matchSpan(m) == UnsetSpan
+    let miss = search("abc", re("z"))
+    check consumedSpan(miss) == UnsetSpan
+    let hit = search("xab", re("a\\Kb"))
+    check consumedSpan(hit) == 1 .. 3
+    check matchSpan(hit) == 2 .. 3
+
+  test "a failed negative assertion keeps its captures but not its \\K":
+    # ``condHolds`` keeps the captures of a negative-lookahead condition whose
+    # body matched, since the branch it selects may read them.  The assertion
+    # did not hold, though, so nothing else of the body survives -- a ``\K``
+    # it ran over least of all.
+    check search("ab", re("a(?(?!\\Kb)x|b)")).boundaries[0] == 0 .. 2
+
   test "\\R matches CRLF":
     let m = search("\r\n", re("\\R"))
     check m.found
@@ -2798,9 +3071,14 @@ suite "MatchContext-based API":
       if not searchIntoCtx(ctx, subject, r, m, start = pos):
         break
       spans.add m.matchSpan
-      pos = advanceAfterMatch(subject, m.matchSpan)
-      if pos < 0:
-        break
+      # ``\d+`` has no ``\K``, so every match reports what it consumed and
+      # the one-span cursor rule is enough here.  A scan that cannot count on
+      # that is what ``MatchScanner`` is for.
+      pos =
+        if m.matchSpan.b == m.matchSpan.a:
+          nextRunePos(subject, m.matchSpan.a)
+        else:
+          m.matchSpan.b
     var expected: seq[Span]
     for em in findAll(subject, r):
       expected.add em.matchSpan
@@ -4514,13 +4792,31 @@ suite "a positive lookaround's captures are rolled back like any other":
     # re-entered for the second alternative.  Group 1 belongs to the
     # alternative that was abandoned, so nothing downstream may still read
     # it -- left set, it flips a ``(?(1)...)`` the same way a leaked
-    # lookahead capture does.  (Whether the assertion is retried at all is a
-    # separate question the oracles answer differently: both Oniguruma and
-    # PCRE2 read a lookbehind as atomic and report no match here.)
+    # lookahead capture does.
+    # Only that bookkeeping is pinned: whether the assertion is retried at all
+    # is left open.  Oniguruma and PCRE2 read a lookbehind as atomic, so they
+    # never reach the second alternative and report no match for this pattern;
+    # reni does retry it and matches.  The test therefore accepts either
+    # answer, and checks the captures only when a match is reported, so making
+    # the lookbehind atomic later needs no change here.
+    # Neither of these needs the retry -- the first alternative's capture
+    # answers the condition in the first, the first alternative simply fails
+    # in the second -- so they hold under either reading and keep the entry,
+    # the rewind and the conditional itself under assertion even if the
+    # retry-dependent check below stops running.
+    let f = search("ax", re(r"^.(?<=(a)|(\w))(?(1)x|q)"))
+    check f.matchSpan == 0 .. 2
+    check f.boundaries[1] == 0 .. 1
+    check f.boundaries[2].a == -1
+    let s = search("ax", re(r"^.(?<=(q)|(\w))(?(2)x|q)"))
+    check s.matchSpan == 0 .. 2
+    check s.boundaries[1].a == -1
+    check s.boundaries[2] == 0 .. 1
     let r = search("ax", re(r"^.(?<=(a)|(\w))(?(2)x|q)"))
-    check r.found
-    check r.boundaries[1].a == -1
-    check r.boundaries[2] == 0 .. 1
+    if r.found:
+      check r.matchSpan == 0 .. 2
+      check r.boundaries[1].a == -1
+      check r.boundaries[2] == 0 .. 1
 
   test "a negative lookaround condition keeps its captures undoable":
     # ``(?(?!(x))...)`` deliberately preserves what the body captured when the
