@@ -4792,13 +4792,31 @@ suite "a positive lookaround's captures are rolled back like any other":
     # re-entered for the second alternative.  Group 1 belongs to the
     # alternative that was abandoned, so nothing downstream may still read
     # it -- left set, it flips a ``(?(1)...)`` the same way a leaked
-    # lookahead capture does.  (Whether the assertion is retried at all is a
-    # separate question the oracles answer differently: both Oniguruma and
-    # PCRE2 read a lookbehind as atomic and report no match here.)
+    # lookahead capture does.
+    # Only that bookkeeping is pinned: whether the assertion is retried at all
+    # is left open.  Oniguruma and PCRE2 read a lookbehind as atomic, so they
+    # never reach the second alternative and report no match for this pattern;
+    # reni does retry it and matches.  The test therefore accepts either
+    # answer, and checks the captures only when a match is reported, so making
+    # the lookbehind atomic later needs no change here.
+    # Neither of these needs the retry -- the first alternative's capture
+    # answers the condition in the first, the first alternative simply fails
+    # in the second -- so they hold under either reading and keep the entry,
+    # the rewind and the conditional itself under assertion even if the
+    # retry-dependent check below stops running.
+    let f = search("ax", re(r"^.(?<=(a)|(\w))(?(1)x|q)"))
+    check f.matchSpan == 0 .. 2
+    check f.boundaries[1] == 0 .. 1
+    check f.boundaries[2].a == -1
+    let s = search("ax", re(r"^.(?<=(q)|(\w))(?(2)x|q)"))
+    check s.matchSpan == 0 .. 2
+    check s.boundaries[1].a == -1
+    check s.boundaries[2] == 0 .. 1
     let r = search("ax", re(r"^.(?<=(a)|(\w))(?(2)x|q)"))
-    check r.found
-    check r.boundaries[1].a == -1
-    check r.boundaries[2] == 0 .. 1
+    if r.found:
+      check r.matchSpan == 0 .. 2
+      check r.boundaries[1].a == -1
+      check r.boundaries[2] == 0 .. 1
 
   test "a negative lookaround condition keeps its captures undoable":
     # ``(?(?!(x))...)`` deliberately preserves what the body captured when the
