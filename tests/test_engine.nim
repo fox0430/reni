@@ -4458,3 +4458,165 @@ suite "an alternation passes over branches whose first byte cannot match":
     check search("b", re("(?~|b)(?:|b|b)(?~|)\\z")).matchSpan == 0 .. 1
     # ``(?~)`` clears the limit the same way.
     check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 0 .. 1
+
+suite "a positive lookaround's captures are rolled back like any other":
+  # A positive lookaround keeps what its (zero-width) body captured.  Those
+  # captures are written inside a nested machine, which releases its own
+  # ``chUndoCapture`` entries on the way out, so unless the lookaround leaves
+  # a rollback of its own nothing ever takes them back: a repetition that
+  # backtracks past the lookaround reports a group the winning path never set,
+  # and a later ``(?(1)...)`` or backreference reads it.  Every case below is
+  # checked against PCRE2 and Python, which both leave the group unset.
+  test "a repetition backtracking past a lookahead unsets what it captured":
+    # ``(?:aa)*`` reaches pos 4, the lookahead takes its ``(x)`` branch there,
+    # then ``aax`` fails; the repetition drops to one rep and the continuation
+    # succeeds through the capture-free ``a`` branch.
+    let m = search("aaaax", re("(?:aa)*(?=(x)|a)aax"))
+    check m.matchSpan == 0 .. 5
+    check m.boundaries[1].a == -1
+    # Same shape with a body the compiler treats as a single-way leaf, which
+    # backtracks through ``chSimpleRepeat`` instead.
+    let s = search("aaaax", re("a*(?=(x)|a)aax"))
+    check s.matchSpan == 0 .. 5
+    check s.boundaries[1].a == -1
+    # ...and lazily, which re-enters from the other side.
+    let l = search("aaxxaay", re("^(?:..)*?(?=(x)|a)aay"))
+    check l.matchSpan == 0 .. 7
+    check l.boundaries[1].a == -1
+
+  test "a leaked lookahead capture would flip a conditional":
+    # Not cosmetic: with group 1 left set, ``(?(1)...)`` takes the ``b``
+    # branch on the retry and the whole match is lost.  A backreference reads
+    # it the same way.
+    check search("aaaax", re("^(?:aa)*(?(1)b|(?=(x)|a))aax")).matchSpan == 0 .. 5
+    check search("aaaax", re("^a*(?(1)b|(?=(x)|a))aax")).matchSpan == 0 .. 5
+
+  test "the same holds for every lookbehind shape that keeps captures":
+    # Fixed-length, non-leaf body.
+    let f = search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(xx)))aay"))
+    check f.matchSpan == 0 .. 7
+    check f.boundaries[1] == 2 .. 4
+    # Alternation, fixed alternative: retried through ``chLookbehindAlt``.
+    let a = search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(x)|a))aay"))
+    check a.matchSpan == 0 .. 7
+    check a.boundaries[1] == 3 .. 4
+    # Alternation, variable alternative: commits, so the entry it committed
+    # from has to become the rollback.
+    let v = search("aaaxaay", re("^(?:..)*(?(1)q|(?<=(a+x)|a))aay"))
+    check v.matchSpan == 0 .. 7
+    check v.boundaries[1] == 2 .. 4
+    # A lookbehind that never matches leaves nothing behind either.
+    check not search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(a)))aay")).found
+
+  test "a retried lookbehind alternative drops the previous one's captures":
+    # The first alternative matches and its ``(a)`` is kept, the continuation
+    # fails on the branch ``(?(2)...)`` chose for it, and the entry is
+    # re-entered for the second alternative.  Group 1 belongs to the
+    # alternative that was abandoned, so nothing downstream may still read
+    # it -- left set, it flips a ``(?(1)...)`` the same way a leaked
+    # lookahead capture does.  (Whether the assertion is retried at all is a
+    # separate question the oracles answer differently: both Oniguruma and
+    # PCRE2 read a lookbehind as atomic and report no match here.)
+    let r = search("ax", re(r"^.(?<=(a)|(\w))(?(2)x|q)"))
+    check r.found
+    check r.boundaries[1].a == -1
+    check r.boundaries[2] == 0 .. 1
+
+  test "a negative lookaround condition keeps its captures undoable":
+    # ``(?(?!(x))...)`` deliberately preserves what the body captured when the
+    # assertion fails, which needs the same rollback as the positive forms.
+    check search("xaay", re("^(?:.)*?(?(1)q|(?(?!(x))a|a))ay")).matchSpan == 0 .. 4
+    check search("xaay", re("^(?:.)*?(?(1)q|(?!(x))a)ay")).matchSpan == 0 .. 4
+
+  test "a pure lookaround body still costs no rollback":
+    # Nothing to undo, so the snapshot is dropped as before; these only pin
+    # that the gate did not change what they answer.
+    check search("aaaax", re("(?:aa)*(?=x|a)aax")).matchSpan == 0 .. 5
+    check search("aaxxaay", re("^(?:..)*(?<=x|a)aay")).matchSpan == 0 .. 7
+    check not search("aaaax", re("(?:aa)*(?=z)aax")).found
+
+  test "a retained snapshot is a whole capture vector, not one span":
+    # ``capSaves`` is a flat ``Span`` region, so keeping a snapshot alive has
+    # to retain ``captures.len`` entries.  Retaining one let the next push
+    # overwrite the rest, and the later rollback read a shifted vector: the
+    # groups below came back holding another attempt's spans.
+    let a = search("aaaax", re("^(?:aa)*(?=(x)|a)(?:(q)b)*aax"))
+    check a.matchSpan == 0 .. 5
+    check a.boundaries[1] == UnsetSpan
+    check a.boundaries[2] == UnsetSpan # ``(q)`` cannot match; "aaaax" has no q
+    # Same arithmetic on the variable-alternative lookbehind commit path.
+    let b = search("qzzaxz", re("^.*(?<=(a+x)|q)(?:(r)b)*zz"))
+    check b.matchSpan == 0 .. 3
+    check b.boundaries[1] == UnsetSpan # the ``q`` alternative is the one that ran
+    check b.boundaries[2] == UnsetSpan
+
+  test "a consuming condition's captures are undoable too":
+    # The general ``(?(...)...)`` branch kept what its condition captured but
+    # left it with no rollback entry, so a scalar-only rollback upstream --
+    # here a pure-bodied repetition -- could not take it back.
+    check search("abab", re("^(?:.)*(?(?=(a))a|b)(a)(?(1)a|b)")).matchSpan == 0 .. 4
+    let a = search("aaaax", re("^(?:(?:a))*(?(?=(x)|a)|q)(a).{1,2}"))
+    check a.matchSpan == 0 .. 5
+    check a.boundaries[1] == UnsetSpan
+    let b = search("aabbaab", re("^a{0,3}b?{1,2}(?(?=(a))a|b)(b)"))
+    check b.matchSpan == 0 .. 4
+    check b.boundaries[1] == UnsetSpan
+
+  test "a pure condition body still costs no rollback":
+    # The same gate ``keepLookCaptures`` has, on the condition that consumes:
+    # a body that writes nothing needs no entry, only its slot back.  These
+    # pin that adding the gate did not change what they answer.
+    let a = search("aabbaab", re("^a{0,3}b?{1,2}(?(?=a)a|b)(b)"))
+    check a.matchSpan == 0 .. 4
+    check a.boundaries[1] == 3 .. 4
+    # Under a pure-bodied repetition, so the rollback upstream is scalar-only
+    # -- the shape that made the unguarded path necessary in the first place.
+    let b = search("aaaax", re("^(?:(?:a))*(?(?=x|a)|q)(a).{1,2}"))
+    check b.matchSpan == 0 .. 5
+    check b.boundaries[1] == 3 .. 4
+    # A consuming condition, which advances ``pos`` past itself either way.
+    let c = search("aaab", re("^(?:a)*(?(a)a|q)(b)"))
+    check c.matchSpan == 0 .. 4
+    check c.boundaries[1] == 3 .. 4
+
+  test "a kept body's rollback reaches every group it wrote":
+    # Whether the entry carries the whole capture vector or just the groups
+    # the body changed is a size decision, and a wide vector takes the second
+    # path.  Both have to put back exactly what the body overwrote: these are
+    # the two tests above with enough spare groups to cross that line.
+    let a = search("aaaax", re("^(?:aa)*(?=(x)|a)(?:(q)b)*(?:(y))?(?:(z))?(?:(w))?aax"))
+    check a.matchSpan == 0 .. 5
+    for i in 1 .. 5:
+      check a.boundaries[i] == UnsetSpan
+    let b = search("qzzaxz", re("^.*(?<=(a+x)|q)(?:(r)b)*(?:(y))?(?:(z))?(?:(w))?zz"))
+    check b.matchSpan == 0 .. 3
+    for i in 1 .. 5:
+      check b.boundaries[i] == UnsetSpan
+
+suite "a zero-width repetition retries from its own choice point":
+  test "the continuation's position does not carry into the next attempt":
+    # ``(b{0,2})+`` matches empty, so the repetition is driven by
+    # ``chZeroWidthRep``: each retry re-runs the body to make it capture
+    # something new.  The retry has to start where the choice was made.  It
+    # used to start wherever the continuation had failed, which let the body
+    # match at a position the repetition never reached -- and then the
+    # continuation ran on from there, reporting a match that began before
+    # anything matched.
+    let a = search("aax", re("(b{0,2})+.x"))
+    check a.matchSpan == 1 .. 3
+    check a.boundaries[1] == 1 .. 1
+    let b = search("xaaxbax", re("(b{0,2})+[^bq]x"))
+    check b.matchSpan == 2 .. 4
+    check b.boundaries[1] == 2 .. 2
+    # A literal continuation took a different path and was always right; it
+    # is here so the two stay in step.
+    check search("aax", re("(b{0,2})+ax")).matchSpan == 1 .. 3
+
+  test "an exhausted zero-width repetition leaves no captures behind":
+    # Every attempt is rolled back when the construct gives up, so a pure
+    # repetition upstream -- which restores scalars only -- cannot inherit
+    # them.
+    check not search("aay", re("^(?:.)*(b{0,2})+x")).found
+    let m = search("aax", re("^(?:.)*?(b{0,2})+x"))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1] == 2 .. 2

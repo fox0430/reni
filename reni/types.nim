@@ -303,10 +303,18 @@ type
       lookBoundsFlags*: RegexFlags
       lookBoundsGm*: GraphemeMode
       lookBoundsValid*: bool
+      lookBodyPure*: bool
+        ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
+        ## has to leave a rollback behind for the captures a positive
+        ## lookaround keeps -- see ``keepLookCaptures``.
     of nkAtomicGroup:
       atomicBody*: Node
     of nkConditional:
       condKind*: ConditionalKind
+      condBodyPure*: bool
+        ## Same rule, covering ``condBody`` alone -- see ``condHolds``.  Kept
+        ## next to ``condKind`` so the two small fields share one padding slot;
+        ## on its own the node grows past 64 bytes.
       condRefIndex*: int ## capture index for ckBackref
       condRefName*: string ## capture name for ckNamedRef
       condYes*: Node ## yes branch

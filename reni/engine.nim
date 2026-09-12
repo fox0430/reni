@@ -17,6 +17,12 @@ type
     ## Index into ``MatchContext.frames`` identifying a continuation.
     ## ``TrueCont`` (-1) is the sentinel for "no further work, succeed".
 
+  CapOff = distinct int32
+    ## Where a capture snapshot's slot starts on ``MatchContext.capSaves``,
+    ## counted in ``Span`` elements.  A slot is ``ctx.captures.len`` elements
+    ## wide, not one; distinct so that ``off + 1`` does not compile and the
+    ## width stays inside ``releaseTo`` / ``retainSlot`` / ``capturesBackTo``.
+
   ContKind = enum
     ## Continuation kinds.  Each kind encodes a specific post-match
     ## action that closures used to perform via captured locals.
@@ -57,6 +63,11 @@ type
       qMinRep: int32
       qMaxRep: int32
       qCount: int32
+      qPure: bool
+        ## Mirror of the quantifier's ``quantBodyPure``: the repetition is
+        ## re-entered from this frame, with the node no longer in hand, so the
+        ## verdict travels along. Sits in ``qCount``'s padding, so ``Frame``
+        ## does not grow.
       qSavedPos: int
     of ckRestoreSubjectEnd:
       reSavedEnd: int
@@ -160,6 +171,15 @@ type
     capSaves: seq[Span] ## Capture vectors for live ``SavedState`` snapshots (bulk copy).
     capSavesPeak: int ## High-water mark of ``capSaves`` for the current search.
     capSavesHigh: int ## Highest peak seen since the buffer was last released.
+    capUndos: seq[CapUndo]
+      ## Pre-images for the groups a kept body actually wrote, for
+      ## ``chUndoSparse`` entries. LIFO with ``choices``; live length is
+      ## ``capUndosLen``, so release is a length store.
+    capUndosLen: int ## Live length of ``capUndos``.
+    capUndosPeak: int
+      ## High-water mark of ``capUndosLen``. Its own mark because one
+      ## ``chUndoSparse`` entry can push many groups.
+    capUndosHigh: int ## Highest peak seen since the buffer was last released.
     stackLensSaves: seq[seq[int]]
       ## ``captureStacks`` length snapshots for ``chLookbehindAlt`` entries.
     choicesPeak: int
@@ -172,6 +192,13 @@ type
     leadRunEnd: int
       ## End of ``leadRun``'s run at this start, or -1 if never reached.
       ## Valid only after a failed attempt.
+
+  CapUndo = object
+    ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
+    ## entries behind, so a caller that keeps what the body captured records
+    ## the changed groups instead of a whole vector -- see ``keepCaptures``.
+    cuIdx: int32
+    cuSpan: Span
 
   ScalarState = object
     ## Rollback snapshot without captures; for bodies that write none.
@@ -192,6 +219,7 @@ type
     chZeroWidthRep ## zero-width repetition: drive the body to change captures
     chSimpleRepeat ## greedy repetition of a single-way leaf: give one rep back
     chUndoState ## roll back to a snapshot, then keep failing
+    chUndoSparse ## roll back the scalars and only the groups a body wrote
     chUndoScalars ## roll back everything but the captures, then keep failing
     chUndoFlags ## put back the flags a group boundary restored
     chUndoFlagsGM ## put back the flags and grapheme mode a flag group restored
@@ -216,7 +244,7 @@ type
       aIdx: int32 ## next branch to try
       aCont: ContId
       aFramesLen: int32
-      aCapOff: int32
+      aCapOff: CapOff
       aPos: int
       aKeepStart: int
     of chLeafVariant:
@@ -233,7 +261,13 @@ type
       qcCont: ContId
       qcFramesLen: int32
       qcPhase: int32 ## lazy only: 0 = body not yet tried, 1 = exhausted
+      qcPure: bool
+        ## Body writes no captures (``Node.quantBodyPure``), so ``qcSaved``
+        ## holds scalars only and is rolled back with ``restoreScalars``.
       qcSaved: SavedState
+        ## Rollback point. ``capOff`` is ``NoCapOff`` when ``qcPure``, so a
+        ## stray ``restore`` fails loudly instead of copying a slice that was
+        ## never pushed.
     of chSimpleRepeat:
       srCont: ContId
       srFramesLen: int32
@@ -250,10 +284,25 @@ type
       zCont: ContId
       zFramesLen: int32
       zIter: int32 ## capture-changing attempts made so far
-      zSaved: SavedState ## the attempt behind the current captures
+      zSavedCap: CapOff
+        ## Slot of the attempt behind the current captures, released when the
+        ## next retry starts.  The offset alone: an attempt is snapshotted
+        ## straight after a rollback to ``zEntry``, so its scalars are
+        ## ``zEntry``'s, and a second ``SavedState`` would pad out every other
+        ## choice kind by 32 bytes.
+      zEntry: SavedState
+        ## State at the choice point, which every retry starts from: ``pos``
+        ## in between was moved by the continuation that failed back in.  Also
+        ## the rollback for the captures the attempts accumulated.
     of chUndoState:
       usFramesLen: int32
       usSaved: SavedState
+    of chUndoSparse:
+      upFramesLen: int32
+      upUndoOff: int32
+        ## Where this entry's run starts in ``MatchContext.capUndos``; popping
+        ## walks back to it.
+      upScalars: ScalarState
     of chUndoScalars:
       uzFramesLen: int32
       uzScalars: ScalarState
@@ -298,13 +347,15 @@ type
       ucoExisted: bool
 
   SavedState = object
-    ## Rollback snapshot.  ``capOff`` is the capture vector's offset on
+    ## Rollback snapshot.  ``capOff`` locates the capture vector's slot on
     ## ``MatchContext.capSaves``, so taking one is a bulk copy rather than an
     ## allocation.  Strictly LIFO: every ``save`` must release its slot before
-    ## returning, via ``restore``, ``restoreKeepingCaptures`` or ``drop``
-    ## (``rewind`` rolls back without releasing, to replay the snapshot).
+    ## returning, via ``restore``, ``keepCaptures`` or ``drop`` (``rewind``
+    ## rolls back without releasing, to replay the snapshot; a snapshot handed
+    ## to a choice entry is released when that entry pops).  ``NoCapOff`` means
+    ## the snapshot carries scalars only.
     scalars: ScalarState
-    capOff: int32
+    capOff: CapOff
 
 proc indexOfByte(s: string, start: int, b: uint8): int {.inline.} =
   ## Index of the first ``b`` at or after a non-negative ``start``, or -1.
@@ -413,6 +464,10 @@ const FramesKeep = 1600 ## ``frames`` entries kept between searches (~64 KB).
 
 const ChoicesKeep = 768 ## ``choices`` entries kept between searches (~66 KB).
 
+const CapUndosKeep = 2048
+  ## ``capUndos`` entries kept between searches (~48 KB). One entry per group
+  ## a kept body wrote, so it fills far more slowly than ``capSaves``.
+
 const RepPositionsKeep = 8192
   ## ``repPositions`` entries kept between searches (64 KB). Higher since one
   ## ``int`` per char of ``a*`` fills this buffer.
@@ -459,6 +514,17 @@ proc pushChoice(ctx: MatchContext, choice: sink Choice) {.inline.} =
   inc ctx.choicesLen
   if ctx.choicesLen > ctx.choicesPeak:
     ctx.choicesPeak = ctx.choicesLen
+
+proc pushCapUndo(ctx: MatchContext, idx: int32, span: Span) {.inline.} =
+  ## Record one group's pre-image, growing only when full.
+  if ctx.capUndosLen >= ctx.capUndos.len:
+    # Half again rather than double: a run is retained for as long as its
+    # entry lives, so the slack is paid for at the peak, not just held.
+    ctx.capUndos.setLen(max(16, ctx.capUndos.len + ctx.capUndos.len div 2))
+  ctx.capUndos[ctx.capUndosLen] = CapUndo(cuIdx: idx, cuSpan: span)
+  inc ctx.capUndosLen
+  if ctx.capUndosLen > ctx.capUndosPeak:
+    ctx.capUndosPeak = ctx.capUndosLen
 
 proc pushRepPos(ctx: MatchContext, p: int) {.inline.} =
   ## Record one repetition end; popping is a length store.
@@ -575,19 +641,48 @@ template copyCaptures(dst, src, n: untyped) =
   if n > 0:
     copyMem(addr dst, addr src, n * sizeof(Span))
 
-proc pushCaptures(ctx: MatchContext): int32 {.inline.} =
-  ## Copy ``ctx.captures`` onto the side stack and return its offset.
-  result = ctx.capSaves.len.int32
+proc `==`(a, b: CapOff): bool {.borrow.}
+proc `<`(a, b: CapOff): bool {.borrow.}
+
+const NoCapOff = CapOff(-1)
+  ## "This snapshot pushed no slot."  The ``doAssert``s below catch a use of
+  ## one; the bounds check cannot, since ``-d:danger`` removes it and a
+  ## ``copyMem`` from ``capSaves[-1]`` then corrupts the heap silently.
+
+proc capMark(ctx: MatchContext): CapOff {.inline.} =
+  ## The current top of ``capSaves``, for trimming back to later.
+  CapOff(ctx.capSaves.len)
+
+proc releaseTo(ctx: MatchContext, off: CapOff) {.inline.} =
+  ## Release ``off``'s slot and everything above it.
+  doAssert off != NoCapOff, "released a snapshot that pushed no slot"
+  ctx.capSaves.setLen(int(off))
+
+proc retainSlot(ctx: MatchContext, off: CapOff) {.inline.} =
+  ## Release everything above ``off``'s slot but keep the slot itself, so a
+  ## later rollback can still read it.  The one place that knows a slot is
+  ## ``captures.len`` elements wide rather than one.
+  doAssert off != NoCapOff, "retained a snapshot that pushed no slot"
+  ctx.capSaves.setLen(int(off) + ctx.captures.len)
+
+proc capturesBackTo(ctx: MatchContext, off: CapOff) {.inline.} =
+  ## Copy the slot at ``off`` back into ``ctx.captures``, leaving it in place.
+  doAssert off != NoCapOff, "restored a snapshot that pushed no slot"
+  copyCaptures(ctx.captures[0], ctx.capSaves[int(off)], ctx.captures.len)
+
+proc pushCaptures(ctx: MatchContext): CapOff {.inline.} =
+  ## Copy ``ctx.captures`` onto the side stack and return its slot offset.
+  result = capMark(ctx)
   let n = ctx.captures.len
   ctx.capSaves.setLen(int(result) + n)
   copyCaptures(ctx.capSaves[int(result)], ctx.captures[0], n)
   if ctx.capSaves.len > ctx.capSavesPeak:
     ctx.capSavesPeak = ctx.capSaves.len
 
-proc popCapturesTo(ctx: MatchContext, off: int32) {.inline.} =
-  ## Copy the slice at ``off`` back into ``ctx.captures`` and release it.
-  copyCaptures(ctx.captures[0], ctx.capSaves[int(off)], ctx.captures.len)
-  ctx.capSaves.setLen(off)
+proc popCapturesTo(ctx: MatchContext, off: CapOff) {.inline.} =
+  ## Copy the slot at ``off`` back into ``ctx.captures`` and release it.
+  capturesBackTo(ctx, off)
+  releaseTo(ctx, off)
 
 proc saveScalars(ctx: MatchContext): ScalarState {.inline.} =
   ## Snapshot everything but the capture vector.  Nothing is pushed onto
@@ -622,17 +717,64 @@ proc rewind(ctx: MatchContext, s: SavedState) {.inline.} =
   ## Roll back to ``s`` but keep its slot, so it can be replayed again.
   ## The caller is responsible for releasing the stack afterwards.
   restoreScalars(ctx, s.scalars)
-  copyCaptures(ctx.captures[0], ctx.capSaves[int(s.capOff)], ctx.captures.len)
-
-proc restoreKeepingCaptures(ctx: MatchContext, s: SavedState) {.inline.} =
-  ## Roll back everything except the capture vector.  Positive lookaround
-  ## and lookbehind keep what their (zero-width) body captured.
-  restoreScalars(ctx, s.scalars)
-  ctx.capSaves.setLen(s.capOff)
+  capturesBackTo(ctx, s.capOff)
 
 proc drop(ctx: MatchContext, s: SavedState) {.inline.} =
-  ## Release ``s``'s slot without rolling anything back.
-  ctx.capSaves.setLen(s.capOff)
+  ## Release ``s``'s slot without rolling anything back.  Only legal when the
+  ## body above it wrote no captures, or a retained snapshot below ``s``
+  ## already undoes them (as a ``chLookbehindAlt`` entry does).  Otherwise the
+  ## caller wants ``keepCaptures``.
+  releaseTo(ctx, s.capOff)
+
+proc keptCaptureChoice(ctx: MatchContext, s: SavedState, framesLen: int32): Choice =
+  ## Build the rollback a caller leaves behind for the captures a body wrote
+  ## above ``s``, consuming ``s``'s slot either way.  The caller pushes the
+  ## result, or writes it over an entry it already owns.  Every construct that
+  ## keeps captures past its own scope needs one: the nested machine released
+  ## its ``chUndoCapture`` entries on the way out, so without an entry here
+  ## the captures leak past the enclosing construct.
+  ##
+  ## Retaining the snapshot costs a ``Span`` per group in the pattern however
+  ## few the body touched; a run of changed groups costs a wider entry each
+  ## but only for those.  So count first and take the cheaper one, crossing
+  ## over at a third of the vector rather than the two thirds the sizes
+  ## suggest, since a run lives in a buffer that grows in steps.  The two are
+  ## equivalent: a write made after this entry carries its own undo, popped
+  ## first, so every group outside the run already holds the snapshot's value.
+  doAssert s.capOff != NoCapOff, "kept the captures of a snapshot that pushed no slot"
+  let n = ctx.captures.len
+  let base = int(s.capOff)
+  var changed = 0
+  for i in 0 ..< n:
+    if ctx.capSaves[base + i] != ctx.captures[i]:
+      inc changed
+  if changed * sizeof(CapUndo) * 2 >= n * sizeof(Span):
+    retainSlot(ctx, s.capOff)
+    return Choice(kind: chUndoState, usFramesLen: framesLen, usSaved: s)
+  let off = int32(ctx.capUndosLen)
+  for i in 0 ..< n:
+    if ctx.capSaves[base + i] != ctx.captures[i]:
+      pushCapUndo(ctx, int32(i), ctx.capSaves[base + i])
+  releaseTo(ctx, s.capOff)
+  Choice(
+    kind: chUndoSparse, upFramesLen: framesLen, upUndoOff: off, upScalars: s.scalars
+  )
+
+proc keepCaptures(ctx: MatchContext, s: SavedState) =
+  ## Commit to captures written above ``s``, leaving ``s`` behind as their
+  ## rollback in whichever shape ``keptCaptureChoice`` picks.
+  ctx.pushChoice keptCaptureChoice(ctx, s, ctx.framesLen.int32)
+
+proc keepLookCaptures(ctx: MatchContext, node: Node, s: SavedState) =
+  ## Finish a positive lookaround that matched: roll the scalars back to ``s``
+  ## and keep what the (zero-width) body captured.  A lookaround commits to
+  ## its first answer, so the entry only ever undoes; alternation lookbehind,
+  ## which does retry, keeps its own ``chLookbehindAlt`` snapshot instead.
+  restoreScalars(ctx, s.scalars)
+  if node.lookBodyPure:
+    releaseTo(ctx, s.capOff)
+  else:
+    keepCaptures(ctx, s)
 
 proc saveStackLens(ctx: MatchContext): seq[int] =
   ## Snapshot the per-group ``captureStacks[i].len`` so a lookaround body
@@ -1518,7 +1660,7 @@ proc lookbehindVarHolds(ctx: MatchContext, node: Node, bodyLen: LenBounds): bool
     let bodyMatch = matchWithCont(ctx, body, fid)
     ctx.framesLen = fid
     if bodyMatch:
-      restoreKeepingCaptures(ctx, saved)
+      keepLookCaptures(ctx, node, saved)
       restoreStackLens(ctx, stackSnap)
       return true
     restore(ctx, saved)
@@ -1604,6 +1746,13 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
   let node = ctx.choices[top].lbaNode
   let targetEnd = ctx.choices[top].lbaTarget
   var k = int(ctx.choices[top].lbaNext)
+  if k > 0 and k < node.lookBody.alternatives.len:
+    # Re-entered for the next alternative.  The one before it kept its
+    # captures on this entry's snapshot, and nothing else undoes them, so roll
+    # back before another alternative writes over them.  With no alternative
+    # left the exhaustion tail below does the same, so skip it here.
+    rewind(ctx, ctx.choices[top].lbaSaved)
+    restoreStackLens(ctx, @(ctx.stackLensSaves[int(ctx.choices[top].lbaLensOff)]))
   while k < node.lookBody.alternatives.len:
     let alt = node.lookBody.alternatives[k]
     let altLen = ctx.altBounds(node, k, alt)
@@ -1644,12 +1793,21 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
         let bodyMatch = matchWithCont(ctx, alt, fid)
         ctx.framesLen = fid
         if bodyMatch:
-          restoreKeepingCaptures(ctx, saved)
+          restoreScalars(ctx, saved.scalars)
           restoreStackLens(ctx, stackSnap)
-          # Commit with shortest priority; pop entry.
-          ctx.capSaves.setLen(ctx.choices[top].lbaSaved.capOff)
+          # Commit with shortest priority: the entry has no retry left, so
+          # its snapshot becomes the rollback for the captures kept here, as
+          # ``keepLookCaptures`` does for the non-alternation shapes.
+          let entrySaved = ctx.choices[top].lbaSaved
+          let entryFramesLen = ctx.choices[top].lbaFramesLen
           ctx.stackLensSaves.setLen(int(ctx.choices[top].lbaLensOff))
-          ctx.choicesLen = top
+          if node.lookBodyPure:
+            releaseTo(ctx, entrySaved.capOff)
+            ctx.choicesLen = top
+          else:
+            # What ``keepCaptures`` would push, written over the entry in
+            # place instead -- hence not going through that proc.
+            ctx.choices[top] = keptCaptureChoice(ctx, entrySaved, entryFramesLen)
           return laCommitted
         restore(ctx, saved)
         restoreStackLens(ctx, stackSnap)
@@ -1660,7 +1818,7 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
   # Exhausted: restore entry state and release slots.
   rewind(ctx, ctx.choices[top].lbaSaved)
   restoreStackLens(ctx, @(ctx.stackLensSaves[int(ctx.choices[top].lbaLensOff)]))
-  ctx.capSaves.setLen(ctx.choices[top].lbaSaved.capOff)
+  releaseTo(ctx, ctx.choices[top].lbaSaved.capOff)
   ctx.stackLensSaves.setLen(int(ctx.choices[top].lbaLensOff))
   ctx.choicesLen = top
   laExhausted
@@ -1824,18 +1982,28 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
         let bodyMatch = matchWithCont(ctx, node.condBody.lookBody, TrueCont)
         if bodyMatch:
           result = false # negative lookaround failed, preserve captures
-          restoreKeepingCaptures(ctx, saved)
+          keepLookCaptures(ctx, node.condBody, saved)
         else:
           result = true # negative lookaround succeeded
           restore(ctx, saved)
         restoreStackLens(ctx, stackSnap)
       else:
+        # Only the failure path trims the capture stacks: a consuming
+        # condition that holds is part of the match proper, so the levels it
+        # pushed stay readable through ``\k<n+1>``.  The zero-width shapes
+        # above restore unconditionally, since nothing of theirs survives.
         let stackSnap = saveStackLens(ctx)
         let saved = save(ctx)
         if matchWithCont(ctx, node.condBody, TrueCont):
-          # Condition matched -- pos is advanced past it
+          # Matched: ``pos`` stays advanced past the condition and what the
+          # body captured is kept, so those captures need a rollback of their
+          # own, as a lookaround's do.
           result = true
-          drop(ctx, saved)
+          if node.condBodyPure:
+            # Nothing written, so the snapshot only gives its slot back.
+            drop(ctx, saved)
+          else:
+            keepCaptures(ctx, saved)
         else:
           result = false
           restore(ctx, saved)
@@ -2099,7 +2267,8 @@ proc runMachine(
   checkNativeDepth(ctx)
 
   let framesBase = ctx.framesLen.int32
-  let capBase = ctx.capSaves.len.int32
+  let capBase = capMark(ctx)
+  let capUndoBase = ctx.capUndosLen
   let repBase = ctx.repLen
   let choiceBase = ctx.choicesLen
   let stackLensBase = ctx.stackLensSaves.len
@@ -2114,8 +2283,9 @@ proc runMachine(
     ## Trim stacks to entry lengths. ``capSaves`` is guarded since the common
     ## case pushed nothing and ``setLen`` walks destructors.
     ctx.framesLen = framesBase
-    if ctx.capSaves.len > capBase:
-      ctx.capSaves.setLen(capBase)
+    if capBase < capMark(ctx):
+      releaseTo(ctx, capBase)
+    ctx.capUndosLen = capUndoBase
     ctx.repLen = repBase
     ctx.choicesLen = choiceBase
     if ctx.stackLensSaves.len > stackLensBase:
@@ -2143,7 +2313,19 @@ proc runMachine(
       succeed()
     mode = mFail
 
-  template startGreedy(body: Node, minRep, maxRep, count: int32, c: ContId): untyped =
+  template quantSnapshot(pure: bool): SavedState =
+    ## Rollback point for a repetition.  A body that writes no captures needs
+    ## scalars only: continuation captures carry their own ``chUndoCapture``
+    ## entries, popped before this choice is reached -- the argument
+    ## ``chSimpleRepeat``'s ``srScalars`` already runs on.
+    if pure:
+      SavedState(scalars: saveScalars(ctx), capOff: NoCapOff)
+    else:
+      save(ctx)
+
+  template startGreedy(
+      body: Node, minRep, maxRep, count: int32, c: ContId, pure: bool
+  ): untyped =
     ## Greedy: try one more rep, leaving "stop and run cont" behind.
     ctx.pushChoice Choice(
       kind: chQuantGreedy,
@@ -2154,7 +2336,8 @@ proc runMachine(
       qcCont: c,
       qcFramesLen: ctx.framesLen.int32,
       qcPhase: 0,
-      qcSaved: save(ctx),
+      qcPure: pure,
+      qcSaved: quantSnapshot(pure),
     )
     if maxRep < 0 or count < maxRep:
       cont = pushFrame(
@@ -2166,6 +2349,7 @@ proc runMachine(
           qMinRep: minRep,
           qMaxRep: maxRep,
           qCount: count,
+          qPure: pure,
           qSavedPos: ctx.pos,
         ),
       )
@@ -2174,7 +2358,9 @@ proc runMachine(
     else:
       mode = mFail
 
-  template startLazy(body: Node, minRep, maxRep, count: int32, c: ContId): untyped =
+  template startLazy(
+      body: Node, minRep, maxRep, count: int32, c: ContId, pure: bool
+  ): untyped =
     ## Lazy: run cont first, leaving "repeat once more" behind.
     ctx.pushChoice Choice(
       kind: chQuantLazy,
@@ -2185,13 +2371,21 @@ proc runMachine(
       qcCont: c,
       qcFramesLen: ctx.framesLen.int32,
       qcPhase: 0,
-      qcSaved: save(ctx),
+      qcPure: pure,
+      qcSaved: quantSnapshot(pure),
     )
     if count >= minRep:
       cont = c
       mode = mCont
     else:
       mode = mFail
+
+  template rollBackQuant(top: int): untyped =
+    ## Undo a repetition's choice entry, snapshot-kind aware.
+    if ctx.choices[top].qcPure:
+      restoreScalars(ctx, ctx.choices[top].qcSaved.scalars)
+    else:
+      restore(ctx, ctx.choices[top].qcSaved)
 
   while true:
     case mode
@@ -2416,9 +2610,11 @@ proc runMachine(
               )
               mode = mCont
           else:
-            startGreedy(body, int32(qmin), int32(qmax), 0, cont)
+            startGreedy(body, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure)
         of qkLazy:
-          startLazy(node.quantBody, int32(qmin), int32(qmax), 0, cont)
+          startLazy(
+            node.quantBody, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure
+          )
         of qkPossessive:
           # Possessive: greedy with no count backtracking; only a rollback for
           # continuation failure. Pure bodies need scalars only.
@@ -2436,12 +2632,12 @@ proc runMachine(
               copyCaptures(ctx.capSaves[int(attemptOff)], ctx.captures[0], n)
               if not matchWithCont(ctx, body, TrueCont):
                 restoreScalars(ctx, attemptScalars)
-                copyCaptures(ctx.captures[0], ctx.capSaves[int(attemptOff)], n)
+                capturesBackTo(ctx, attemptOff)
                 break
               count += 1
               if ctx.pos == attemptScalars.pos:
                 break # zero-width: count as one rep, then stop
-            ctx.capSaves.setLen(attemptOff) # release the scratch slot
+            releaseTo(ctx, attemptOff) # release the scratch slot
             if count >= qmin:
               ctx.pushChoice Choice(
                 kind: chUndoState,
@@ -2494,7 +2690,7 @@ proc runMachine(
           let saved = save(ctx)
           if matchWithCont(ctx, node.lookBody, TrueCont):
             # Keep the captures the lookahead body made.
-            restoreKeepingCaptures(ctx, saved)
+            keepLookCaptures(ctx, node, saved)
             restoreStackLens(ctx, stackSnap)
             mode = mCont
           else:
@@ -2555,7 +2751,7 @@ proc runMachine(
             let bodyMatch = matchWithCont(ctx, node.lookBody, fid)
             ctx.framesLen = fid
             if bodyMatch:
-              restoreKeepingCaptures(ctx, saved)
+              keepLookCaptures(ctx, node, saved)
               restoreStackLens(ctx, stackSnap)
               mode = mCont
             else:
@@ -2887,7 +3083,8 @@ proc runMachine(
             zCont: ctx.frames[cont].parent,
             zFramesLen: ctx.framesLen.int32,
             zIter: 0,
-            zSaved: SavedState(),
+            zSavedCap: NoCapOff,
+            zEntry: save(ctx),
           )
           cont = ctx.frames[cont].parent
           mode = mCont
@@ -2897,10 +3094,11 @@ proc runMachine(
           let maxRep = ctx.frames[cont].qMaxRep
           let count = ctx.frames[cont].qCount + 1
           let parent = ctx.frames[cont].parent
+          let pure = ctx.frames[cont].qPure
           if isGreedy:
-            startGreedy(body, minRep, maxRep, count, parent)
+            startGreedy(body, minRep, maxRep, count, parent, pure)
           else:
-            startLazy(body, minRep, maxRep, count, parent)
+            startLazy(body, minRep, maxRep, count, parent, pure)
       of ckRestoreSubjectEnd:
         # Walking out of a marker: widen end, leaving an undo to re-narrow
         # when backtracking retries inside the narrowed region.
@@ -2958,16 +3156,14 @@ proc runMachine(
         # Snapshot survives until last branch; copy by hand, release at end.
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart
-        copyCaptures(
-          ctx.captures[0], ctx.capSaves[int(ctx.choices[top].aCapOff)], ctx.captures.len
-        )
+        capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         # Index in place to avoid copying the alternatives seq per backtrack.
         let idx = int(ctx.choices[top].aIdx)
         cont = ctx.choices[top].aCont
         node = ctx.choices[top].aNode.alternatives[idx]
         if idx + 1 >= ctx.choices[top].aNode.alternatives.len:
-          ctx.capSaves.setLen(ctx.choices[top].aCapOff)
+          releaseTo(ctx, ctx.choices[top].aCapOff)
           ctx.choicesLen = top
         else:
           ctx.choices[top].aIdx = int32(idx + 1)
@@ -2983,9 +3179,7 @@ proc runMachine(
         # old cost -- the case dispatch already had to happen.
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart
-        copyCaptures(
-          ctx.captures[0], ctx.capSaves[int(ctx.choices[top].aCapOff)], ctx.captures.len
-        )
+        capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         cont = ctx.choices[top].aCont
         let altNode = ctx.choices[top].aNode
@@ -3001,12 +3195,12 @@ proc runMachine(
         if nxt < 0:
           # No untried branch can start here: drop the choice and keep
           # failing, as ``chAlt`` does when its index runs out.
-          ctx.capSaves.setLen(ctx.choices[top].aCapOff)
+          releaseTo(ctx, ctx.choices[top].aCapOff)
           ctx.choicesLen = top
           mode = mFail
         else:
           if nxt + 1 >= altNode.alternatives.len:
-            ctx.capSaves.setLen(ctx.choices[top].aCapOff)
+            releaseTo(ctx, ctx.choices[top].aCapOff)
             ctx.choicesLen = top
           else:
             ctx.choices[top].aIdx = int32(nxt + 1)
@@ -3055,7 +3249,7 @@ proc runMachine(
           cont = ctx.choices[top].srCont
           mode = mCont
       of chQuantGreedy:
-        restore(ctx, ctx.choices[top].qcSaved)
+        rollBackQuant(top)
         ctx.framesLen = ctx.choices[top].qcFramesLen
         let count = ctx.choices[top].qcCount
         let minRep = ctx.choices[top].qcMinRep
@@ -3064,7 +3258,7 @@ proc runMachine(
         # Stop repeating, try continuation.
         mode = if count >= minRep: mCont else: mFail
       of chQuantLazy:
-        restore(ctx, ctx.choices[top].qcSaved)
+        rollBackQuant(top)
         ctx.framesLen = ctx.choices[top].qcFramesLen
         let body = ctx.choices[top].qcBody
         let minRep = ctx.choices[top].qcMinRep
@@ -3072,11 +3266,19 @@ proc runMachine(
         let count = ctx.choices[top].qcCount
         let parent = ctx.choices[top].qcCont
         let phase = ctx.choices[top].qcPhase
+        let pure = ctx.choices[top].qcPure
         ctx.choicesLen = top
         if phase == 0 and (maxRep < 0 or count < maxRep):
-          ctx.pushChoice Choice(
-            kind: chUndoState, usFramesLen: ctx.framesLen.int32, usSaved: save(ctx)
-          )
+          if pure:
+            ctx.pushChoice Choice(
+              kind: chUndoScalars,
+              uzFramesLen: ctx.framesLen.int32,
+              uzScalars: saveScalars(ctx),
+            )
+          else:
+            ctx.pushChoice Choice(
+              kind: chUndoState, usFramesLen: ctx.framesLen.int32, usSaved: save(ctx)
+            )
           cont = pushFrame(
             ctx,
             Frame(
@@ -3086,6 +3288,7 @@ proc runMachine(
               qMinRep: minRep,
               qMaxRep: maxRep,
               qCount: count,
+              qPure: pure,
               qSavedPos: ctx.pos,
             ),
           )
@@ -3097,25 +3300,44 @@ proc runMachine(
         ctx.framesLen = ctx.choices[top].zFramesLen
         if ctx.choices[top].zIter > 0:
           # Keep captures; each attempt builds on the previous one.
-          drop(ctx, ctx.choices[top].zSaved)
+          releaseTo(ctx, ctx.choices[top].zSavedCap)
+        # Back to the choice point: the continuation that just failed ran
+        # from here and left ``pos`` wherever it stopped.
+        restoreScalars(ctx, ctx.choices[top].zEntry.scalars)
         if ctx.choices[top].zIter >= ctx.captures.len.int32:
+          restore(ctx, ctx.choices[top].zEntry)
           ctx.choicesLen = top
           mode = mFail
         else:
-          let s2 = save(ctx)
+          # A mark, not a snapshot: the attempt runs on ``zEntry``'s scalars
+          # (just restored) and ``zEntry`` rolls back everything it writes.
+          # Only where ``capSaves`` stood is needed, to trim back to next round.
+          let attemptPos = ctx.pos
+          let attemptCap = capMark(ctx)
           if not tryCaptureChangingMatch(ctx, ctx.choices[top].zBody) or
-              ctx.pos != s2.pos:
-            restore(ctx, s2)
+              ctx.pos != attemptPos:
+            restore(ctx, ctx.choices[top].zEntry)
             ctx.choicesLen = top
             mode = mFail
           else:
             ctx.choices[top].zIter += 1
-            ctx.choices[top].zSaved = s2
+            ctx.choices[top].zSavedCap = attemptCap
             cont = ctx.choices[top].zCont
             mode = mCont
       of chUndoState:
         restore(ctx, ctx.choices[top].usSaved)
         ctx.framesLen = ctx.choices[top].usFramesLen
+        ctx.choicesLen = top
+        mode = mFail
+      of chUndoSparse:
+        restoreScalars(ctx, ctx.choices[top].upScalars)
+        let undoOff = int(ctx.choices[top].upUndoOff)
+        var i = ctx.capUndosLen
+        while i > undoOff:
+          dec i
+          ctx.captures[int(ctx.capUndos[i].cuIdx)] = ctx.capUndos[i].cuSpan
+        ctx.capUndosLen = undoOff
+        ctx.framesLen = ctx.choices[top].upFramesLen
         ctx.choicesLen = top
         mode = mFail
       of chUndoScalars:
@@ -3265,13 +3487,15 @@ proc scratchCaps*(ctx: MatchContext): tuple[frames, choices, repPositions: int] 
 
 proc noteScratchUsage(ctx: MatchContext) =
   ## Release oversized scratch buffers after several small searches in a row.
-  ## ``choicesPeak`` stands in for frames/capSaves (they grow together);
-  ## ``repPeak`` has its own mark since simple repeats push no choices.
+  ## ``choicesPeak`` stands in for frames (they grow together); ``repPeak``,
+  ## ``capSavesPeak`` and ``capUndosPeak`` have their own marks, since a
+  ## simple repeat pushes no choice and a wide snapshot pushes only one.
   ## Also resets live lengths left behind by ``RegexLimitError``.
   if ctx.capSavesPeak > CapSavesKeep or ctx.choicesPeak > ChoicesKeep or
-      ctx.repPeak > RepPositionsKeep:
+      ctx.repPeak > RepPositionsKeep or ctx.capUndosPeak > CapUndosKeep:
     ctx.scratchQuiet = 0
     ctx.capSavesHigh = max(ctx.capSavesHigh, ctx.capSavesPeak)
+    ctx.capUndosHigh = max(ctx.capUndosHigh, ctx.capUndosPeak)
   else:
     inc ctx.scratchQuiet
     if ctx.scratchQuiet >= ScratchQuietRuns:
@@ -3284,11 +3508,16 @@ proc noteScratchUsage(ctx: MatchContext) =
       if ctx.choices.len > ChoicesKeep:
         ctx.choices = newSeq[Choice](ChoicesKeep)
         ctx.choicesLen = 0
+      if ctx.capUndosHigh > CapUndosKeep:
+        ctx.capUndos = newSeq[CapUndo](CapUndosKeep)
+        ctx.capUndosLen = 0
+        ctx.capUndosHigh = 0
       if ctx.repPositions.len > RepPositionsKeep:
         ctx.repPositions = newSeq[int](RepPositionsKeep)
         ctx.repLen = 0
       ctx.scratchQuiet = 0
   ctx.capSavesPeak = 0
+  ctx.capUndosPeak = 0
   ctx.choicesPeak = 0
   ctx.repPeak = 0
 
@@ -3317,6 +3546,7 @@ proc resetForRegex(
   ctx.callDepth = 0
   ctx.chainDepth = 0
   ctx.choicesLen = 0
+  ctx.capUndosLen = 0
   ctx.stackBase = currentStackAddr()
   noteScratchUsage(ctx)
   let capCount = regex[].captureCount
@@ -3343,6 +3573,7 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.callDepth = 0
   ctx.chainDepth = 0
   ctx.choicesLen = 0
+  ctx.capUndosLen = 0
   ctx.stackBase = currentStackAddr()
   ctx.framesLen = 0
   ctx.repLen = 0
