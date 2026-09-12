@@ -46,21 +46,29 @@ const TimeCol = 11
 #
 # One loop shape per engine, mirroring reni's `findAll`: search from `pos`,
 # record the match, advance to the match end (one code point on a zero-width
-# match), repeat.  The `collect*` variants exist for the pre-timing agreement
-# check; the `count*` variants are what gets timed.
+# match), repeat.  reni's own loops run on `MatchScanner`, which is what
+# `findAll` runs on; the foreign engines hand back an ovector, which reports
+# what the attempt consumed, and `advanceOvector` below is the whole cursor
+# rule such a match needs.  It is the deprecated `advanceAfterMatch` of the
+# public API, kept here because here it is the right rule.  The `collect*` variants exist for the
+# pre-timing agreement check; the `count*` variants are what gets timed.
+
+proc advanceOvector(subject: string, mStart, mEnd: int): int {.inline.} =
+  ## Next search position after a match that reported what it consumed.
+  ## A zero-width match steps one code point, or ends the scan at the end.
+  if mEnd == mStart:
+    if mStart < subject.len:
+      nextRunePos(subject, mStart)
+    else:
+      -1
+  else:
+    mEnd
 
 proc collectReni(ctx: MatchContext, subject: string, regex: Regex): seq[Span] =
-  var pos = 0
+  var sc = initMatchScanner(subject)
   var m: Match
-  while pos <= subject.len:
-    discard searchIntoCtx(ctx, subject, regex, m, start = pos)
-    if not m.found:
-      break
+  while scanNext(sc, ctx, subject, regex, m):
     result.add (m.boundaries[0].a, m.boundaries[0].b)
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
-    if nextPos < 0:
-      break
-    pos = nextPos
 
 proc collectOnig(
     reg: onig.OnigRegex, subject: string, region: ptr onig.OnigRegion
@@ -72,7 +80,7 @@ proc collectOnig(
     let mStart = region.beg[0].int
     let mEnd = region.ends[0].int
     result.add (mStart, mEnd)
-    let nextPos = advanceAfterMatch(subject, reni.Span(a: mStart, b: mEnd))
+    let nextPos = advanceOvector(subject, mStart, mEnd)
     if nextPos < 0:
       break
     pos = nextPos
@@ -88,23 +96,16 @@ proc collectPcre2(
     let mStart = ov[0].int
     let mEnd = ov[1].int
     result.add (mStart, mEnd)
-    let nextPos = advanceAfterMatch(subject, reni.Span(a: mStart, b: mEnd))
+    let nextPos = advanceOvector(subject, mStart, mEnd)
     if nextPos < 0:
       break
     pos = nextPos
 
 proc countReni(ctx: MatchContext, subject: string, regex: Regex): int =
-  var pos = 0
+  var sc = initMatchScanner(subject)
   var m: Match
-  while pos <= subject.len:
-    discard searchIntoCtx(ctx, subject, regex, m, start = pos)
-    if not m.found:
-      break
+  while scanNext(sc, ctx, subject, regex, m):
     inc result
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
-    if nextPos < 0:
-      break
-    pos = nextPos
 
 proc countOnig(reg: onig.OnigRegex, subject: string, region: ptr onig.OnigRegion): int =
   var pos = 0
@@ -112,8 +113,7 @@ proc countOnig(reg: onig.OnigRegex, subject: string, region: ptr onig.OnigRegion
     if onig.search(reg, subject, region, pos) < 0:
       break
     inc result
-    let nextPos =
-      advanceAfterMatch(subject, reni.Span(a: region.beg[0].int, b: region.ends[0].int))
+    let nextPos = advanceOvector(subject, region.beg[0].int, region.ends[0].int)
     if nextPos < 0:
       break
     pos = nextPos
@@ -126,9 +126,8 @@ proc countPcre2(
     if pcre2.match(code, subject, data, pos) <= 0:
       break
     inc result
-    let nextPos = advanceAfterMatch(
-      subject, reni.Span(a: pcre2.ovector(data)[0].int, b: pcre2.ovector(data)[1].int)
-    )
+    let nextPos =
+      advanceOvector(subject, pcre2.ovector(data)[0].int, pcre2.ovector(data)[1].int)
     if nextPos < 0:
       break
     pos = nextPos

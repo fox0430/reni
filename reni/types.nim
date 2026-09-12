@@ -690,6 +690,16 @@ type
   Match* = object
     found*: bool
     boundaries*: seq[Span]
+    startChar*: int
+      ## Subject offset the successful attempt started at; -1 when the engine
+      ## reports no match.  ``boundaries[0]`` is what the match *reports*, and
+      ## ``\K`` moves that start either way -- inside a lookbehind even behind
+      ## the scan position -- so it cannot also serve as scan progress.  This is
+      ## what the attempt consumed from, and a scanning loop steps on it
+      ## instead: over a forward scan it never moves backwards (a backward
+      ## search writes its own decreasing start here, and is not a scan a loop
+      ## steps through).  PCRE2 splits the two the same way, as ``ovector[0]``
+      ## and ``pcre2_get_startchar``.
 
 const DefaultStepLimit* = 1_000_000
 const DefaultMaxRecursionDepth* = 50
