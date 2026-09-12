@@ -16,19 +16,12 @@ import ../reni
 import bench_common
 
 proc countMatches(ctx: MatchContext, subject: string, regex: Regex): int =
-  ## Reproduce findAll semantics directly on top of searchIntoCtx so the
+  ## Reproduce findAll semantics directly on top of its scanner so the
   ## benchmark stresses the matcher, not the iterator wrapper.
-  var pos = 0
+  var sc = initMatchScanner(subject)
   var m: Match
-  while pos <= subject.len:
-    discard searchIntoCtx(ctx, subject, regex, m, start = pos)
-    if not m.found:
-      break
+  while scanNext(sc, ctx, subject, regex, m):
     inc result
-    let nextPos = advanceAfterMatch(subject, m.boundaries[0])
-    if nextPos < 0:
-      break
-    pos = nextPos
 
 proc bench(lineCount: int, warmup, iters: int, markdown: bool) =
   let corpora = subjects(lineCount)
