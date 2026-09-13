@@ -32,6 +32,10 @@
 ## the way reni does.  So a divergence whose differing spans are empty on one
 ## side, or end at the same offset, is reported, not failed.
 ##
+## The split is not confined to the group it happens in: a backreference
+## consumes what the losing iteration left there, so the match span moves with
+## it.  ``onlyIterationSplitSpans`` excuses that on a narrower tell.
+##
 ## Patterns come from a small grammar weighted towards the constructs that
 ## stress rollback: captures inside quantified groups, lookarounds that keep
 ## what they captured, conditionals, atomic groups, backreferences, and ``\K``
@@ -386,18 +390,27 @@ else:
     ##   engines share.
     ##
     ## A wrong rollback moves a span somewhere else entirely -- a stale start
-    ## *and* a stale end -- which neither tell covers.  A differing match span
-    ## -- index 0 -- is never excused.
+    ## *and* a stale end -- which neither tell covers.
+    ##
+    ## The match span -- index 0 -- is excused on the same two tells, except
+    ## that it takes *both* spans empty rather than one.  The split reaches it
+    ## through a backreference, which consumes what the losing iteration left:
+    ## on ``(.*?){0,2}a\1`` against "bab" the empty final iteration ends the
+    ## match at 2 and the iteration before it at 3.  ``\K`` moves the start the
+    ## same way.  But one side empty would excuse an empty match standing
+    ## against a span of any length, which is what a rollback bug looks like;
+    ## needing both also keeps "matched" against "did not match" failing, since
+    ## those two answers differ in length.
     if a.len != b.len or a.len == 0:
       return false
-    if a[0] != b[0]:
-      return false
-    for i in 1 ..< a.len:
+    for i in 0 ..< a.len:
       if a[i] == b[i]:
         continue
-      let emptySide = a[i][0] == a[i][1] or b[i][0] == b[i][1]
+      let aEmpty = a[i][0] == a[i][1]
+      let bEmpty = b[i][0] == b[i][1]
+      let empty = if i == 0: aEmpty and bEmpty else: aEmpty or bEmpty
       let sameEnd = a[i][1] == b[i][1]
-      if not (emptySide or sameEnd):
+      if not (empty or sameEnd):
         return false
     true
 
