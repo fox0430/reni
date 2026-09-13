@@ -134,14 +134,21 @@ What bounds the *work* a match may do is `stepLimit`, described above.
 Debug builds may additionally stop at Nim's call-depth limit before reaching
 the byte budget.
 
-## Internal API notice
+## What `import reni` gives you
 
-`Regex.ast`, the `Node` type, and `NodeKind` are exposed by the library but
-they are **internal implementation details**. They are re-exported so that
-tests inside this repository can inspect parsed trees. User code should not
-depend on them, and they may be removed or restricted in a future release.
-Use `captureText`, `captureSpan`, `captureIndex`, `captureCount`,
-`namedCaptures`, and `pattern` instead.
+The package module exports the matching API and the few types it speaks in,
+and nothing else. The full list is in the [generated
+docs](https://fox0430.github.io/reni/reni.html);
+`tests/test_public_api.nim` names every entry through `import reni` alone --
+the ones it does not call, it touches for their mere existence -- so an entry
+that stops being exported fails a test.
+
+Everything else in `reni/` is the parser's and the matcher's own: the `Node`
+tree and its kinds, the character-class tables, the compiler's analyses. Those
+are reachable by importing a submodule such as `reni/types` directly, which is
+how this repository's own parser and engine tests inspect a compiled tree.
+They carry no compatibility promise and change whenever the implementation
+does -- a submodule import is the point at which you take that on.
 
 ## Documentation
 

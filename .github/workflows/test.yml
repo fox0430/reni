@@ -99,15 +99,13 @@ jobs:
         # so the stacks' freedom from borrows and the ``Node`` size
         # ``types.nim`` pins are only checked by a build like this one.
         #
-        # The files are named rather than run through ``nimble test`` to keep
-        # ``test_fuzz_oniguruma`` out: it needs the Oniguruma oracle the
-        # differential job installs. Debug build: ``-d:release`` changes
-        # neither thing this job watches and costs ~15 min on ``test_engine``.
-        run: |
-          for t in test_engine test_parser test_oniguruma test_pcre2 \
-                   test_posix_props test_stack_budget test_unicode_data; do
-            nim c -r --mm:refc "tests/$t.nim"
-          done
+        # ``nimble test`` rather than a list of files, so a test added later
+        # is covered too. ``test_fuzz_oniguruma`` needs no exception: without
+        # ``-d:reniFuzzDiff`` it compiles to a notice and links against no
+        # oracle, which is how the ``orc`` job already runs it. Debug build:
+        # ``-d:release`` changes neither thing this job watches and costs
+        # ~15 min on ``test_engine``.
+        run: nimble test -y --mm:refc
 
   tests-small-budget:
     runs-on: ubuntu-latest
