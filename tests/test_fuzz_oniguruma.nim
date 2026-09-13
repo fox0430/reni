@@ -408,7 +408,11 @@ else:
         continue
       let aEmpty = a[i][0] == a[i][1]
       let bEmpty = b[i][0] == b[i][1]
-      let empty = if i == 0: aEmpty and bEmpty else: aEmpty or bEmpty
+      let empty =
+        if i == 0:
+          aEmpty and bEmpty
+        else:
+          aEmpty or bEmpty
       let sameEnd = a[i][1] == b[i][1]
       if not (empty or sameEnd):
         return false
