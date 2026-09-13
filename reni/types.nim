@@ -767,6 +767,9 @@ type
     leadRun: Node
       ## Leading greedy unbounded repeat over a one-way leaf, or nil. A failed
       ## run rules out starts inside it, so the scan jumps to its end.
+    leadLeaf: Node
+      ## Leaf every match starts with, or nil. Tested before entering the
+      ## matcher, so a refusal costs one character test, not a full attempt.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -878,6 +881,10 @@ proc levelBackrefs*(r: Regex): bool {.inline.} =
 proc leadRun*(r: Regex): lent Node {.inline.} =
   ## Leading repeat whose run a failed attempt may skip, or nil.
   r.leadRun
+
+proc leadLeaf*(r: Regex): lent Node {.inline.} =
+  ## Leaf the first character of every match must match, or nil.
+  r.leadLeaf
 
 proc span*(a, b: int): Span {.inline.} =
   Span(a: a, b: b)
@@ -1033,6 +1040,7 @@ proc initRegex*(
     semiEndDMax: int = -1,
     levelBackrefs: bool = true,
     leadRun: Node = nil,
+    leadLeaf: Node = nil,
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1059,6 +1067,7 @@ proc initRegex*(
     semiEndDMax: semiEndDMax,
     levelBackrefs: levelBackrefs,
     leadRun: leadRun,
+    leadLeaf: leadLeaf,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =
@@ -1198,9 +1207,10 @@ proc isMultiCharFoldPairStart*(r1, r2: Rune): bool =
       return true
   false
 
-const WidestUsefulHint = 200
-  ## Above this many bytes a hint skips too little to pay for the test it
-  ## costs at every position, so the scan is better off with no prefilter.
+const WidestUsefulHint = 255
+  ## Above this many bytes a hint skips too little to pay for its per-position
+  ## test. Only the full set is excluded: one load and bit test per byte is
+  ## still cheaper than the walk it saves on rejected bytes.
 
 proc byteSetInfo(bs: set[uint8]): FirstCharInfo =
   if bs.card == 0:
@@ -1422,6 +1432,18 @@ type FirstCharCache* = TableRef[(uint, RegexFlags), FirstCharInfo]
   ## -- asks about overlapping subtrees: without the memo a chain of nested
   ## alternations re-walks everything below it once per level.
 
+proc isInvertedRange*(quantMin, quantMax: int): bool {.inline.} =
+  ## Whether ``{quantMin,quantMax}`` is inverted (bounded ``m < n``). Swapped
+  ## at match time; readers must use [effectiveQuantBounds] instead.
+  quantMax >= 0 and quantMin > quantMax
+
+proc effectiveQuantBounds*(quantMin, quantMax: int): tuple[lo, hi: int] {.inline.} =
+  ## Bounds after the inverted-range swap (``{2,0}`` like ``{0,2}``).
+  if isInvertedRange(quantMin, quantMax):
+    (quantMax, quantMin)
+  else:
+    (quantMin, quantMax)
+
 proc extractFirstCharUncached(
   node: Node, flags: RegexFlags, cache: FirstCharCache
 ): FirstCharInfo
@@ -1512,7 +1534,7 @@ proc extractFirstCharUncached(
     else:
       FirstCharInfo(kind: fcNone)
   of nkQuantifier:
-    if node.quantMin >= 1 and (node.quantMax < 0 or node.quantMax >= node.quantMin):
+    if node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax):
       extractFirstChar(node.quantBody, flags, cache)
     else:
       FirstCharInfo(kind: fcNone)
@@ -1563,9 +1585,9 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
     else:
       false
   of nkQuantifier:
-    # An optional prefix leaves the literal no longer first, and Oniguruma
-    # does not reach past it either.
-    node.quantMin >= 1 and hasLiteralPrefix(node.quantBody, flags)
+    # An optional prefix is no prefix; an inverted range counts as optional.
+    node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax) and
+      hasLiteralPrefix(node.quantBody, flags)
   of nkConcat:
     var currentFlags = flags
     for child in node.children:
@@ -1643,7 +1665,8 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
     else:
       RequiredByteInfo(valid: false)
   of nkQuantifier:
-    if node.quantMin >= 1:
+    # Inverted range: the effective minimum is ``quantMax``.
+    if node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax):
       extractRequiredByte(node.quantBody, flags)
     else:
       RequiredByteInfo(valid: false)
@@ -1789,14 +1812,16 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     LenBounds(maxLen: best, fixedLen: fixed)
   of nkQuantifier:
     let bb = lengthBounds(node.quantBody, flags, gm)
+    # Inverted range: use the swapped bounds.
+    let (qlo, qhi) = effectiveQuantBounds(node.quantMin, node.quantMax)
     var total = -1
-    if node.quantMax >= 0 and bb.maxLen >= 0:
-      if node.quantMax == 0 or bb.maxLen <= int.high div node.quantMax:
-        total = bb.maxLen * node.quantMax
+    if qhi >= 0 and bb.maxLen >= 0:
+      if qhi == 0 or bb.maxLen <= int.high div qhi:
+        total = bb.maxLen * qhi
     var fixed = -1
-    if node.quantMin == node.quantMax and node.quantMin >= 0 and bb.fixedLen >= 0:
-      if node.quantMin == 0 or bb.fixedLen <= int.high div node.quantMin:
-        fixed = bb.fixedLen * node.quantMin
+    if qlo == qhi and qlo >= 0 and bb.fixedLen >= 0:
+      if qlo == 0 or bb.fixedLen <= int.high div qlo:
+        fixed = bb.fixedLen * qlo
     LenBounds(maxLen: total, fixedLen: fixed)
   of nkCapture:
     lengthBounds(node.captureBody, flags, gm)

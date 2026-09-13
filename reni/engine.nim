@@ -195,6 +195,21 @@ type
     leadRunEnd: int
       ## End of ``leadRun``'s run at this start, or -1 if never reached.
       ## Valid only after a failed attempt.
+    leadLeaf: NodeId
+      ## Cached ``Regex.leadLeaf`` as an index, or ``NoNodeId``. Tested before
+      ## each attempt unless the counters below turn it off.
+    leadLeafFor: pointer
+      ## The ``Regex.ast`` the counters belong to. Identity-compared, never
+      ## dereferenced; a recycled address only mistunes the prefilter.
+    leadLeafTried: int32
+      ## Positions answered and refusals for ``leadLeafFor``. Outlives one
+      ## search since a ``findAll`` loop pays the cost a few positions at a time.
+    leadLeafSkips: int32
+    leadLeafOff: bool
+      ## Whether the counters turned the prefilter off. Retried after
+      ## ``leadLeafCool`` positions: a refusing-nothing prefix says nothing
+      ## about what follows.
+    leadLeafCool: int32 ## Positions left before retrying an off prefilter.
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -1423,6 +1438,32 @@ proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inli
     classAdvance(ctx, node, variant)
   else:
     -1
+
+const LeadLeafTrial = 32'i32 ## Positions answered before reading the refusal rate.
+
+const LeadLeafPayoff = 8'i32
+  ## Minimum refusal rate to stay on: one in eight. A refusal saves a whole
+  ## attempt, worth well over eight character tests.
+
+const LeadLeafRetry = 4096'i32 ## Positions an off prefilter sits out before retry.
+
+const LeadLeafCapacity = 256'i32
+  ## Counter ceiling: both counters halve here, keeping the recent ratio
+  ## without reaching the int32 limit.
+
+proc leadLeafMatches(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## Whether the leading leaf matches at ``ctx.pos``. One character test, no
+  ## writes. Only single-way leaves qualify, so one variant decides; for a
+  ## class that is the plain match, not variant 0 (a fold).
+  case node.kind
+  of nkLiteral, nkEscapedLiteral:
+    leafVariantAdvance(ctx, node, 0) >= 0
+  of nkCharClass:
+    leafVariantAdvance(ctx, node, classFirstVariant(ctx, node)) >= 0
+  of nkCharType:
+    charTypeAdvance(ctx, node.charType) >= 0
+  else:
+    raiseAssert "leadLeaf is not a leaf kind"
 
 proc isLeafLookbehindBody(node: Node): bool {.inline.} =
   ## Whether a lookbehind body is a single leaf, and so answerable in place by
@@ -3604,6 +3645,18 @@ proc resetForRegex(
   ctx.regex = regex
   ctx.trackCaptureStacks = regex[].levelBackrefs
   ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
+  # Keyed on the owned tree, not on ``regex``: the caller passes its own
+  # parameter address, one stack slot shared by every pattern.
+  let leadLeafFor = cast[pointer](regex[].ast)
+  if ctx.leadLeafFor != leadLeafFor:
+    ctx.leadLeafFor = leadLeafFor
+    ctx.leadLeafTried = 0
+    ctx.leadLeafSkips = 0
+    ctx.leadLeafOff = false
+    ctx.leadLeafCool = 0
+  # Only single-way leaves qualify; pin the compile-time guarantee.
+  assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
+  ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
@@ -3689,6 +3742,14 @@ proc writeNotFound(m: var Match) {.inline.} =
   m.startChar = -1
   m.boundaries.setLen(0)
 
+proc releaseBorrowed(ctx: MatchContext) {.inline.} =
+  ## Clear borrowed refs so stale reads fail loudly. Indices need clearing too;
+  ## frame buffers hold plain data only.
+  ctx.regex = nil
+  ctx.subject = Subject(data: nil, size: 0)
+  ctx.leadRun = NoNodeId
+  ctx.leadLeaf = NoNodeId
+
 proc searchImplInto*(
     ctx: MatchContext,
     subject: string,
@@ -3701,14 +3762,8 @@ proc searchImplInto*(
   ## In-place variant of ``searchImpl``: writes into ``m``, reusing
   ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
   ## ``ctx`` must be caller-owned and single-threaded.
-  # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences.  ``leadRun`` indexes a table this no longer
-  # reaches, so it is cleared too.  The frame and backtrack buffers need no
-  # clearing: a stale slot holds indices and scalars only.
   defer:
-    ctx.regex = nil
-    ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = NoNodeId
+    releaseBorrowed(ctx)
   let findLongest = rfFindLongest in regex.flags
   if findLongest:
     ctx.flBestLen = -1
@@ -3735,8 +3790,12 @@ proc searchImplInto*(
     # ``onig_search`` resolves the anchors in one if/else chain, and ``\A``
     # wins over ``\Z``: an anchored pattern is only ever tried at ``start``.
     startPos = semiEndScanStart(subject, regex, start)
-  # ``exhausted`` means the walk has no candidate left.
+  # ``exhausted`` means no candidate is left. ``leadLeafNode`` is resolved once:
+  # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
+  let leadLeafNode = nodeAt(ctx, ctx.leadLeaf)
+  # Set once an attempt may have moved the leaf test's inputs.
+  var prefilterDirty = false
   while true:
     if startPos > subject.len:
       exhausted = true
@@ -3798,26 +3857,63 @@ proc searchImplInto*(
     if exhausted:
       break
 
-    resetForPosition(ctx, startPos, start)
+    # Leading-leaf prefilter: a refused position cannot match. Restores the
+    # ``flags``/``subjectEnd`` the test reads, which an attempt may have moved,
+    # and clears ``leadRunEnd`` the way ``resetForPosition`` does.
+    var prefiltered = false
+    if leadLeafNode != nil:
+      if ctx.leadLeafOff:
+        dec ctx.leadLeafCool
+        if ctx.leadLeafCool <= 0:
+          ctx.leadLeafOff = false
+          ctx.leadLeafTried = 0
+          ctx.leadLeafSkips = 0
+      else:
+        if prefilterDirty:
+          ctx.flags = regex.flags
+          ctx.subjectEnd = subject.len
+          prefilterDirty = false
+        ctx.pos = startPos
+        ctx.leadRunEnd = -1
+        prefiltered = not leadLeafMatches(ctx, leadLeafNode)
+        # Adaptive off switch: an accepted position costs a second character
+        # test the matcher repeats anyway, so stay on well past break-even.
+        # Halve (not reset) at capacity: keeps the recent ratio, bounds both
+        # counters, and covers the refuses-everything case, which never
+        # reaches the off check below.
+        if ctx.leadLeafTried >= LeadLeafCapacity:
+          ctx.leadLeafTried = ctx.leadLeafTried shr 1
+          ctx.leadLeafSkips = ctx.leadLeafSkips shr 1
+        inc ctx.leadLeafTried
+        if prefiltered:
+          inc ctx.leadLeafSkips
+        elif ctx.leadLeafTried >= LeadLeafTrial and
+            ctx.leadLeafSkips * LeadLeafPayoff < ctx.leadLeafTried:
+          ctx.leadLeafOff = true
+          ctx.leadLeafCool = LeadLeafRetry
 
-    if findLongest:
-      # Find longest: try all match alternatives at this position.  The
-      # ckFindLongestRec frame mutates ``ctx.flBestMatch`` whenever a
-      # longer match is found and returns false to force backtracking.
-      let fid = pushFrame(
-        ctx, Frame(kind: ckFindLongestRec, parent: TrueCont, flStartPos: startPos)
-      )
-      discard matchWithCont(ctx, regex.ast, fid)
-      ctx.framesLen = fid
-    else:
-      if matchNode(ctx, regex.ast):
-        ctx.capturesDirty = true
-        ctx.captures[0] = span(startPos, ctx.pos)
-        if ctx.keepStart != startPos:
-          ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
-        # Copy into m so that ctx.captures stays usable across calls.
-        writeFoundCopy(m, ctx.captures, startPos)
-        return
+    if not prefiltered:
+      resetForPosition(ctx, startPos, start)
+      prefilterDirty = true
+
+      if findLongest:
+        # Find longest: try all match alternatives at this position.  The
+        # ckFindLongestRec frame mutates ``ctx.flBestMatch`` whenever a
+        # longer match is found and returns false to force backtracking.
+        let fid = pushFrame(
+          ctx, Frame(kind: ckFindLongestRec, parent: TrueCont, flStartPos: startPos)
+        )
+        discard matchWithCont(ctx, regex.ast, fid)
+        ctx.framesLen = fid
+      else:
+        if matchNode(ctx, regex.ast):
+          ctx.capturesDirty = true
+          ctx.captures[0] = span(startPos, ctx.pos)
+          if ctx.keepStart != startPos:
+            ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
+          # Copy into m so that ctx.captures stays usable across calls.
+          writeFoundCopy(m, ctx.captures, startPos)
+          return
 
     # Advance to the next candidate start position.  Neither a plain
     # continuation-byte test nor the declared length is right alone — the
@@ -3826,9 +3922,9 @@ proc searchImplInto*(
     if startPos >= subject.len:
       break
     if not byteScan and ctx.leadRunEnd > startPos + 1:
-      # Failed attempt already refuted the continuation at every position the
-      # skipped starts would retry, so jump to the run end. Byte scan
-      # excluded: it may land mid-character.
+      # A failed attempt refuted the continuation at every skipped start, so
+      # jump to the run end. Byte scan excluded: it may land mid-character.
+      # Prefiltered positions never reach this (their branch clears the end).
       startPos = ctx.leadRunEnd
     else:
       startPos =
@@ -3870,13 +3966,8 @@ proc searchBackwardImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
-  # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences.  ``leadRun`` indexes a table this no longer
-  # reaches, so it is cleared too.
   defer:
-    ctx.regex = nil
-    ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = NoNodeId
+    releaseBorrowed(ctx)
   writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
@@ -3989,13 +4080,8 @@ proc matchAtImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ) =
   ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
-  # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences.  ``leadRun`` indexes a table this no longer
-  # reaches, so it is cleared too.
   defer:
-    ctx.regex = nil
-    ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = NoNodeId
+    releaseBorrowed(ctx)
   writeNotFound(m)
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)

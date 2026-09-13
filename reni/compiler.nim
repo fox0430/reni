@@ -205,7 +205,10 @@ proc canMatchEmpty(node: Node): bool =
         return true
     false
   of nkQuantifier:
-    node.quantMin == 0 or canMatchEmpty(node.quantBody)
+    # Inverted range behaves swapped (``{2,0}`` like ``{0,2}``): use the
+    # effective minimum.
+    effectiveQuantBounds(node.quantMin, node.quantMax).lo == 0 or
+      canMatchEmpty(node.quantBody)
   of nkCapture:
     canMatchEmpty(node.captureBody)
   of nkNamedCapture:
@@ -292,9 +295,8 @@ proc hasRecursiveCycle(
   of nkAtomicGroup:
     hasRecursiveCycle(startIdx, node.atomicBody, bodies, namedCaptures, visiting)
   of nkQuantifier:
-    # Optional quantifiers (min == 0) can always skip the body, so they never
-    # force recursion. Required reps propagate whatever the body does.
-    if node.quantMin == 0:
+    # Effective min == 0 skips the body and never forces recursion.
+    if effectiveQuantBounds(node.quantMin, node.quantMax).lo == 0:
       false
     else:
       hasRecursiveCycle(startIdx, node.quantBody, bodies, namedCaptures, visiting)
@@ -808,6 +810,51 @@ proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
   else:
     false
 
+proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
+  ## Leaf every match must start with, or nil. The scan tests it at each
+  ## candidate start, so a refusal costs one character test, not a full
+  ## attempt. Only mandatory first leaves qualify: quantifiers with min >= 1,
+  ## no case folding, and no exact ASCII leaf (already covered by
+  ## ``firstCharInfo``).
+  if node == nil:
+    return nil
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return nil
+  case node.kind
+  of nkConcat:
+    # Zero-width nodes consume nothing; look past them.
+    for child in node.children:
+      case child.kind
+      of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+        continue
+      else:
+        return leadFirstLeaf(child, flags)
+    nil
+  of nkCapture:
+    leadFirstLeaf(node.captureBody, flags)
+  of nkNamedCapture:
+    leadFirstLeaf(node.namedCaptureBody, flags)
+  of nkGroup:
+    leadFirstLeaf(node.groupBody, flags)
+  of nkAtomicGroup:
+    leadFirstLeaf(node.atomicBody, flags)
+  of nkQuantifier:
+    # Inverted range proves nothing about the first character.
+    if isInvertedRange(node.quantMin, node.quantMax):
+      return nil
+    if node.quantMin >= 1:
+      leadFirstLeaf(node.quantBody, flags)
+    else:
+      nil
+  of nkLiteral, nkEscapedLiteral, nkCharClass:
+    var s: set[uint8]
+    if exactAsciiLeaf(node, s): nil else: node
+  of nkCharType:
+    # Variable-width types are no single character test.
+    if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+  else:
+    nil
+
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
   ## Unbounded greedy repeat over a one-way leaf every match must start
   ## inside, or nil. The run must be unbounded: a bounded one reaches further
@@ -862,10 +909,9 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
         return nil
       else:
         discard
-    # Mandatory repeat: its body must match at the start, so look through to
-    # the body's run. Possessive is atomic, and inverted ``{n,m}`` is
-    # normalised to possessive, so both are left out.
-    if node.quantMax >= 0 and node.quantMin > node.quantMax:
+    # Mandatory repeat looks through to the body's run. Possessive and
+    # inverted ranges are normalised to possessive, so both are left out.
+    if isInvertedRange(node.quantMin, node.quantMax):
       return nil
     if node.quantMin >= 1 and node.quantKind in {qkGreedy, qkLazy}:
       return leadSimpleRepeat(body, flags)
@@ -1010,4 +1056,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       else:
         let q = leadSimpleRepeat(ast, finalFlags)
         if q != nil and leadRunSkipSafe(ast): q else: nil,
+    leadLeaf = leadFirstLeaf(ast, finalFlags),
   )

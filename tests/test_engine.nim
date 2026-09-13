@@ -405,6 +405,19 @@ suite "Step 4: Alternation and quantifiers":
     check m.boundaries[0].a == 0
     check m.boundaries[0].b == 0
 
+  test "inverted range {2,0} requires nothing":
+    # The bounds swap leaves ``{0,2}``, so ``x`` need not appear: the
+    # required-byte quick reject must not treat it as mandatory.
+    let m = search("y", re("x{2,0}y"))
+    check m.found
+    check m.matchSpan == 0 .. 1
+    let m2 = search("zy", re("x{2,0}y"))
+    check m2.found
+    check m2.matchSpan == 1 .. 2
+    let m3 = search("", re("x{2,0}"))
+    check m3.found
+    check m3.matchSpan == 0 .. 0
+
   test "scoped flag group with alternation and continuation":
     # (?i:a|ab)c on "ABc" — case insensitive body, case sensitive continuation
     let m = search("ABc", re("(?i:a|ab)c"))
@@ -2840,6 +2853,22 @@ suite "Mutual recursion detection":
     let r = re("(?<a>(?&b)?x)(?<b>(?&a)?y)")
     check r.captureCount == 2
 
+  test "self-recursion under an inverted range is valid":
+    # ``{2,0}`` behaves like ``{0,2}``, so the body may be skipped and the
+    # call is not forced without consuming input.
+    let r = re("(?<a>(?&a){2,0})")
+    check r.captureCount == 1
+
+  test "recursion after an inverted range is detected":
+    # ``b{2,0}`` can match empty, so the call is reachable without consuming
+    # input.
+    expect RegexError:
+      discard re("(?<a>b{2,0}(?&a))")
+
+  test "recursion after an inverted range is detected before a consumer":
+    expect RegexError:
+      discard re("(?<a>b{2,0}(?&a)c)")
+
   test "recursion behind a conditional with no else branch detected":
     # /(?(<a>)x)/ matches empty when the condition is false, so \g<a> is
     # reachable without consuming input.  Oniguruma rejects this pattern with
@@ -3687,6 +3716,10 @@ suite "the hints and the scans agree by construction":
     # see ``hintless``).
     "a|\xC3\xA9|1",
     "\\d|\\s|[^a]",
+    # Inverted ``{n,m}`` swaps its bounds, so the body is optional and no
+    # leaf in front of it may be read as leading or as a literal prefix.
+    "\xC3\xA9{2,0}",
+    "[^a]{2,0}",
   ]
 
   const Anchors = ["", "\\z", "\\Z", "$", "^", "\\b", "\\B", "(?m)^", "(?m)$", "\\A"]
@@ -4977,3 +5010,138 @@ suite "a name reference resolves to every group that declares it":
     check search("aa", first).matchSpan == 0 .. 2
     check search("cc", second).matchSpan == 0 .. 2
     check search("aa", first).matchSpan == 0 .. 2
+
+suite "the leading-leaf prefilter refuses only what no match can start with":
+  # The scan tests the pattern's leading leaf at a candidate position and
+  # skips the position outright when it fails.  These pin what may be read as
+  # "leading" -- the shapes where a leaf looks required but is not are the
+  # ones a wrong prefilter answers "no match" on.
+
+  proc leadLeafOf(pattern: string, flags: RegexFlags = {}): bool =
+    re(pattern, flags).leadLeaf != nil
+
+  test "a leading repeat that may run zero times requires nothing":
+    # ``\s`` refuses ``a``, so a prefilter that looked through the ``*``
+    # would skip the only position this matches at.
+    check not leadLeafOf("\\s*abc")
+    check not leadLeafOf("\\d*x")
+    check not leadLeafOf("[^q]{0,3}q")
+    check search("abc", re("\\s*abc")).matchSpan == 0 .. 3
+    check search("x", re("\\d*x")).matchSpan == 0 .. 1
+    check search("q", re("[^q]{0,3}q")).matchSpan == 0 .. 1
+    # ``{2,0}`` swaps to ``{0,2}``, so the body may not appear and the leaf
+    # behind it is what the first character must match.  The bodies here are
+    # non-ASCII or a class, which the walker would otherwise admit as the
+    # leading leaf; an ASCII body would be refused by the exact-ASCII rule
+    # for the wrong reason and hide the guard.
+    check not leadLeafOf("漢{2,0}字")
+    check not leadLeafOf("\\d{2,0}x")
+    check not leadLeafOf("[^a]{2,0}")
+    check search("字", re("漢{2,0}字")).matchSpan == 0 .. 3
+    check search("x", re("\\d{2,0}x")).matchSpan == 0 .. 1
+    check search("b", re("[^a]{2,0}")).matchSpan == 0 .. 1
+    # The literal scan must not reach past an optional body either: a byte
+    # scan would visit positions the character walk (and Oniguruma) does not.
+    check not re("x{2,0}y").literalScan
+    # ``é{2,0}`` is ``é{0,2}``, so the ``\Z`` window must reach back two é
+    # widths; a maximum read off ``quantMax`` would start the scan at the end
+    # and lose the match at the front.
+    check search("é", re("é{2,0}\\Z")).matchSpan == 0 .. 2
+    check search("aé", re("é{2,0}\\Z")).matchSpan == 1 .. 3
+    check search("éé", re("é{2,0}\\Z")).matchSpan == 0 .. 4
+
+  test "a leading repeat that must run once still admits the leaf":
+    check leadLeafOf("\\s+abc")
+    check search("  abc", re("\\s+abc")).matchSpan == 0 .. 5
+    check not search("abc", re("\\s+abc")).found
+
+  test "a folded leading literal is not refused by one variant":
+    # ``ß`` matches ``ss`` under ``(?i)`` through a multi-character fold, so
+    # the plain compare the prefilter would make is not the whole answer.
+    check search("ss", re("(?i)ß")).matchSpan == 0 .. 2
+    check search("K", re("(?i)k")).matchSpan == 0 .. 1
+    # The guard has to catch the flag spelled as an argument too, not only an
+    # inline ``(?i)``, which the parser wraps in a flag group the walker
+    # cannot see through.  ``[ß]`` also matches plain ``ß``, so one variant
+    # is never the whole answer.
+    check not leadLeafOf("ß", {rfIgnoreCase})
+    check not leadLeafOf("[ß]", {rfIgnoreCase})
+    check search("ss", re("ß", {rfIgnoreCase})).matchSpan == 0 .. 2
+    check search("ß", re("[ß]", {rfIgnoreCase})).matchSpan == 0 .. 2
+    check search("ss", re("[ß]", {rfIgnoreCase})).matchSpan == 0 .. 2
+
+  test "a prefiltered scan still finds a match further along":
+    # Every skipped position here is one the first-byte hint admits: the
+    # kana and the kanji share a lead byte.
+    check search("かな漢字です", re("\\p{Han}+")).matchSpan == 6 .. 12
+    check search("   x  ", re("[^ \\n]+")).matchSpan == 3 .. 4
+
+  test "a non-ASCII leading literal is refused by the prefilter itself":
+    # A single non-ASCII rune stays an ``nkLiteral`` (a longer run parses as
+    # ``nkString`` and gets no prefilter), so this is the shape that reaches
+    # the literal arm.  ``え`` shares its lead byte with ``あ``: the
+    # first-byte hint admits position 0 and only the leaf test skips it.
+    check leadLeafOf("あ")
+    check search("えあ", re("あ")).matchSpan == 3 .. 6
+
+  test "a zero-width prefix still admits the leaf behind it":
+    # ``^``, ``\b``, a lookaround and an atomic group consume nothing, so the
+    # first consumed character is the one the prefilter must test.
+    check search("x\n漢字", re("^\\p{Han}+")).matchSpan == 2 .. 8
+    check search("  abc", re("\\b\\S+")).matchSpan == 2 .. 5
+    check search(" 漢字", re("(?<!\\w)\\p{Han}+")).matchSpan == 1 .. 7
+    check search("a漢字", re("(?>\\p{Han}+)")).matchSpan == 1 .. 7
+
+  test "the prefilter turning itself off does not change the answers":
+    # A leaf that accepts nearly every position saves nothing, and the scan
+    # stops testing it after a trial run.  The answers either side of that
+    # switch must be the same, so this crosses it: the trial is 32 positions
+    # and these subjects hold many times that.
+    var words: seq[string]
+    for i in 0 ..< 60:
+      words.add "alpha beta gamma delta"
+    let subject = words.join(" ")
+    var wordRuns = 0
+    for m in findAll(subject, re("\\w+")):
+      inc wordRuns
+    check wordRuns == 240
+    var nonSpaceRuns = 0
+    for m in findAll(subject, re("[^ \\n]+")):
+      inc nonSpaceRuns
+    check nonSpaceRuns == 240
+
+  test "an off prefilter is retried later in the subject":
+    # The first matches accept the leaf at every candidate; the long kana
+    # tail refuses every one.  A verdict kept for the life of the context
+    # must not change the answers, and the trial must come back for the tail.
+    let subject = "12 ".repeat(40) & "か".repeat(300_000)
+    var runs = 0
+    for m in findAll(subject, re("\\d+")):
+      inc runs
+    check runs == 40
+    # The counters outlive a single search, so a ``findAll`` over many short
+    # runs crosses ``LeadLeafCapacity`` repeatedly while every position of
+    # the kana prefix is refused.  Each match still has to come back.
+    let runs2 = ("か".repeat(1000) & "漢, ").repeat(300)
+    var han = 0
+    for m in findAll(runs2, re("\\p{Han}+")):
+      inc han
+      check captureText(m, 0, runs2).get("") == "漢"
+    check han == 300
+
+  test "a prefiltered scan agrees under findLongest":
+    # The prefilter guards both the normal and the longest paths, so a shape
+    # the first-byte hint admits but only the leaf test skips must answer the
+    # same either way. The kana and the kanji share a lead byte here. The
+    # flags-argument spelling keeps the leaf (the inline ``(?L)`` wraps the
+    # body in a flag group the walker does not see through, so it stays off
+    # there -- same answers, just no prefilter).
+    check leadLeafOf("\\p{Han}+", {rfFindLongest})
+    check search("かな漢字です", re("\\p{Han}+")).matchSpan == 6 .. 12
+    check search("かな漢字です", re("\\p{Han}+", {rfFindLongest})).matchSpan ==
+      6 .. 12
+    check search("かな漢字です", re("(?L)\\p{Han}+")).matchSpan == 6 .. 12
+    check leadLeafOf("あ", {rfFindLongest})
+    check search("えあ", re("あ")).matchSpan == 3 .. 6
+    check search("えあ", re("あ", {rfFindLongest})).matchSpan == 3 .. 6
+    check search("えあ", re("(?L)あ")).matchSpan == 3 .. 6

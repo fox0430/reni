@@ -102,6 +102,7 @@ suite "the internals are not part of that API":
     check not compiles(r.nodes)
     check not compiles(r.groupBodies)
     check not compiles(r.leadRun)
+    check not compiles(r.leadLeaf)
     check not compiles(r.groupFlags)
 
   test "the compiled flags cannot be changed from outside":
