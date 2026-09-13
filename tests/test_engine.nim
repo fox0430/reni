@@ -2,6 +2,7 @@ import std/[unittest, strutils, options, unicode]
 
 import ../reni
 import ../reni/engine
+import ../reni/types
 import ../reni/unicode_utils
 
 suite "Step 1: Literal matching":

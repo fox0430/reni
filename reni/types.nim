@@ -426,6 +426,14 @@ when sizeof(pointer) == 8 and not defined(nimdoc):
       "Node grew to " & $sizeof(typeof(default(Node)[])) & " bytes, expected " &
         $expectedNodeSize & "; see the note here"
 
+# ``reni.nim`` re-exports ``==`` and ``$`` from this module by name, and a
+# name carries all of its overloads. An operator declared here for an internal
+# type therefore lands in the package's public symbol set; it stays unusable
+# from outside only for as long as ``reni.nim`` does not re-export the type it
+# takes -- [NameRefs] and [NodeId] are exported here, as their accessors need,
+# but not from there. Declare one for a re-exported type only when it is meant
+# to be part of that API.
+
 proc `==`*(a, b: NameRefs): bool {.borrow.}
   ## **Internal API.** Two offsets naming the same run.  Only equality is
   ## borrowed: the arithmetic that walks a run belongs to [nameRefsOf].
@@ -727,7 +735,9 @@ type
       ## ``nil``.  The matcher's stacks name a node by its index here rather
       ## than holding it, which is what keeps those entries plain data.  Built
       ## by ``initRegex``, so a ``Regex`` cannot exist with the two out of step.
-    flags*: RegexFlags
+    flags: RegexFlags
+      ## The flags the pattern was compiled under.  Read through the `flags`
+      ## accessor, which carries the reason this is not a public field.
     captureCount: int
     namedCaptures: seq[(string, int)]
     nameRefs: seq[int32]
@@ -736,7 +746,7 @@ type
       ## holds its own run's offset (see [NameRefs]), so resolving
       ## ``\k<name>`` is a load, not a walk of ``namedCaptures``.
     groupBodies: seq[Node]
-    groupFlags*: seq[RegexFlags] ## flags active when each group was defined
+    groupFlags: seq[RegexFlags] ## flags active when each group was defined
     firstCharInfo: FirstCharInfo
     literalScan: bool
     requiredByte: RequiredByteInfo
@@ -784,6 +794,14 @@ const UnsetSpan* = Span(a: -1, b: -1)
 proc pattern*(r: Regex): lent string {.inline.} =
   r.pattern
 
+proc flags*(r: Regex): RegexFlags {.inline.} =
+  ## The flags the pattern was compiled under.  Readable but not writable:
+  ## ``firstCharInfo``, ``literalScan``, ``requiredByte``, ``semiEndDMax`` and
+  ## the lookaround annotations are all derived from these at compile time, so
+  ## a ``Regex`` whose flags were changed afterwards would report one thing and
+  ## match under another.  Compile a second ``Regex`` instead.
+  r.flags
+
 proc nodes*(r: Regex): lent seq[Node] {.inline.} =
   ## **Internal API.** The node table [NodeId]s index; see ``Regex.nodes``.
   r.nodes
@@ -809,10 +827,9 @@ iterator nameRefsOf*(r: Regex, refs: NameRefs): int32 =
     yield r.nameRefs[refs.int + k]
 
 proc ast*(r: Regex): lent Node {.inline.} =
-  ## **Internal API.** Returns the compiled AST root, for this repository's
-  ## parser/engine tests only — it WILL be removed or restricted. Use the
-  ## documented API (``captureText``, ``captureSpan``, ``captureIndex``,
-  ## ``captureCount``, ``namedCaptures``, ``pattern``) instead.
+  ## **Internal API.** The compiled AST root, for the compiler, the matcher
+  ## and this repository's tests. Not reachable through ``import reni``, and
+  ## the shape of the tree changes without notice.
   r.ast
 
 proc captureCount*(r: Regex): int {.inline.} =
@@ -823,6 +840,14 @@ proc namedCaptures*(r: Regex): lent seq[(string, int)] {.inline.} =
 
 proc groupBodies*(r: Regex): lent seq[Node] {.inline.} =
   r.groupBodies
+
+proc groupFlags*(r: Regex): lent seq[RegexFlags] {.inline.} =
+  ## **Internal API.** The flags each capture group was defined under. A
+  ## call into a group (``\g<n>``, recursion) restores them, so the body
+  ## matches under the modifiers it was written with rather than the caller's.
+  ## Read-only: emptying the seq left the matcher's bounds check to skip the
+  ## restore, silently matching the body under the caller's flags.
+  r.groupFlags
 
 proc firstCharInfo*(r: Regex): FirstCharInfo {.inline.} =
   r.firstCharInfo

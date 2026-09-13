@@ -1,5 +1,6 @@
 import std/[unittest, unicode]
 import reni
+import reni/types
 import reni/unicode_utils
 
 suite "POSIX property Oniguruma alignment":
