@@ -118,7 +118,11 @@ jobs:
         run: nim c -r --exceptions:setjmp --stacktrace:off tests/test_stack_budget.nim
 
   differential-fuzz:
-    runs-on: ubuntu-latest
+    # Pinned, not ``ubuntu-latest``: this is the only job whose result depends
+    # on a system library's behaviour rather than just its presence, and an
+    # image migration that carries a newer Oniguruma would move the oracle
+    # out from under a corpus the seed below holds still.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -147,9 +151,13 @@ jobs:
       - name: Install Oniguruma and PCRE2
         # The only job that links either: the differential test needs both as
         # oracles, and the rest of tests/ is pure Nim over ported JSON corpora.
+        # The versions go in the log because a divergence this job reports is
+        # only as pinned as the oracle that answered: if the image ever moves
+        # them, the run that first disagreed says which ones it had.
         run: |
           sudo apt-get update
           sudo apt-get install -y libonig-dev libpcre2-dev
+          dpkg-query -W -f '${Package} ${Version}\n' libonig-dev libpcre2-dev
 
       - name: Compare against Oniguruma on generated patterns
         # The conformance corpora pin the semantics that somebody wrote down.
@@ -161,15 +169,15 @@ jobs:
         # the oracles do not share.
         #
         # The seed is the file's default, spelled out here so that widening
-        # the sweep is a visible edit rather than a silent one.  It does not
-        # pin the corpus, though: the patterns come out of ``std/random``,
-        # and the Nim above is deliberately left at ``stable`` so this job
-        # keeps testing the compiler everyone actually gets.  A Nim bump can
-        # therefore re-roll the sweep onto shapes this seed never reached --
-        # only the default seed is known clean, and the test file names the
-        # divergences other seeds still hit.  If this job goes red right
-        # after a toolchain bump, read the reported divergence before
-        # suspecting the change under test.
+        # the sweep is a visible edit rather than a silent one.  It pins the
+        # corpus: the generator draws from a PRNG the test file carries, not
+        # from ``std/random``, so the Nim above can stay at ``stable`` -- this
+        # job keeps testing the compiler everyone actually gets without a
+        # release re-rolling the sweep onto shapes this seed was never
+        # measured on.  What it does not pin is the answers: those come from
+        # the oracles the image installs, which is why the image is pinned
+        # too.  Only the default seed is known clean; the test file names the
+        # divergences other seeds still hit.
         env:
           RENI_FUZZ_SEED: '20260912'
         run: nim c -r -d:release -d:reniFuzzDiff tests/test_fuzz_oniguruma.nim

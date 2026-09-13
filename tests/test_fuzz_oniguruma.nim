@@ -32,6 +32,10 @@
 ## the way reni does.  So a divergence whose differing spans are empty on one
 ## side, or end at the same offset, is reported, not failed.
 ##
+## The split is not confined to the group it happens in: a backreference
+## consumes what the losing iteration left there, so the match span moves with
+## it.  ``onlyIterationSplitSpans`` excuses that on a narrower tell.
+##
 ## Patterns come from a small grammar weighted towards the constructs that
 ## stress rollback: captures inside quantified groups, lookarounds that keep
 ## what they captured, conditionals, atomic groups, backreferences, and ``\K``
@@ -55,24 +59,44 @@
 ## it prints -- a reduced test case as it stands, since the generator keeps
 ## patterns short on purpose.
 ##
-## The default seed is clean; other seeds are not, which is why the CI job
-## spells the seed out (see ``.github/workflows/test.yml``).  That job tracks
-## Nim ``stable`` rather than a pinned version, so a toolchain bump re-rolls
-## ``std/random`` and with it the corpus this seed generates: a run that goes
-## red straight after one is as likely to have reached an open shape below as
-## to have found something new.  At least two shapes are open, both of
-## them older than this file:
+## The corpus is a function of the seed alone: the generator draws from the
+## ``Rand`` defined below, not from ``std/random``, so the seed the CI job
+## spells out (see ``.github/workflows/test.yml``) names the same patterns on
+## every toolchain.  That is the point of carrying a PRNG here -- the job runs
+## on Nim ``stable`` deliberately, and a corpus that moves with the compiler
+## would turn a required job red on a release with no change under test.
+##
+## The default seed is clean; other seeds are not.  At least four shapes are
+## open, all of them older than this file.  A seed named beside a shape is a
+## sweep that prints an instance of it under the corpus described above; where
+## the quoted pattern is not the one that sweep prints, it is a hand-reduced
+## case that still diverges on its own.
 ##
 ## * an atomic group over a possessive body, where reni gives up a match the
 ##   other two engines find -- ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on
-##   "abqq" answers 0..1 here and 0..4 there
-##   (``RENI_FUZZ_SEED=424242 RENI_FUZZ_SEEDS=24``);
+##   "abqq" answers 0..1 here and 0..4 there; ``RENI_FUZZ_SEED=424242
+##   RENI_FUZZ_SEEDS=24`` reaches the shape as
+##   ``b((([ab])a*+|a*?)(\3.*?(?>ab*q)|a\w(?>x\w++x))*?|a*?\2\w+){0,2}a`` on
+##   "bxbaba", 2..4 here and 0..6 there;
 ## * a conditional or backreference naming a group that the repetition around
 ##   it writes, where reni matches and both oracles do not -- the generator
 ##   avoids this deliberately (see ``Gen.closed``) but a nested quantifier can
-##   still reach it (``RENI_FUZZ_SEED=99991 RENI_FUZZ_SEEDS=24``;
-##   ``RENI_FUZZ_SEED=20250101 RENI_FUZZ_SEEDS=24`` reaches it through a
-##   conditional instead).
+##   still reach it (``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax", from
+##   ``RENI_FUZZ_SEED=20250101 RENI_FUZZ_SEEDS=24``);
+## * the same disagreement with the backreference standing *after* the
+##   repetition that writes the group rather than inside it -- the case
+##   ``Gen.closed`` permits on purpose -- ``(a{0,2}+.*(?:a*?){0,2})*\1a`` on
+##   "aqbbxqx" answers 0..1 here and no match there (the 20250101 sweep
+##   prints this one too);
+## * an alternation lookbehind, which reni retries once the continuation after
+##   it fails where both oracles read the assertion as atomic --
+##   ``(?>baa|b(?<=b|(.))\1)`` on "bbabaa" answers 0..2 here and 3..6 there
+##   (printed by the 20250101 sweep as well; ``RENI_FUZZ_SEED=99991
+##   RENI_FUZZ_SEEDS=24`` reaches the shape as ``((?<=a|(.))\2{0,2}+\w)\2b``
+##   on "aaab", 1..4 here and no match there).
+##
+## So a red run is not automatically a new bug: read the divergence it prints
+## against the four above before suspecting the change under test.
 
 ## Building this links against Oniguruma and PCRE2, which the rest of
 ## ``tests/`` does not, so it is opt-in: without ``-d:reniFuzzDiff`` the file
@@ -87,7 +111,7 @@
 when not defined(reniFuzzDiff):
   echo "test_fuzz_oniguruma: skipped (build with -d:reniFuzzDiff)"
 else:
-  import std/[os, random, strformat, strutils, unittest]
+  import std/[os, strformat, strutils, unittest]
 
   import ../reni
   import ../bench/onig
@@ -98,6 +122,50 @@ else:
     MaxSubjectLen = 7
     DefaultIters = 100_000 ## per seed
     DefaultSeeds = 8
+
+  type Rand = object
+    ## A self-contained SplitMix64, so that ``RENI_FUZZ_SEED`` alone
+    ## determines the corpus.  ``std/random`` generates the same shapes, but
+    ## its stream is an implementation detail of the Nim release, and the CI
+    ## job that runs this file tracks ``stable`` on purpose: drawing from
+    ## ``std/random`` there means a toolchain bump re-rolls the whole sweep
+    ## onto shapes the pinned seed was never measured on, turning a required
+    ## job red with no change under test.  Twenty lines of generator buy back
+    ## a corpus that a seed in a workflow file actually names.
+    ##
+    ## Quality is not the point and neither is the modulo bias below: the
+    ## bounds here are single digits against a 64-bit stream, and what the
+    ## sweep needs is a spread of shapes that reproduces, not uniformity.
+    state: uint64
+
+  const
+    SplitMixGamma = 0x9E3779B97F4A7C15'u64
+    SplitMixMixA = 0xBF58476D1CE4E5B9'u64
+    SplitMixMixB = 0x94D049BB133111EB'u64
+
+  proc initRand(seed: int): Rand =
+    ## Seeds differing by one still give unrelated streams: the seed goes
+    ## through the same output mix as every draw, so the sweep can walk
+    ## ``baseSeed + s`` the way it did before.
+    Rand(state: cast[uint64](seed) xor SplitMixGamma)
+
+  proc next(r: var Rand): uint64 =
+    r.state = r.state + SplitMixGamma
+    var z = r.state
+    z = (z xor (z shr 30)) * SplitMixMixA
+    z = (z xor (z shr 27)) * SplitMixMixB
+    z xor (z shr 31)
+
+  proc rand(r: var Rand, max: int): int =
+    ## Uniform over ``0 .. max`` inclusive, as ``std/random``'s ``rand`` is,
+    ## so every call site below reads the same way it always did.
+    int(r.next() mod uint64(max + 1))
+
+  proc sample(r: var Rand, s: string): char =
+    s[r.rand(s.len - 1)]
+
+  proc sample[T](r: var Rand, s: openArray[T]): T =
+    s[r.rand(s.len - 1)]
 
   proc envInt(name: string, fallback: int): int =
     let v = getEnv(name)
@@ -322,18 +390,31 @@ else:
     ##   engines share.
     ##
     ## A wrong rollback moves a span somewhere else entirely -- a stale start
-    ## *and* a stale end -- which neither tell covers.  A differing match span
-    ## -- index 0 -- is never excused.
+    ## *and* a stale end -- which neither tell covers.
+    ##
+    ## The match span -- index 0 -- is excused on the same two tells, except
+    ## that it takes *both* spans empty rather than one.  The split reaches it
+    ## through a backreference, which consumes what the losing iteration left:
+    ## on ``(.*?){0,2}a\1`` against "bab" the empty final iteration ends the
+    ## match at 2 and the iteration before it at 3.  ``\K`` moves the start the
+    ## same way.  But one side empty would excuse an empty match standing
+    ## against a span of any length, which is what a rollback bug looks like;
+    ## needing both also keeps "matched" against "did not match" failing, since
+    ## those two answers differ in length.
     if a.len != b.len or a.len == 0:
       return false
-    if a[0] != b[0]:
-      return false
-    for i in 1 ..< a.len:
+    for i in 0 ..< a.len:
       if a[i] == b[i]:
         continue
-      let emptySide = a[i][0] == a[i][1] or b[i][0] == b[i][1]
+      let aEmpty = a[i][0] == a[i][1]
+      let bEmpty = b[i][0] == b[i][1]
+      let empty =
+        if i == 0:
+          aEmpty and bEmpty
+        else:
+          aEmpty or bEmpty
       let sameEnd = a[i][1] == b[i][1]
-      if not (emptySide or sameEnd):
+      if not (empty or sameEnd):
         return false
     true
 
