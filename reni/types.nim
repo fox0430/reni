@@ -302,6 +302,11 @@ type
         ## ``b < 0x80`` gate lives.
       negated*: bool
       bracketClass*: bool ## true when from [...] syntax (enables case-fold matching)
+      solePropOk*: bool
+        ## ``atoms`` is one ``\p{...}`` or ``\P{...}`` written outside ``[...]``:
+        ## nothing to walk, nothing to fold, so the matcher asks
+        ## [matchUnicodeProp] directly.  Filled in by the compiler; the default
+        ## ``false`` is the general path.
       asciiSetOk*: bool
         ## ``asciiSet`` is exact.  Only true for classes whose atoms all read
         ## the same below U+0080 whatever the ASCII-restriction flags say --

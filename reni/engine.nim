@@ -1368,13 +1368,20 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
     anyMatch = classHasByte(node, uint8(code), ctx.flags)
   elif code >= 0x80:
     let r = Rune(code)
-    for atom in node.atoms:
-      if node.bracketClass and matchCcAtomWithFold(r, atom, ctx.flags):
-        anyMatch = true
-        break
-      elif not node.bracketClass and matchCcAtom(r, atom, ctx.flags):
-        anyMatch = true
-        break
+    if node.solePropOk:
+      # One property and nothing else; ``ccNegUnicodeProp`` is the same lookup
+      # read the other way round.
+      anyMatch =
+        matchUnicodeProp(r, node.atoms[0].prop, ctx.flags) ==
+        (node.atoms[0].kind == ccUnicodeProp)
+    else:
+      for atom in node.atoms:
+        if node.bracketClass and matchCcAtomWithFold(r, atom, ctx.flags):
+          anyMatch = true
+          break
+        elif not node.bracketClass and matchCcAtom(r, atom, ctx.flags):
+          anyMatch = true
+          break
 
   let matched =
     if node.negated:

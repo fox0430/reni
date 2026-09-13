@@ -750,6 +750,11 @@ proc annotateTree(
     if discriminates:
       node.altFirst = hints
   of nkCharClass:
+    # A bare ``\p{...}``: one atom, no fold variant, nothing past the first
+    # element.  Read the shape off here so [classAdvance] need not.
+    node.solePropOk =
+      not node.bracketClass and node.atoms.len == 1 and
+      node.atoms[0].kind in {ccUnicodeProp, ccNegUnicodeProp}
     # The shape reader first; [exactAsciiClassSet] only for what it gives up
     # on -- a ``\p{...}``, a nested class, an intersection.  Asking every atom
     # about every ASCII byte costs microseconds per pattern (``re()`` on
