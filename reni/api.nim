@@ -187,9 +187,13 @@ proc captureText*(m: Match, group: int, subject: string): Option[string] =
 
 proc captureIndex*(regex: Regex, name: string): int =
   ## Get the index of a named capture group. Returns -1 if not found.
-  for (n, idx) in regex.namedCaptures:
-    if n == name:
-      return idx + 1 # boundaries are 1-indexed for groups
+  ##
+  ## The one name lookup that still compares strings: the name comes from the
+  ## caller, so ``types.resolveNameRefs`` cannot settle it.  Indexed rather
+  ## than unpacked, since ``for (n, idx) in ...`` copies each name.
+  for i in 0 ..< regex.namedCaptures.len:
+    if regex.namedCaptures[i][0] == name:
+      return regex.namedCaptures[i][1] + 1 # boundaries are 1-indexed for groups
   -1
 
 proc captured*(m: Match, name: string, regex: Regex): bool =

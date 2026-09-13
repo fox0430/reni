@@ -4916,3 +4916,63 @@ suite "a zero-width repetition retries from its own choice point":
     let m = search("aax", re("^(?:.)*?(b{0,2})+x"))
     check m.matchSpan == 0 .. 3
     check m.boundaries[1] == 2 .. 2
+
+suite "a name reference resolves to every group that declares it":
+  # A name may be declared more than once, so ``\k<name>``, ``\g<name>`` and
+  # ``(?(<name>)...)`` each resolve to a run of groups rather than to one.
+  # Every expectation here was read off Oniguruma 6.9.10
+  # (ONIG_SYNTAX_ONIGURUMA, UTF-8, onig_search), except where noted.
+
+  test "a named backreference tries each group of that name":
+    # The first alternative declares ``w``, the second declares it again; the
+    # backreference has to reach whichever one actually captured.
+    let pat = "(?:(?<w>[a-z]+)|(?<w>[0-9]+))\\s+\\k<w>"
+    check search("abc abc", re(pat)).matchSpan == 0 .. 7
+    check search("12 12", re(pat)).matchSpan == 0 .. 5
+    check not search("12 ab", re(pat)).found
+
+  test "a named backreference over one group still matches that group":
+    check search("aa", re("(?<w>a)\\k<w>")).matchSpan == 0 .. 2
+    check not search("ab", re("(?<w>a)\\k<w>")).found
+
+  test "a name no group captured fails rather than matching empty":
+    # ``w`` is declared, so the reference is not an error; nothing captured
+    # into it, so it matches nothing.
+    check not search("x", re("(?:(?<w>a))?\\k<w>")).found
+
+  test "a named condition holds when any group of that name captured":
+    let pat = "(?:(?<a>x)|(?<a>y))(?(<a>)z|q)"
+    check search("xz", re(pat)).matchSpan == 0 .. 2
+    check search("yz", re(pat)).matchSpan == 0 .. 2
+
+  test "a named condition fails over when no group of that name captured":
+    check search("e", re("(?<a>q)?(?(<a>)w|e)")).matchSpan == 0 .. 1
+    check search("qw", re("(?<a>q)?(?(<a>)w|e)")).matchSpan == 0 .. 2
+
+  test "a named subexpression call enters the first group of that name":
+    # Oniguruma rejects a call to a name declared twice outright ("multiplex
+    # definition name <p> call"); reni calls the first declaration, which is
+    # what these pin -- change them with the behaviour, not around it.
+    check search("aba", re("(?<p>a)(?<p>b)\\g<p>")).matchSpan == 0 .. 3
+    check not search("abb", re("(?<p>a)(?<p>b)\\g<p>")).found
+    # The single-declaration form is the one Oniguruma also answers.
+    check search("aa", re("(?<p>a)\\g<p>")).matchSpan == 0 .. 2
+
+  test "a numeric reference resolves by index, not through the name table":
+    # A pattern with named groups may not use a numbered reference at all
+    # (Oniguruma: "numbered backref/call is not allowed"), so the numeric
+    # forms are checked on their own pattern.  Nothing about them should
+    # reach the name table.
+    check search("aa", re("(a)\\1")).matchSpan == 0 .. 2
+    check search("aa", re("(a)\\g<1>")).matchSpan == 0 .. 2
+    expect RegexError:
+      discard re("(?<p>a)\\1")
+
+  test "two patterns with the same name do not share a resolution":
+    # Each ``Regex`` carries its own name table, so compiling a second
+    # pattern cannot move the first one's answer.
+    let first = re("(?<n>a)\\k<n>")
+    let second = re("(?:(?<n>b)|(?<n>c))\\k<n>")
+    check search("aa", first).matchSpan == 0 .. 2
+    check search("cc", second).matchSpan == 0 .. 2
+    check search("aa", first).matchSpan == 0 .. 2

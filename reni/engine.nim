@@ -40,12 +40,12 @@ type
 
   Frame = object
     ## Continuation frame. Frames live in a flat ``seq`` on ``MatchContext``;
-    ## ``parent`` chains them. ``Node`` fields are cursors: the tree outlives
-    ## every match, so ref-counting them would cost the hot path.
+    ## ``parent`` chains them. A frame names an AST node by [NodeId] rather
+    ## than holding one -- see ``Choice`` below for what that buys.
     parent: ContId
     case kind: ContKind
     of ckSeqContinue:
-      sNode {.cursor.}: Node ## parent nkConcat node (children walked by idx)
+      sNode: NodeId ## parent nkConcat node (children walked by idx)
       sIdx: int32 ## next child index to match
     of ckCapture:
       cCapIdx: int32
@@ -59,7 +59,7 @@ type
       fgSavedFlags: RegexFlags
       fgSavedGM: GraphemeMode
     of ckQuantGreedyMore, ckQuantLazyMore:
-      qBody {.cursor.}: Node
+      qBody: NodeId
       qMinRep: int32
       qMaxRep: int32
       qCount: int32
@@ -152,13 +152,14 @@ type
       ## subexpression recursion ever increments one.
     frames: seq[Frame]
       ## Frame buffer; live length is ``framesLen``. Never shrinks, so push/pop
-      ## avoids destructors. Stale entries own nothing (``Node`` is a cursor).
+      ## avoids destructors. Stale entries own nothing, under every memory
+      ## management: a frame is plain values down to the last field.
     framesLen: int ## Live length of ``frames``.
     captureSnapshots: seq[Span]
       ## ``captures`` snapshots for ``ckCapturesChanged``, LIFO with ``frames``.
     choices: seq[Choice]
       ## Backtrack buffer; live length is ``choicesLen``. Never shrinks; stale
-      ## entries own nothing (cursors and plain values only).
+      ## entries own nothing, in the same way ``frames`` above notes.
     choicesLen: int ## Live length of ``choices``. LIFO with ``frames`` and ``capSaves``.
     repPositions: seq[int]
       ## Repetition end positions for ``chSimpleRepeat``, LIFO with ``choices``.
@@ -187,8 +188,10 @@ type
     scratchQuiet: int ## Consecutive small searches within the keep marks.
     flBestLen: int ## findLongest: best match length so far (-1 if none)
     flBestMatch: Match ## findLongest: deepest match recorded
-    leadRun {.cursor.}: Node
-      ## Cached ``Regex.leadRun``; cursor since the tree outlives the search.
+    leadRun: NodeId
+      ## Cached ``Regex.leadRun``, as an index: the comparison below is an
+      ## identity test, which an index answers without the question of what a
+      ## recycled address might have been reused for.
     leadRunEnd: int
       ## End of ``leadRun``'s run at this start, or -1 if never reached.
       ## Valid only after a failed attempt.
@@ -237,10 +240,15 @@ type
     ## recursive matcher kept in native frames, so the matcher can run as a
     ## loop (see ``runMachine``). Restores only what its site restored; e.g.
     ## alternation leaves ``flags`` alone so ``(?i)`` spans branches.
-    ## ``Node`` fields are cursors to avoid ref-count traffic on the hot path.
+    ##
+    ## An AST node is named by [NodeId], not held: the tree outlives every
+    ## match, so a reference here would only cost the hot path an atomic pair
+    ## per push.  An index makes an entry plain data, which is what lets
+    ## ``storeSlot`` move one with ``copyMem`` under every memory management,
+    ## and lets an arm read a node out of an entry it has already popped.
     case kind: ChoiceKind
     of chAlt, chAltHinted:
-      aNode {.cursor.}: Node
+      aNode: NodeId
       aIdx: int32 ## next branch to try
       aCont: ContId
       aFramesLen: int32
@@ -248,13 +256,13 @@ type
       aPos: int
       aKeepStart: int
     of chLeafVariant:
-      lNode {.cursor.}: Node
+      lNode: NodeId
       lVariant: int32 ## next way to try
       lCont: ContId
       lFramesLen: int32
       lPos: int
     of chQuantGreedy, chQuantLazy:
-      qcBody {.cursor.}: Node
+      qcBody: NodeId
       qcMinRep: int32
       qcMaxRep: int32
       qcCount: int32
@@ -280,7 +288,7 @@ type
         ## no snapshot: a single-way leaf writes none, and continuation
         ## captures have their own ``chUndoCapture`` entries.
     of chZeroWidthRep:
-      zBody {.cursor.}: Node
+      zBody: NodeId
       zCont: ContId
       zFramesLen: int32
       zIter: int32 ## capture-changing attempts made so far
@@ -333,7 +341,7 @@ type
       ssCapIdx: int32 ## Referenced group (0-based), or -1 for ``\g<0>``.
       ssFlags: RegexFlags ## Flags before the called group's flags.
     of chLookbehindAlt:
-      lbaNode {.cursor.}: Node ## Lookaround node under test.
+      lbaNode: NodeId ## Lookaround node under test.
       lbaNext: int32 ## Next alternative index to try.
       lbaCont: ContId
       lbaFramesLen: int32
@@ -341,8 +349,7 @@ type
       lbaSaved: SavedState ## Entry snapshot, replayed until exhausted.
       lbaLensOff: int32 ## Stack-length snapshot offset in `stackLensSaves`.
     of chUndoCallout:
-      ucoNode {.cursor.}: Node
-        ## Callout node whose counter was incremented (cursor; tree outlives match).
+      ucoNode: NodeId ## Callout node whose counter was incremented.
       ucoPrev: int
       ucoExisted: bool
 
@@ -376,6 +383,15 @@ proc toSubject(s: string): Subject {.inline.} =
     Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[0]), size: s.len)
   else:
     Subject(data: cast[ptr UncheckedArray[char]](addr emptySubjectByte), size: 0)
+
+template nodeAt(ctx: MatchContext, id: NodeId): Node =
+  ## The node ``id`` names, out of the regex's node table.  One extra load is
+  ## the whole cost of naming a node by index; ``NoNodeId`` is slot 0, which
+  ## holds ``nil``, so no branch is needed here.
+  ##
+  ## Only matching code may use it, and only past ``resetForRegex``, for the
+  ## reason ``MatchContext.regex`` gives.
+  ctx.regex[].nodes[id.int]
 
 template len(s: Subject): int =
   s.size
@@ -531,10 +547,14 @@ template checkCont(ctx: MatchContext, id: ContId) =
   assert id < ctx.framesLen, "continuation outlives its frame"
 
 macro requireBitwiseCopyable(t: typedesc): untyped =
-  ## Assert at compile time that every field of ``t`` survives a bitwise copy:
-  ## either its type owns nothing, or the field is a ``{.cursor.}`` borrow that
-  ## is never released.  Walks the variant, so branch fields are covered too,
-  ## and the base objects, so an inherited field cannot slip past unchecked.
+  ## Assert at compile time that every field of ``t`` owns nothing, so the
+  ## whole object survives a bitwise copy.  Walks the variant, so branch
+  ## fields are covered too, and the base objects, so an inherited field
+  ## cannot slip past unchecked.
+  ##
+  ## A ``{.cursor.}`` borrow is *not* exempt, though ORC would make the field
+  ## copyable: ``refc`` implements no ``{.cursor.}``, so such a field
+  ## reinstates exactly the corruption ``storeSlot`` below describes.
   result = newStmtList()
   let
     checks = result
@@ -551,30 +571,26 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
       # type and the default value.
       let typ = parseExpr(n[^2].repr)
       for i in 0 ..< n.len - 2:
-        var
-          name = n[i]
-          cursor = false
+        var name = n[i]
         if name.kind == nnkPragmaExpr:
-          for p in name[1]:
-            if p.eqIdent("cursor"):
-              cursor = true
+          # ``field {.pragma.}: T`` -- the pragma wraps the identifier.  No
+          # pragma exempts a field from the check, so only the name matters.
           name = name[0]
         if name.kind == nnkPostfix:
           # ``payload*: T`` -- the export marker wraps the identifier, and
           # ``name.strVal`` would abort the macro instead of checking the field.
           name = name[1]
-        if not cursor:
-          checks.add nnkStaticStmt.newTree(
-            newCall(
-              # ``doAssert``, not ``assert``: ``--assertions:off`` (implied by
-              # ``-d:danger``, a build mode the benchmarks use) erases the
-              # latter even inside ``static``, dropping the guard exactly where
-              # the ``copyMem`` below would turn into silent corruption.
-              bindSym"doAssert",
-              newCall(bindSym"supportsCopyMem", typ.copyNimTree),
-              newLit(tname & "." & name.strVal & " is not bitwise-copyable"),
-            )
+        checks.add nnkStaticStmt.newTree(
+          newCall(
+            # ``doAssert``, not ``assert``: ``--assertions:off`` (implied by
+            # ``-d:danger``, a build mode the benchmarks use) erases the
+            # latter even inside ``static``, dropping the guard exactly where
+            # the ``copyMem`` below would turn into silent corruption.
+            bindSym"doAssert",
+            newCall(bindSym"supportsCopyMem", typ.copyNimTree),
+            newLit(tname & "." & name.strVal & " is not bitwise-copyable"),
           )
+        )
     else:
       discard
 
@@ -582,8 +598,6 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
     ## Walk one object's own fields, then its base's.  Reaching for the
     ## typedef's ``RecList`` directly would silently skip everything inherited,
     ## and an owning inherited field would then pass the guard.
-    # ``getImpl``, not ``getTypeImpl``: only the declaration keeps the field
-    # pragmas, and without them every ``{.cursor.}`` borrow reads as owning.
     let impl = sym.getImpl
     if impl.kind != nnkTypeDef or impl[2].kind != nnkObjectTy:
       error(
@@ -597,6 +611,27 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
 
   walkObject(t.getTypeInst[1])
 
+template storeSlot(dst, src: untyped) =
+  ## Move ``src`` into the popped buffer slot ``dst``.
+  ##
+  ## A ``copyMem``, under every memory management: assignment would call the
+  ## ``=sink`` Nim gives every variant object, which zeroes the destination's
+  ## old branch -- dead work on a popped slot that owns nothing -- before
+  ## copying the new one in field by field.  A slot holds plain values only,
+  ## which ``requireBitwiseCopyable`` keeps true, so the whole store is one
+  ## ``sizeof(dst)`` move.
+  ##
+  ## Naming a node by [NodeId] is what lets this be unconditional.  While the
+  ## slots held a ``Node``, ``refc``'s marker visited that field in every
+  ## slot, stale ones included, so a raw store wrote the pointer without the
+  ## matching increment and the marker's later decrement freed a live node.
+  # Both ends are sized from ``dst``, so a ``src`` of a different type would
+  # be overread.  This is what keeps that from happening.
+  static:
+    doAssert typeof(dst) is typeof(src),
+      "storeSlot: " & $typeof(src) & " does not fit a " & $typeof(dst) & " slot"
+  copyMem(addr dst, addr src, sizeof(dst))
+
 # The precondition for ``pushFrame``'s ``copyMem`` store below.  An owning
 # field added to the variant -- the ``seq[Span]`` ``ckCapturesChanged``
 # deliberately keeps out, say -- would otherwise compile silently and then
@@ -609,21 +644,15 @@ proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
   ##
   ## ``sink`` keeps the parameter callee-owned: an lvalue argument -- say
   ## ``pushFrame(ctx, ctx.frames[i])`` -- is materialised into a temporary, so
-  ## the growth below cannot reallocate the buffer out from under the
-  ## ``copyMem`` source.  The temporary costs nothing to discard for the same
-  ## reason the store below is a plain move.
+  ## the growth below cannot reallocate the buffer out from under the store's
+  ## source.  The temporary costs nothing to discard for the same reason the
+  ## store below is a plain move.
   ##
-  ## Stored with ``copyMem``: assignment would call the ``=sink`` Nim gives
-  ## every variant object, which first zeroes the destination's old branch and
-  ## then copies the new one in field by field.  The zeroing is dead work on a
-  ## popped slot holding nothing that needs releasing, and the second switch
-  ## collapses to a single ``sizeof(Frame)`` move -- ``Node`` fields are
-  ## cursors and the rest is plain values, so ``Frame``'s ``=destroy`` is
-  ## empty and ``requireBitwiseCopyable`` above keeps it that way.
+  ## ``storeSlot`` above explains the store.
   if ctx.framesLen >= ctx.frames.len:
     ctx.frames.setLen(max(16, ctx.frames.len * 2))
   result = ctx.framesLen.int32
-  copyMem(addr ctx.frames[ctx.framesLen], addr frame, sizeof(Frame))
+  storeSlot(ctx.frames[ctx.framesLen], frame)
   inc ctx.framesLen
 
 # The same precondition, for ``pushChoice``'s store below.  ``Choice`` has more
@@ -634,11 +663,11 @@ requireBitwiseCopyable(Choice)
 proc pushChoice(ctx: MatchContext, choice: sink Choice) {.inline.} =
   ## Push a backtrack entry, growing only when full.
   ##
-  ## ``sink`` and ``copyMem`` for the reasons ``pushFrame`` above gives; like
-  ## ``Frame``, ``Choice`` holds only cursors and plain values.
+  ## ``sink`` and ``storeSlot`` for the reasons ``pushFrame`` above gives;
+  ## like ``Frame``, ``Choice`` holds plain values only.
   if ctx.choicesLen >= ctx.choices.len:
     ctx.choices.setLen(max(16, ctx.choices.len * 2))
-  copyMem(addr ctx.choices[ctx.choicesLen], addr choice, sizeof(Choice))
+  storeSlot(ctx.choices[ctx.choicesLen], choice)
   inc ctx.choicesLen
   if ctx.choicesLen > ctx.choicesPeak:
     ctx.choicesPeak = ctx.choicesLen
@@ -891,7 +920,8 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       unwindAbsentFrames(ctx, base)
       return ok
     let fid = pushFrame(
-      ctx, Frame(kind: ckSeqContinue, parent: tail, sNode: parent, sIdx: int32(i + 1))
+      ctx,
+      Frame(kind: ckSeqContinue, parent: tail, sNode: parent.id, sIdx: int32(i + 1)),
     )
     let ok = matchWithCont(ctx, nodes[i], fid)
     unwindAbsentFrames(ctx, base)
@@ -1777,7 +1807,7 @@ type LookAltResult = enum
 proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
   ## Try remaining alternatives from `lbaNext` on. Fixed matches keep the
   ## entry for retry; variable matches commit and pop it; exhaustion restores.
-  let node = ctx.choices[top].lbaNode
+  let node {.cursor.} = ctx.nodeAt(ctx.choices[top].lbaNode)
   let targetEnd = ctx.choices[top].lbaTarget
   var k = int(ctx.choices[top].lbaNext)
   if k > 0 and k < node.lookBody.alternatives.len:
@@ -1993,12 +2023,12 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
       return ctx.captures[capIdx].a >= 0
     return false
   of ckNamedRef:
-    # Check ALL capture groups with matching name
-    for (name, i) in ctx.regex[].namedCaptures:
-      if name == node.condRefName:
-        let capIdx = i + 1
-        if capIdx < ctx.captures.len and ctx.captures[capIdx].a >= 0:
-          return true
+    # Holds if any group of that name captured; the name resolved to them
+    # at compile time (see ``resolveNameRefs``).
+    for i in ctx.regex[].nameRefsOf(node.condRefs):
+      let capIdx = int(i) + 1
+      if capIdx < ctx.captures.len and ctx.captures[capIdx].a >= 0:
+        return true
     return false
   of ckAlwaysFalse:
     return false
@@ -2058,18 +2088,15 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
     matchBackref(ctx, node.backrefIndex, cont, node.backrefLevel)
   of nkNamedBackref:
     # Loop answers these itself.
-    var anyFound = false
-    for (name, i) in ctx.regex[].namedCaptures:
-      if name == node.backrefName:
-        anyFound = true
-        let idx = i + 1 # captures are 1-indexed in boundaries
-        let saved = save(ctx)
-        if matchBackref(ctx, idx, cont, node.namedBackrefLevel):
-          drop(ctx, saved)
-          return true
-        restore(ctx, saved)
-    if not anyFound:
+    if ctx.regex[].nameRefCount(node.backrefRefs) == 0:
       return false
+    for i in ctx.regex[].nameRefsOf(node.backrefRefs):
+      let idx = int(i) + 1 # captures are 1-indexed in boundaries
+      let saved = save(ctx)
+      if matchBackref(ctx, idx, cont, node.namedBackrefLevel):
+        drop(ctx, saved)
+        return true
+      restore(ctx, saved)
     # All named groups exist but none captured → fail
     false
   of nkSubexpCall:
@@ -2085,12 +2112,11 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
         body = ctx.regex[].groupBodies[idx]
       captureIdx = idx
     elif node.callName.len > 0:
-      for (name, i) in ctx.regex[].namedCaptures:
-        if name == node.callName:
-          if i < ctx.regex[].groupBodies.len:
-            body = ctx.regex[].groupBodies[i]
-          captureIdx = i
-          break
+      let i = int(ctx.regex[].nameRefFirst(node.callRefs))
+      if i >= 0:
+        if i < ctx.regex[].groupBodies.len:
+          body = ctx.regex[].groupBodies[i]
+        captureIdx = i
     if body == nil:
       return false
     inc ctx.recursionDepth
@@ -2200,7 +2226,7 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
   ctx.checkCont cont
   case ctx.frames[cont].kind
   of ckSeqContinue:
-    let parentNode = ctx.frames[cont].sNode
+    let parentNode {.cursor.} = ctx.nodeAt(ctx.frames[cont].sNode)
     let idx = int(ctx.frames[cont].sIdx)
     let parent = ctx.frames[cont].parent
     matchSeqCont(ctx, parentNode, idx, parent)
@@ -2365,7 +2391,7 @@ proc runMachine(
     ## Greedy: try one more rep, leaving "stop and run cont" behind.
     ctx.pushChoice Choice(
       kind: chQuantGreedy,
-      qcBody: body,
+      qcBody: body.id,
       qcMinRep: minRep,
       qcMaxRep: maxRep,
       qcCount: count,
@@ -2381,7 +2407,7 @@ proc runMachine(
         Frame(
           kind: ckQuantGreedyMore,
           parent: c,
-          qBody: body,
+          qBody: body.id,
           qMinRep: minRep,
           qMaxRep: maxRep,
           qCount: count,
@@ -2400,7 +2426,7 @@ proc runMachine(
     ## Lazy: run cont first, leaving "repeat once more" behind.
     ctx.pushChoice Choice(
       kind: chQuantLazy,
-      qcBody: body,
+      qcBody: body.id,
       qcMinRep: minRep,
       qcMaxRep: maxRep,
       qcCount: count,
@@ -2452,7 +2478,7 @@ proc runMachine(
           if v + 1 < lastVariant and not isSingleWayLeaf(ctx, node):
             ctx.pushChoice Choice(
               kind: chLeafVariant,
-              lNode: node,
+              lNode: node.id,
               lVariant: int32(v + 1),
               lCont: cont,
               lFramesLen: ctx.framesLen.int32,
@@ -2505,7 +2531,7 @@ proc runMachine(
             # Isolated flag groups (?i) extend across alternation branches.
             ctx.pushChoice Choice(
               kind: chAlt,
-              aNode: node,
+              aNode: node.id,
               aIdx: 1,
               aCont: cont,
               aFramesLen: ctx.framesLen.int32,
@@ -2535,7 +2561,7 @@ proc runMachine(
               # passed over for good.
               ctx.pushChoice Choice(
                 kind: chAltHinted,
-                aNode: node,
+                aNode: node.id,
                 aIdx: int32(first + 1),
                 aCont: cont,
                 aFramesLen: ctx.framesLen.int32,
@@ -2627,7 +2653,7 @@ proc runMachine(
                 break # zero-width: a single-way leaf cannot vary, so stop
               ctx.pushRepPos ctx.pos
               inc count
-            if ctx.leadRunEnd < 0 and node == ctx.leadRun:
+            if ctx.leadRunEnd < 0 and node.id == ctx.leadRun:
               # First visit to the leading repeat: record its run end.
               ctx.leadRunEnd = ctx.pos
             if count < int32(qmin):
@@ -2756,7 +2782,7 @@ proc runMachine(
             ctx.stackLensSaves.add(saveStackLens(ctx))
             ctx.pushChoice Choice(
               kind: chLookbehindAlt,
-              lbaNode: node,
+              lbaNode: node.id,
               lbaNext: 0,
               lbaCont: cont,
               lbaFramesLen: ctx.framesLen.int32,
@@ -2805,7 +2831,7 @@ proc runMachine(
         else:
           ctx.pushChoice Choice(
             kind: chUndoCallout,
-            ucoNode: node,
+            ucoNode: node.id,
             ucoPrev: cur,
             ucoExisted: ctx.calloutCounters.hasKey(node.maxTag),
           )
@@ -2816,7 +2842,7 @@ proc runMachine(
         let cur = ctx.calloutCounters.getOrDefault(node.countTag, 0)
         ctx.pushChoice Choice(
           kind: chUndoCallout,
-          ucoNode: node,
+          ucoNode: node.id,
           ucoPrev: cur,
           ucoExisted: ctx.calloutCounters.hasKey(node.countTag),
         )
@@ -2935,11 +2961,10 @@ proc runMachine(
       of nkNamedBackref:
         # First same-named group that matches wins.
         var e = -1
-        for (name, i) in ctx.regex[].namedCaptures:
-          if name == node.backrefName:
-            e = backrefEnd(ctx, i + 1, node.namedBackrefLevel)
-            if e >= 0:
-              break
+        for i in ctx.regex[].nameRefsOf(node.backrefRefs):
+          e = backrefEnd(ctx, int(i) + 1, node.namedBackrefLevel)
+          if e >= 0:
+            break
         if e < 0:
           mode = mFail
         else:
@@ -2961,12 +2986,11 @@ proc runMachine(
             body = ctx.regex[].groupBodies[idx]
           captureIdx = idx
         elif node.callName.len > 0:
-          for (name, i) in ctx.regex[].namedCaptures:
-            if name == node.callName:
-              if i < ctx.regex[].groupBodies.len:
-                body = ctx.regex[].groupBodies[i]
-              captureIdx = i
-              break
+          let i = int(ctx.regex[].nameRefFirst(node.callRefs))
+          if i >= 0:
+            if i < ctx.regex[].groupBodies.len:
+              body = ctx.regex[].groupBodies[i]
+            captureIdx = i
         if body == nil:
           mode = mFail
         elif ctx.recursionDepth + 1 > ctx.maxRecursionDepth:
@@ -3044,7 +3068,7 @@ proc runMachine(
               Frame(
                 kind: ckSeqContinue,
                 parent: cont,
-                sNode: seqNode,
+                sNode: seqNode.id,
                 sIdx: int32(seqIdx + 1),
               ),
             )
@@ -3056,7 +3080,7 @@ proc runMachine(
       ctx.checkCont cont
       case ctx.frames[cont].kind
       of ckSeqContinue:
-        seqNode = ctx.frames[cont].sNode
+        seqNode = ctx.nodeAt(ctx.frames[cont].sNode)
         seqIdx = int(ctx.frames[cont].sIdx)
         cont = ctx.frames[cont].parent
         mode = mSeq
@@ -3125,7 +3149,7 @@ proc runMachine(
           cont = ctx.frames[cont].parent
           mode = mCont
         else:
-          let body = ctx.frames[cont].qBody
+          let body {.cursor.} = ctx.nodeAt(ctx.frames[cont].qBody)
           let minRep = ctx.frames[cont].qMinRep
           let maxRep = ctx.frames[cont].qMaxRep
           let count = ctx.frames[cont].qCount + 1
@@ -3197,8 +3221,9 @@ proc runMachine(
         # Index in place to avoid copying the alternatives seq per backtrack.
         let idx = int(ctx.choices[top].aIdx)
         cont = ctx.choices[top].aCont
-        node = ctx.choices[top].aNode.alternatives[idx]
-        if idx + 1 >= ctx.choices[top].aNode.alternatives.len:
+        let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
+        node = altNode.alternatives[idx]
+        if idx + 1 >= altNode.alternatives.len:
           releaseTo(ctx, ctx.choices[top].aCapOff)
           ctx.choicesLen = top
         else:
@@ -3218,7 +3243,7 @@ proc runMachine(
         capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         cont = ctx.choices[top].aCont
-        let altNode = ctx.choices[top].aNode
+        let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
         # ``pos`` was just restored to the alternation's own position, so the
         # byte the hints read is the one in front of the matcher here.
         let hasByte = ctx.pos < ctx.subjectEnd
@@ -3245,7 +3270,7 @@ proc runMachine(
       of chLeafVariant:
         ctx.pos = ctx.choices[top].lPos
         ctx.framesLen = ctx.choices[top].lFramesLen
-        let leaf = ctx.choices[top].lNode
+        let leaf {.cursor.} = ctx.nodeAt(ctx.choices[top].lNode)
         let lastVariant =
           if leaf.kind == nkCharClass: ClassVariants else: LiteralVariants
         var v = int(ctx.choices[top].lVariant)
@@ -3296,7 +3321,7 @@ proc runMachine(
       of chQuantLazy:
         rollBackQuant(top)
         ctx.framesLen = ctx.choices[top].qcFramesLen
-        let body = ctx.choices[top].qcBody
+        let body {.cursor.} = ctx.nodeAt(ctx.choices[top].qcBody)
         let minRep = ctx.choices[top].qcMinRep
         let maxRep = ctx.choices[top].qcMaxRep
         let count = ctx.choices[top].qcCount
@@ -3320,7 +3345,7 @@ proc runMachine(
             Frame(
               kind: ckQuantLazyMore,
               parent: parent,
-              qBody: body,
+              qBody: body.id,
               qMinRep: minRep,
               qMaxRep: maxRep,
               qCount: count,
@@ -3350,7 +3375,7 @@ proc runMachine(
           # Only where ``capSaves`` stood is needed, to trim back to next round.
           let attemptPos = ctx.pos
           let attemptCap = capMark(ctx)
-          if not tryCaptureChangingMatch(ctx, ctx.choices[top].zBody) or
+          if not tryCaptureChangingMatch(ctx, ctx.nodeAt(ctx.choices[top].zBody)) or
               ctx.pos != attemptPos:
             restore(ctx, ctx.choices[top].zEntry)
             ctx.choicesLen = top
@@ -3446,7 +3471,7 @@ proc runMachine(
         of laExhausted:
           mode = mFail
       of chUndoCallout:
-        let n = ctx.choices[top].ucoNode
+        let n {.cursor.} = ctx.nodeAt(ctx.choices[top].ucoNode)
         let tag =
           case n.kind
           of nkCalloutMax: n.maxTag
@@ -3571,7 +3596,7 @@ proc resetForRegex(
   ctx.flags = regex[].flags
   ctx.regex = regex
   ctx.trackCaptureStacks = regex[].levelBackrefs
-  ctx.leadRun = regex[].leadRun
+  ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
@@ -3670,12 +3695,13 @@ proc searchImplInto*(
   ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
   ## ``ctx`` must be caller-owned and single-threaded.
   # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
-  # against recycled allocations.
+  # into nil dereferences.  ``leadRun`` indexes a table this no longer
+  # reaches, so it is cleared too.  The frame and backtrack buffers need no
+  # clearing: a stale slot holds indices and scalars only.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = nil
+    ctx.leadRun = NoNodeId
   let findLongest = rfFindLongest in regex.flags
   if findLongest:
     ctx.flBestLen = -1
@@ -3838,12 +3864,12 @@ proc searchBackwardImplInto*(
 ) =
   ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
   # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
-  # against recycled allocations.
+  # into nil dereferences.  ``leadRun`` indexes a table this no longer
+  # reaches, so it is cleared too.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = nil
+    ctx.leadRun = NoNodeId
   writeNotFound(m)
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
@@ -3957,12 +3983,12 @@ proc matchAtImplInto*(
 ) =
   ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
   # Borrowed refs must not survive the return; clearing turns stale reads
-  # into nil dereferences. ``leadRun`` is identity-compared, so clear it
-  # against recycled allocations.
+  # into nil dereferences.  ``leadRun`` indexes a table this no longer
+  # reaches, so it is cleared too.
   defer:
     ctx.regex = nil
     ctx.subject = Subject(data: nil, size: 0)
-    ctx.leadRun = nil
+    ctx.leadRun = NoNodeId
   writeNotFound(m)
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
