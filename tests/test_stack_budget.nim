@@ -40,20 +40,24 @@ suite "the parser measures the same stack budget the matcher does":
         discard re(tooDeep)
     else:
       # ``RegexLimitError`` is a ``RegexError``, so ``expect RegexError``
-      # would pass on either one. What this pins is that the level cap, not
-      # the byte guard, is what rejects a pattern this deep.
-      when compileOption("exceptions", "setjmp"):
-        # 300 parser levels cost past 1 MiB under setjmp (see the test above),
-        # so the byte guard fires before the 256 level cap is reached. Still
-        # a catchable error, never an overflow.
-        expect RegexLimitError:
-          discard re(tooDeep)
+      # would pass on either one. What this pins is *which* of the two
+      # rejects a pattern this deep, so each build names its own answer.
+      var sawLevelCap = false
+      var sawByteGuard = false
+      try:
+        discard re(tooDeep)
+      except RegexLimitError:
+        sawByteGuard = true
+      except RegexError as e:
+        sawLevelCap = "nesting too deep" in e.msg
+      when compileOption("exceptions", "setjmp") and defined(gcDestructors):
+        # A level costs much more under setjmp (see the test above), so the
+        # frame size decides which guard answers first. Under ``orc`` the
+        # parser runs past the byte budget before the 300th level -- which is
+        # the whole reason the guard counts bytes.
+        check sawByteGuard
       else:
-        var sawLevelCap = false
-        try:
-          discard re(tooDeep)
-        except RegexLimitError:
-          discard
-        except RegexError as e:
-          sawLevelCap = "nesting too deep" in e.msg
+        # Every other build leaves a level small enough to reach the cap
+        # first: goto exceptions spend a few hundred bytes on one, and
+        # ``refc`` frames carry no destructor bookkeeping.
         check sawLevelCap

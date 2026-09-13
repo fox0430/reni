@@ -206,6 +206,30 @@ type
     ckAlwaysTrue ## (?()...) empty condition, (?({...})...) code condition
     ckRegexCond ## (?(regex)...) - bare name that's not a capture group
 
+  NameRefs* = distinct int32
+    ## **Internal API.** Offset into ``Regex``'s name-reference table of the
+    ## capture groups one ``\k<name>``, ``\g<name>`` or ``(?(<name>)...)``
+    ## resolves to, in declaration order.  A run and not an index, because a
+    ## name may be declared twice.
+    ##
+    ## The slot at the offset holds the run's length and the indices follow,
+    ## so a reference costs one ``int32`` on the node -- ``nkConditional`` has
+    ## no room for two.  Read it with [nameRefsOf]; ``NoNameRefs`` is the
+    ## reserved empty run.  Filled in by [resolveNameRefs].
+    ##
+    ## ``distinct``, and so is [NodeId]: the two index different tables at the
+    ## same width, so a plain alias would let one be read as the other.
+
+  NodeId* = distinct int32
+    ## **Internal API.** Index of a node in ``Regex``'s node table, as handed
+    ## out by [numberNodes].  What the matcher's frame and backtrack stacks
+    ## hold instead of a ``Node``: a plain integer needs no cursor, no write
+    ## barrier and no destructor, whatever the memory management.
+    ## ``NoNodeId`` is the table's reserved slot, so a default-initialised
+    ## field reads back as "no node".
+    ##
+    ## ``distinct`` for the reason [NameRefs] gives.
+
   Node* {.acyclic.} = ref object
     ## **Internal API.** Fields are exported only so `compiler` and `engine`
     ## can walk the tree. The shape may change without notice, and mutating
@@ -213,6 +237,10 @@ type
     ##
     ## ``{.acyclic.}``: trees are built strictly top-down and never spliced
     ## into themselves; ``nkSubexpCall`` resolves by index/name at match time.
+    id*: NodeId
+      ## This node's slot in the ``Regex``'s node table, or ``NoNodeId`` until
+      ## [numberNodes] runs.  Lives before the discriminant, in padding the
+      ## variant spends anyway; the size check under the type holds it there.
     case kind*: NodeKind
     of nkLiteral:
       rune*: Rune
@@ -290,6 +318,7 @@ type
     of nkNamedBackref:
       backrefName*: string
       namedBackrefLevel*: int ## recursion-level offset for \k<name+level> (0 = normal)
+      backrefRefs*: NameRefs ## groups ``backrefName`` resolves to
     of nkLookaround:
       lookKind*: LookaroundKind
       lookBody*: Node
@@ -315,14 +344,19 @@ type
         ## Same rule, covering ``condBody`` alone -- see ``condHolds``.  Kept
         ## next to ``condKind`` so the two small fields share one padding slot;
         ## on its own the node grows past 64 bytes.
+      condRefs*: NameRefs
+        ## Groups ``condRefName`` resolves to; here, in the rest of that same
+        ## padding slot, since this branch is the one on the 64-byte line.
       condRefIndex*: int ## capture index for ckBackref
       condRefName*: string ## capture name for ckNamedRef
+
       condYes*: Node ## yes branch
       condNo*: Node ## no branch (nil if absent)
       condBody*: Node ## regex body for ckRegexCond
     of nkSubexpCall:
       callIndex*: int ## capture group index to call (-1 for named)
       callName*: string ## capture group name (empty for numeric)
+      callRefs*: NameRefs ## groups ``callName`` resolves to
     of nkAbsent:
       absentKind*: AbsentKind
       absentBody*: Node ## absent pattern (nil for abClear)
@@ -378,9 +412,37 @@ when sizeof(pointer) == 8 and not defined(nimdoc):
   # and Nim 2.0.x's compile-time layout for this variant disagrees with the
   # one it emits (56 vs 64); the check belongs to the build that lays the
   # node out for real.
+  #
+  # The number is also the memory management's: a traced-GC ``seq`` and
+  # ``string`` are one pointer each where ``arc``/``orc`` spend a pointer and
+  # a length, so the node lays out one word narrower under ``--mm:refc``.
+  # Both are pinned, so neither build can grow it unnoticed.
+  #
+  # ``id`` is free either way -- it fits in the padding the discriminant's
+  # alignment already leaves -- which is what these unchanged numbers record.
+  const expectedNodeSize = when defined(gcDestructors): 64 else: 56
   static:
-    doAssert sizeof(typeof(default(Node)[])) == 64,
-      "Node grew to " & $sizeof(typeof(default(Node)[])) & " bytes; see the note here"
+    doAssert sizeof(typeof(default(Node)[])) == expectedNodeSize,
+      "Node grew to " & $sizeof(typeof(default(Node)[])) & " bytes, expected " &
+        $expectedNodeSize & "; see the note here"
+
+proc `==`*(a, b: NameRefs): bool {.borrow.}
+  ## **Internal API.** Two offsets naming the same run.  Only equality is
+  ## borrowed: the arithmetic that walks a run belongs to [nameRefsOf].
+
+proc `==`*(a, b: NodeId): bool {.borrow.}
+  ## **Internal API.** Two ids naming the same node.  Only equality is
+  ## borrowed, so an id cannot be added to or ordered against anything by
+  ## accident; indexing the table is [nodes]'s job.
+
+const NoNameRefs* = NameRefs(0)
+  ## **Internal API.** The name-reference table's reserved empty run, so a
+  ## [NameRefs] field nobody wrote names no group rather than the first one's.
+
+const NoNodeId* = NodeId(0)
+  ## **Internal API.** The node table's reserved slot 0, which holds ``nil``.
+  ## Real nodes are numbered from 1, so an unwritten [NodeId] reads as "no
+  ## node" rather than as the root, and an optional node needs no flag.
 
 const
   acWord* = 0x0001'u16
@@ -660,9 +722,19 @@ type
   Regex* = object
     pattern: string
     ast: Node
+    nodes: seq[Node]
+      ## Every node reachable from ``ast``, indexed by its [NodeId]; slot 0 is
+      ## ``nil``.  The matcher's stacks name a node by its index here rather
+      ## than holding it, which is what keeps those entries plain data.  Built
+      ## by ``initRegex``, so a ``Regex`` cannot exist with the two out of step.
     flags*: RegexFlags
     captureCount: int
     namedCaptures: seq[(string, int)]
+    nameRefs: seq[int32]
+      ## Every name reference's run of capture-group indices, concatenated,
+      ## each run preceded by its length; slot 0 is a zero length.  A node
+      ## holds its own run's offset (see [NameRefs]), so resolving
+      ## ``\k<name>`` is a load, not a walk of ``namedCaptures``.
     groupBodies: seq[Node]
     groupFlags*: seq[RegexFlags] ## flags active when each group was defined
     firstCharInfo: FirstCharInfo
@@ -709,10 +781,34 @@ const UnsetSpan* = Span(a: -1, b: -1)
   ## range (e.g. a non-participating capture group, or `matchSpan` on a
   ## `Match` where `found` is false).
 
-proc pattern*(r: Regex): string {.inline.} =
+proc pattern*(r: Regex): lent string {.inline.} =
   r.pattern
 
-proc ast*(r: Regex): Node {.inline.} =
+proc nodes*(r: Regex): lent seq[Node] {.inline.} =
+  ## **Internal API.** The node table [NodeId]s index; see ``Regex.nodes``.
+  r.nodes
+
+proc nameRefCount*(r: Regex, refs: NameRefs): int32 {.inline.} =
+  ## **Internal API.** How many capture groups ``refs`` names.
+  r.nameRefs[refs.int]
+
+proc nameRefFirst*(r: Regex, refs: NameRefs): int32 {.inline.} =
+  ## **Internal API.** The first capture group ``refs`` names, or -1 for none.
+  ## What a ``\g<name>`` call wants: it enters one body, so a name declared
+  ## twice calls the first.
+  if r.nameRefs[refs.int] > 0:
+    r.nameRefs[refs.int + 1]
+  else:
+    -1
+
+iterator nameRefsOf*(r: Regex, refs: NameRefs): int32 =
+  ## **Internal API.** The capture groups ``refs`` names, 0-based, in
+  ## declaration order -- the order ``\k<name>`` has to try them in, since it
+  ## takes the first of them that matches.
+  for k in 1 .. r.nameRefs[refs.int].int:
+    yield r.nameRefs[refs.int + k]
+
+proc ast*(r: Regex): lent Node {.inline.} =
   ## **Internal API.** Returns the compiled AST root, for this repository's
   ## parser/engine tests only — it WILL be removed or restricted. Use the
   ## documented API (``captureText``, ``captureSpan``, ``captureIndex``,
@@ -722,10 +818,10 @@ proc ast*(r: Regex): Node {.inline.} =
 proc captureCount*(r: Regex): int {.inline.} =
   r.captureCount
 
-proc namedCaptures*(r: Regex): seq[(string, int)] {.inline.} =
+proc namedCaptures*(r: Regex): lent seq[(string, int)] {.inline.} =
   r.namedCaptures
 
-proc groupBodies*(r: Regex): seq[Node] {.inline.} =
+proc groupBodies*(r: Regex): lent seq[Node] {.inline.} =
   r.groupBodies
 
 proc firstCharInfo*(r: Regex): FirstCharInfo {.inline.} =
@@ -749,42 +845,9 @@ proc levelBackrefs*(r: Regex): bool {.inline.} =
   ## capture history, which costs a write on every capture.
   r.levelBackrefs
 
-proc leadRun*(r: Regex): Node {.inline.} =
+proc leadRun*(r: Regex): lent Node {.inline.} =
   ## Leading repeat whose run a failed attempt may skip, or nil.
   r.leadRun
-
-proc initRegex*(
-    pattern: string,
-    ast: Node,
-    flags: RegexFlags,
-    captureCount: int,
-    namedCaptures: seq[(string, int)],
-    groupBodies: seq[Node],
-    groupFlags: seq[RegexFlags],
-    firstCharInfo: FirstCharInfo,
-    literalScan: bool = false,
-    requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
-    semiEndAnchored: bool = false,
-    semiEndDMax: int = -1,
-    levelBackrefs: bool = true,
-    leadRun: Node = nil,
-): Regex =
-  Regex(
-    pattern: pattern,
-    ast: ast,
-    flags: flags,
-    captureCount: captureCount,
-    namedCaptures: namedCaptures,
-    groupBodies: groupBodies,
-    groupFlags: groupFlags,
-    firstCharInfo: firstCharInfo,
-    literalScan: literalScan,
-    requiredByte: requiredByte,
-    semiEndAnchored: semiEndAnchored,
-    semiEndDMax: semiEndDMax,
-    levelBackrefs: levelBackrefs,
-    leadRun: leadRun,
-  )
 
 proc span*(a, b: int): Span {.inline.} =
   Span(a: a, b: b)
@@ -837,6 +900,136 @@ iterator childNodes*(node: Node): Node =
       yield node.absentExpr
   else:
     discard
+
+proc numberNodes*(ast: Node): seq[Node] =
+  ## Give every node reachable from ``ast`` its slot in the returned table and
+  ## record that slot on the node, so both directions of the mapping are built
+  ## together and cannot disagree.
+  ##
+  ## Slot 0 is reserved and holds ``nil`` (see ``NoNodeId``).  A node reached
+  ## twice is numbered once: a rewrite may leave one subtree under two
+  ## parents, so the tree is a DAG as far as this is concerned.
+  ##
+  ## Runs on the final tree: a later rewrite would hand the matcher an index
+  ## for a node no longer in it.  Numbering twice is that mistake in visible
+  ## form and is refused, as is a subtree borrowed from another numbered tree,
+  ## whose id names a slot in *that* table.
+  result = @[Node(nil)]
+  if ast == nil:
+    return
+  doAssert ast.id == NoNodeId,
+    "numberNodes: this tree is already numbered; number the final tree once"
+  var pending = @[ast]
+  while pending.len > 0:
+    let node = pending.pop()
+    if node.id != NoNodeId:
+      # Numbered already.  On this walk, if the id names this very node in the
+      # table being built -- the DAG case, and nothing more to do.  Anything
+      # else is a node borrowed from another numbered tree: its id would index
+      # this table at an offset naming a different node, or past its end.
+      doAssert node.id.int < result.len and result[node.id.int] == node,
+        "numberNodes: this tree shares a subtree with another numbered tree"
+      continue
+    node.id = NodeId(result.len)
+    result.add(node)
+    for child in childNodes(node):
+      if child != nil:
+        pending.add(child)
+
+proc resolveNameRefs*(nodes: seq[Node], namedCaptures: seq[(string, int)]): seq[int32] =
+  ## Resolve every name reference in ``nodes`` to the capture groups it names,
+  ## recording the run's offset on the node and returning the table the
+  ## offsets index.
+  ##
+  ## Runs over the node table rather than the tree, so it reaches exactly what
+  ## [numberNodes] numbered.  Slot 0 is a zero length, so a node this never
+  ## visits -- a numeric ``\g<1>``, say -- names no group.
+  ##
+  ## A name declared twice yields a run of both groups, in declaration order,
+  ## which is why one index would not do: ``\k<name>`` tries each, and
+  ## ``(?(<name>)...)`` holds if any of them captured.
+  result = @[0'i32]
+  if namedCaptures.len == 0:
+    return
+  # One run per distinct name, not per reference: a pattern naming one group
+  # from a hundred places stores one copy of the answer, not a hundred.
+  var runs: Table[string, int32]
+  for node in nodes:
+    if node == nil:
+      continue
+    template resolve(name: string, field: untyped) =
+      if name.len > 0:
+        var off = runs.getOrDefault(name, -1'i32)
+        if off < 0:
+          off = int32(result.len)
+          result.add(0'i32)
+          for (declared, index) in namedCaptures:
+            if declared == name:
+              result.add(int32(index))
+          let found = int32(result.len) - off - 1
+          if found == 0:
+            # Nothing to point at: drop the length slot again and record the
+            # reserved empty run, so the next reference skips the scan.
+            result.setLen(off)
+            off = int32(NoNameRefs)
+          else:
+            result[off] = found
+          runs[name] = off
+        field = NameRefs(off)
+
+    case node.kind
+    of nkNamedBackref:
+      resolve(node.backrefName, node.backrefRefs)
+    of nkConditional:
+      if node.condKind == ckNamedRef:
+        resolve(node.condRefName, node.condRefs)
+    of nkSubexpCall:
+      resolve(node.callName, node.callRefs)
+    else:
+      discard
+
+proc initRegex*(
+    pattern: string,
+    ast: Node,
+    flags: RegexFlags,
+    captureCount: int,
+    namedCaptures: seq[(string, int)],
+    groupBodies: seq[Node],
+    groupFlags: seq[RegexFlags],
+    firstCharInfo: FirstCharInfo,
+    literalScan: bool = false,
+    requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
+    semiEndAnchored: bool = false,
+    semiEndDMax: int = -1,
+    levelBackrefs: bool = true,
+    leadRun: Node = nil,
+): Regex =
+  ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
+  ## references happen here rather than in the caller: the matcher reaches a
+  ## node through one of the tables this fills in and a name through the
+  ## other, so a ``Regex`` built without them would match nothing at all.
+  let nodeTable = numberNodes(ast)
+  # Resolved before the constructor so `nodes: nodeTable` below is the table's
+  # last use and moves; reading it inside the constructor would `=dup` it.
+  let refs = resolveNameRefs(nodeTable, namedCaptures)
+  Regex(
+    pattern: pattern,
+    ast: ast,
+    nodes: nodeTable,
+    nameRefs: refs,
+    flags: flags,
+    captureCount: captureCount,
+    namedCaptures: namedCaptures,
+    groupBodies: groupBodies,
+    groupFlags: groupFlags,
+    firstCharInfo: firstCharInfo,
+    literalScan: literalScan,
+    requiredByte: requiredByte,
+    semiEndAnchored: semiEndAnchored,
+    semiEndDMax: semiEndDMax,
+    levelBackrefs: levelBackrefs,
+    leadRun: leadRun,
+  )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =
   ## ASCII letters folded to lower case, every other byte unchanged.
