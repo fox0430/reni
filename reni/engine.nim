@@ -1810,7 +1810,7 @@ proc lookbehindVarHolds(ctx: MatchContext, node: Node, bodyLen: LenBounds): bool
   ## Whether variable-length positive lookbehind matches ending at ``ctx.pos``.
   ## Scans shortest-first, commits to first match, takes no continuation.
   let targetEnd = ctx.pos
-  let body = node.lookBody
+  let body {.cursor.} = node.lookBody
   let mbl = bodyLen.maxLen
   let minPos =
     if mbl >= 0:
@@ -1840,7 +1840,7 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
   ## Whether negative lookbehind succeeds (body matches nowhere ending here).
   ## Takes no continuation; restores ``ctx`` either way.
   let targetEnd = ctx.pos
-  let body = node.lookBody
+  let body {.cursor.} = node.lookBody
   if body.kind == nkAlternation:
     # Try each alternative independently — if ANY matches, negative fails
     for i, alt in body.alternatives:
@@ -1920,7 +1920,7 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
     rewind(ctx, ctx.choices[top].lbaSaved)
     restoreStackLens(ctx, @(ctx.stackLensSaves[int(ctx.choices[top].lbaLensOff)]))
   while k < node.lookBody.alternatives.len:
-    let alt = node.lookBody.alternatives[k]
+    let alt {.cursor.} = node.lookBody.alternatives[k]
     let altLen = ctx.altBounds(node, k, alt)
     let altFbl = altLen.fixedLen
     if altFbl >= 0:
@@ -2057,7 +2057,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
   of abExpression:
     # (?~|absent|expr) - match expr, limiting range to exclude absent
     let startPos = ctx.pos
-    let absentBody = node.absentBody
+    let absentBody {.cursor.} = node.absentBody
     # Find first position where absent matches
     var absentPos = ctx.subjectEnd
     block findAbsent:
@@ -2093,7 +2093,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
     return ok
   of abRange:
     # (?~|absent) - range marker: zero-width, limits subjectEnd
-    let absentBody = node.absentBody
+    let absentBody {.cursor.} = node.absentBody
     var absentPos = ctx.subjectEnd
     block findAbsent:
       var checkPos = ctx.pos
@@ -2742,7 +2742,7 @@ proc runMachine(
       of nkCapture, nkNamedCapture:
         let index =
           if node.kind == nkCapture: node.captureIndex else: node.namedCaptureIndex
-        let body =
+        let body {.cursor.} =
           if node.kind == nkCapture: node.captureBody else: node.namedCaptureBody
         ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
         # Capture recursion depth at entry time (before continuations modify it)
@@ -2775,7 +2775,7 @@ proc runMachine(
           qkind = qkPossessive
         case qkind
         of qkGreedy:
-          let body = node.quantBody
+          let body {.cursor.} = node.quantBody
           if ctx.isSingleWayLeaf(body):
             # Single-way body: forward scan, one int per rep for backtracking.
             let scalars = saveScalars(ctx)
@@ -2817,7 +2817,7 @@ proc runMachine(
         of qkPossessive:
           # Possessive: greedy with no count backtracking; only a rollback for
           # continuation failure. Pure bodies need scalars only.
-          let body = node.quantBody
+          let body {.cursor.} = node.quantBody
           let savedScalars = saveScalars(ctx)
           var count = 0
           if not node.quantBodyPure:
@@ -3113,7 +3113,7 @@ proc runMachine(
         # the capture frame is the existing `ckCapture` machinery, and one
         # `chSubexpScope` entry owns the recursion depths and the flag switch
         # a native frame used to hold until the whole match resolved.
-        var body: Node = nil
+        var body {.cursor.}: Node = nil
         var captureIdx = -1
         if node.callIndex == 0:
           body = ctx.regex[].ast
@@ -3174,7 +3174,7 @@ proc runMachine(
       else:
         # Fold consecutive range markers inline; first non-marker runs next.
         while seqIdx < seqNode.children.len:
-          let mk = seqNode.children[seqIdx]
+          let mk {.cursor.} = seqNode.children[seqIdx]
           if mk.kind == nkAbsent and mk.absentKind == abRange:
             let absentPos = findAbsentPos(ctx, mk.absentBody, ctx.pos)
             let savedEnd = ctx.subjectEnd
@@ -3909,7 +3909,7 @@ proc searchImplInto*(
   # ``exhausted`` means no candidate is left. ``leadLeafNode`` is resolved once:
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
-  let leadLeafNode = nodeAt(ctx, ctx.leadLeaf)
+  let leadLeafNode {.cursor.} = nodeAt(ctx, ctx.leadLeaf)
   # Set once an attempt may have moved the leaf test's inputs.
   var prefilterDirty = false
   while true:
