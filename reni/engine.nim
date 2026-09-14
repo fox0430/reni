@@ -237,6 +237,8 @@ type
     chQuantLazy ## lazy quantifier: the continuation failed, repeat once more
     chZeroWidthRep ## zero-width repetition: drive the body to change captures
     chSimpleRepeat ## greedy repetition of a single-way leaf: give one rep back
+    chLazyScan
+      ## lazy repetition of a single-way leaf: scan to the next admissible position
     chUndoState ## roll back to a snapshot, then keep failing
     chUndoSparse ## roll back the scalars and only the groups a body wrote
     chUndoScalars ## roll back everything but the captures, then keep failing
@@ -303,6 +305,15 @@ type
         ## covers what the continuation changed (``\K``, flags). Captures need
         ## no snapshot: a single-way leaf writes none, and continuation
         ## captures have their own ``chUndoCapture`` entries.
+    of chLazyScan:
+      lsBody: NodeId
+      lsNext: NodeId ## continuation leaf, ``Node.quantNextLeaf``
+      lsCont: ContId
+      lsFramesLen: int32
+      lsCount: int32 ## repetitions currently handed to the continuation
+      lsMaxRep: int32
+      lsPos: int ## stop position of those reps; the scan only moves forward
+      lsScalars: ScalarState ## state at repeat start; see ``srScalars``
     of chZeroWidthRep:
       zBody: NodeId
       zCont: ContId
@@ -1453,9 +1464,10 @@ const LeadLeafCapacity = 256'i32
   ## without reaching the int32 limit.
 
 proc leadLeafMatches(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether the leading leaf matches at ``ctx.pos``. One character test, no
-  ## writes. Only single-way leaves qualify, so one variant decides; for a
-  ## class that is the plain match, not variant 0 (a fold).
+  ## Whether the leaf matches at ``ctx.pos``. One character test, no writes.
+  ## Only single-way leaves qualify, so one variant decides; for a class that
+  ## is the plain match, not variant 0 (a fold). ``nkString`` tests the whole
+  ## run; only the lazy scan reaches it.
   case node.kind
   of nkLiteral, nkEscapedLiteral:
     leafVariantAdvance(ctx, node, 0) >= 0
@@ -1463,8 +1475,30 @@ proc leadLeafMatches(ctx: MatchContext, node: Node): bool {.inline.} =
     leafVariantAdvance(ctx, node, classFirstVariant(ctx, node)) >= 0
   of nkCharType:
     charTypeAdvance(ctx, node.charType) >= 0
+  of nkString:
+    stringAdvance(ctx, node) >= 0
   else:
     raiseAssert "leadLeaf is not a leaf kind"
+
+proc lazyScanAdvance(
+    ctx: MatchContext, body, nextLeaf: Node, count: var int32, maxRep: int32
+): bool =
+  ## Step ``body`` forward to where ``nextLeaf`` matches. ``count`` and
+  ## ``ctx.pos`` are left at what the walk reached; the caller restores them
+  ## on a false. One scan suffices since a single-way body has no second way
+  ## per repetition.
+  while true:
+    if ctx.pos < ctx.subjectEnd and leadLeafMatches(ctx, nextLeaf):
+      return true
+    if maxRep >= 0 and count >= maxRep:
+      return false
+    let before = ctx.pos
+    if not matchWithCont(ctx, body, TrueCont):
+      ctx.pos = before
+      return false
+    if ctx.pos == before:
+      return false # zero-width: a single-way leaf cannot vary, so stop
+    inc count
 
 proc isLeafLookbehindBody(node: Node): bool {.inline.} =
   ## Whether a lookbehind body is a single leaf, and so answerable in place by
@@ -2413,6 +2447,30 @@ type MachineMode = enum
   mCont ## run the continuation chain from ``cont``
   mFail ## backtrack into the most recent choice
 
+proc lazyScanResume(ctx: MatchContext, top: int): bool {.noinline.} =
+  ## Resume the scan at ``ctx.choices[top]`` with one more rep, then scan on.
+  ## Out of line to keep ``runMachine``'s switch small enough for ``pushChoice``
+  ## to stay inlined.
+  restoreScalars(ctx, ctx.choices[top].lsScalars)
+  ctx.framesLen = ctx.choices[top].lsFramesLen
+  ctx.pos = ctx.choices[top].lsPos
+  let body {.cursor.} = ctx.nodeAt(ctx.choices[top].lsBody)
+  let nextLeaf {.cursor.} = ctx.nodeAt(ctx.choices[top].lsNext)
+  let maxRep = ctx.choices[top].lsMaxRep
+  var count = ctx.choices[top].lsCount
+  if maxRep < 0 or count < maxRep:
+    let before = ctx.pos
+    if matchWithCont(ctx, body, TrueCont) and ctx.pos != before:
+      inc count
+      if lazyScanAdvance(ctx, body, nextLeaf, count, maxRep):
+        ctx.choices[top].lsCount = count
+        ctx.choices[top].lsPos = ctx.pos
+        return true
+    else:
+      ctx.pos = before
+  restoreScalars(ctx, ctx.choices[top].lsScalars)
+  false
+
 proc runMachine(
     ctx: MatchContext, startNode: Node, startCont: ContId, startMode = mMatch
 ): bool =
@@ -2811,9 +2869,41 @@ proc runMachine(
           else:
             startGreedy(body, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure)
         of qkLazy:
-          startLazy(
-            node.quantBody, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure
-          )
+          let body {.cursor.} = node.quantBody
+          let nextLeaf {.cursor.} = node.quantNextLeaf
+          # Leaf test needs folding off, then and now; both leaves single-way.
+          if nextLeaf != nil and
+              (ctx.flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0 and
+              ctx.isSingleWayLeaf(body) and ctx.isSingleWayLeaf(nextLeaf):
+            # Mandatory reps, then scan to the first admissible position.
+            let scalars = saveScalars(ctx)
+            var count = 0'i32
+            var atMin = true
+            while count < int32(qmin):
+              let before = ctx.pos
+              if not matchWithCont(ctx, body, TrueCont) or ctx.pos == before:
+                ctx.pos = before
+                atMin = false
+                break
+              inc count
+            if atMin and lazyScanAdvance(ctx, body, nextLeaf, count, int32(qmax)):
+              ctx.pushChoice Choice(
+                kind: chLazyScan,
+                lsBody: body.id,
+                lsNext: nextLeaf.id,
+                lsCont: cont,
+                lsFramesLen: ctx.framesLen.int32,
+                lsCount: count,
+                lsMaxRep: int32(qmax),
+                lsPos: ctx.pos,
+                lsScalars: scalars,
+              )
+              mode = mCont
+            else:
+              restoreScalars(ctx, scalars)
+              mode = mFail
+          else:
+            startLazy(body, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure)
         of qkPossessive:
           # Possessive: greedy with no count backtracking; only a rollback for
           # continuation failure. Pure bodies need scalars only.
@@ -3473,6 +3563,13 @@ proc runMachine(
           ctx.framesLen = ctx.choices[top].srFramesLen
           cont = ctx.choices[top].srCont
           mode = mCont
+      of chLazyScan:
+        if lazyScanResume(ctx, top):
+          cont = ctx.choices[top].lsCont
+          mode = mCont
+        else:
+          ctx.choicesLen = top
+          mode = mFail
       of chQuantGreedy:
         rollBackQuant(top)
         ctx.framesLen = ctx.choices[top].qcFramesLen

@@ -1164,6 +1164,139 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
   test "grapheme repetition still steps by grapheme":
     check search("áb", re("\\X*b")).found
 
+suite "a lazy repeat of a single-way leaf is a scan, not a choice per rep":
+  # The mirror image of the greedy scan above.  Greedy takes every repetition
+  # it can and hands them back; lazy takes as few as it can and adds them, so
+  # the general path pushes a choice and re-enters the dispatch once per
+  # character the body steps over.  Where the compiler can name the leaf the
+  # continuation must match, the matcher walks the body forward to the next
+  # position that leaf admits instead, and pushes one choice for the run.
+
+  proc lazyScanned(pattern: string, flags: RegexFlags = {}): bool =
+    ## Whether any lazy repeat in ``pattern`` carries the annotation the scan
+    ## is gated on.  What the gates refuse is not visible in an answer -- both
+    ## paths answer the same thing -- so read the annotation itself.
+    proc walk(n: Node): bool =
+      if n == nil:
+        return false
+      if n.kind == nkQuantifier and n.quantKind == qkLazy and n.quantNextLeaf != nil:
+        return true
+      for c in n.childNodes:
+        if walk(c):
+          return true
+      false
+
+    walk(re(pattern, flags).ast)
+
+  test "the backtrack stack does not grow with the subject":
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "a".repeat(50_000) & "b", re("a*?b"), m, stepLimit = 0)
+    check m.boundaries[0] == 0 .. 50_001
+    check ctx.scratchCaps.choices <= 16
+    check ctx.scratchCaps.frames <= 16
+
+  test "it still takes as few repetitions as it can":
+    check search("aaa", re("a*?a")).boundaries[0] == 0 .. 1
+    check search("aaaaab", re("a{2,4}?b")).boundaries[0] == 1 .. 6
+    check search("aaab", re("a{0,2}?b")).boundaries[0] == 1 .. 4
+    check search("aaaab", re("a{3,}?b")).boundaries[0] == 0 .. 5
+    check search("12345", re("\\d*?5")).boundaries[0] == 0 .. 5
+    check search("abcbc", re("[a-c]*?c")).boundaries[0] == 0 .. 3
+    check search("b", re("a*?b")).boundaries[0] == 0 .. 1
+    check not search("aaa", re("a*?b")).found
+
+  test "the scan resumes past a position the continuation refused":
+    # ``b`` admits position 1, where ``bc`` does not match; the retry has to
+    # carry on from there rather than give up or start over.
+    check search("xbxbc", re("\\w*?bc")).boundaries[0] == 0 .. 5
+    check search("say \"hi\" there", re("\"[^\"]*?\"")).boundaries[0] == 4 .. 8
+
+  test "a scan that cannot reach a minimum or a later position fails":
+    # ``qmin`` is not reached: the scan must not start from an under-filled
+    # count and hand the continuation repetitions the body never matched.
+    check not search("aab", re("a{3,}?b")).found
+    # The first leaf the scan admits is refused by the rest of the
+    # continuation, and no later repetition reaches another admissible
+    # position, so the choice has to be popped and the match fail.
+    check not search("abcby", re("\\w*?[b]cx")).found
+    # ``maxRep`` is reached before the leaf admits anything.
+    check not search("aab", re("a{2}?c")).found
+
+  test "a repetition over malformed bytes still ends where the decoder said":
+    check search("\x80\x80x", re("[^a]*?(.)x")).boundaries[1] == 1 .. 2
+    # The first case's continuation leaf is ``.``, which the annotation
+    # refuses, so only the general path runs.  A leaf the scan does read has
+    # to stop where the decoder said too: a stray continuation byte decodes
+    # as a code point of its own, and the scan counts those same steps.
+    check search("\x80\x80x", re("[^a]*?(x)")).boundaries[1] == 2 .. 3
+
+  test "resuming the scan undoes what ran after it":
+    # The repetitions write only ``pos``; the continuation is not so bounded,
+    # so the entry carries the scalars the way the general path's snapshot
+    # does.  Here ``\K`` moves the match start at a position the continuation
+    # then refuses, and the start it reports must not survive into the one
+    # that matches.
+    check search("xbxbc", re("\\w*?\\Kbc")).boundaries[0] == 3 .. 5
+    check search("abcaaaaaaaaaaaa", re("a{1,3}?(?i)a|\\b\\Kab")).boundaries[0] == 3 .. 5
+
+  test "a body or a leaf with two ways to match keeps the general path":
+    # Under (?i) ``a`` also matches ``A`` and ``ß`` matches ``ss``, so one
+    # variant no longer decides the body or the leaf test.  A leading ``(?i)``
+    # is an isolated flag group, and a scoped ``(?i:...)`` restores the flags
+    # on its way out, so neither reaches the flags the annotation is chosen
+    # under: it is the matcher's own check on the flags in force that refuses
+    # these, and the annotation is there.
+    check lazyScanned("(?i)a*?B")
+    check search("aab", re("(?i)a*?B")).boundaries[0] == 0 .. 3
+    check search("aAab", re("(?i)a*?b")).boundaries[0] == 0 .. 4
+    check search("\xC3\x9Fss", re("(?i)\xC3\x9F*?ss")).boundaries[0] == 0 .. 2
+    check search("aab", re("(?i:a*?B)")).boundaries[0] == 0 .. 3
+
+  test "the runtime gates keep what the annotation cannot see":
+    # The scan steps the body with one way per repetition, so a body with two
+    # ways has to stay on the general path even where the continuation leaf is
+    # known: committing to the first branch steps over the match.
+    check lazyScanned("(?:abcd|a)*?bc")
+    check search("abcdbx", re("(?:abcd|a)*?bc")).boundaries[0] == 0 .. 3
+    # Under (?i) a class is not one test, and the scan's leaf test reads the
+    # fold variant rather than the plain byte.  The annotation is there, so
+    # only the gates keep this case off the scan.
+    check lazyScanned("(?i)a*?[b]")
+    check search("aab", re("(?i)a*?[b]")).boundaries[0] == 0 .. 3
+
+  test "the leaf has to be one the continuation cannot get past":
+    check lazyScanned("a*?b")
+    check lazyScanned("(a*?)b") # a capture finishes into its own continuation
+    check lazyScanned("(?:a*?|x)b") # and so does an alternation branch
+    check lazyScanned("(?>a*?bc)") # ``bc`` is inside the atomic group, not past it
+    check search("aabc", re("(?>a*?bc)")).boundaries[0] == 0 .. 4
+    # A run of literals is one leaf too, just a wider test.
+    check lazyScanned("<!--.*?--\x3ex")
+    check search("<!--a--\x3eb<!--c--\x3ex", re("<!--.*?--\x3ex")).boundaries[0] ==
+      0 .. 18
+    check not lazyScanned("a*?") # nothing follows
+    check not lazyScanned("a*?$") # nothing that consumes does
+    check not lazyScanned("a*?(?=b)") # nor here: the assertion is zero-width
+    check not lazyScanned("a*?.") # ``.`` is no character test
+    check not lazyScanned("a*?(?:b|c)") # an alternation is not one leaf either
+    check not lazyScanned("a*?b*") # nor is a repeat that need not match
+
+  test "a construct that cuts the backtracking keeps the general path":
+    # Inside ``(?>...)`` a repeat that stopped later than it does today could
+    # not be asked to stop earlier again, so the scan must not reach past the
+    # group's end.
+    check not lazyScanned("(?>a*?)b")
+    check search("aab", re("(?>a*?)b")).boundaries[0] == 2 .. 3
+    check not lazyScanned("(?=a*?)b")
+    # A flag group's end restores the flags the leaf would then be read under.
+    check not lazyScanned("(?s:a*?)b")
+    # ``\\g<...>`` makes a group body's continuation the call site's, so what
+    # follows the group lexically proves nothing about what follows the body.
+    check not lazyScanned("(a*?)b\\g<1>")
+    check lazyScanned("(a*?b)c") # ... but the sibling inside it is still safe
+    check search("aabaa", re("(a*?)b\\g<1>")).boundaries[0] == 0 .. 3
+
 suite "the ASCII class bitset and the atom walk agree by construction":
   # ``classAdvance`` answers a one-byte class member test from a bitset the
   # compiler precomputed, instead of walking the class's atoms.  The bitset is

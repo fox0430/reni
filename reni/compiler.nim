@@ -990,6 +990,97 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   else:
     nil
 
+proc lazyScanLeaf(node: Node, flags: RegexFlags): Node =
+  ## Leaf a continuation entered at ``node`` must match at entry, or nil.
+  ## Only kinds with a ``leadLeafMatches`` arm qualify, and only where the test
+  ## is necessary: refusing it must refuse the continuation too.
+  ##
+  ## Case folding widens a leaf, ``.``/``\X``/``\R`` test no character, and a
+  ## refused callout still counts, so none qualify. Anchors are skipped:
+  ## zero-width, with ``\K`` covered by the scan's own rollback.
+  if node == nil:
+    return nil
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return nil
+  case node.kind
+  of nkConcat:
+    for child in node.children:
+      if child.kind == nkAnchor:
+        continue
+      return lazyScanLeaf(child, flags)
+    nil
+  of nkCapture:
+    lazyScanLeaf(node.captureBody, flags)
+  of nkNamedCapture:
+    lazyScanLeaf(node.namedCaptureBody, flags)
+  of nkGroup:
+    lazyScanLeaf(node.groupBody, flags)
+  of nkAtomicGroup:
+    lazyScanLeaf(node.atomicBody, flags)
+  of nkQuantifier:
+    # Inverted range proves nothing about the first character.
+    if isInvertedRange(node.quantMin, node.quantMax):
+      nil
+    elif node.quantMin >= 1:
+      lazyScanLeaf(node.quantBody, flags)
+    else:
+      nil
+  of nkLiteral, nkEscapedLiteral, nkCharClass, nkString:
+    node
+  of nkCharType:
+    if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+  else:
+    nil
+
+proc hasSubexpCall(node: Node): bool =
+  ## Whether any ``\g<...>`` appears; a body may then run under another continuation.
+  if node == nil:
+    return false
+  if node.kind == nkSubexpCall:
+    return true
+  for child in node.childNodes:
+    if hasSubexpCall(child):
+      return true
+  false
+
+proc annotateLazyScanLeaf(node: Node, flags: RegexFlags, after: Node, calls: bool) =
+  ## Give every lazy repeat the leaf its continuation must match where it
+  ## stops, so the matcher can scan forward to it instead of trying each
+  ## position in turn.
+  ##
+  ## ``after`` is that leaf for ``node``; it passes through concats, groups,
+  ## captures and alternation branches only. Anything that cuts backtracking,
+  ## re-enters the repeat, restores flags, or may run under ``\g<...>`` stops it.
+  if node == nil:
+    return
+  let inner = if calls: nil else: after
+  case node.kind
+  of nkConcat:
+    # Right to left: each child's continuation starts at the next non-anchor child.
+    var tail = after
+    for i in countdown(node.children.high, 0):
+      let child = node.children[i]
+      annotateLazyScanLeaf(child, flags, tail, calls)
+      if child.kind != nkAnchor:
+        # Anchors are zero-width; anything else without a leaf resets the tail.
+        tail = lazyScanLeaf(child, flags)
+  of nkQuantifier:
+    if node.quantKind == qkLazy and not isInvertedRange(node.quantMin, node.quantMax):
+      node.quantNextLeaf = after
+    annotateLazyScanLeaf(node.quantBody, flags, nil, calls)
+  of nkAlternation:
+    for alt in node.alternatives:
+      annotateLazyScanLeaf(alt, flags, after, calls)
+  of nkCapture:
+    annotateLazyScanLeaf(node.captureBody, flags, inner, calls)
+  of nkNamedCapture:
+    annotateLazyScanLeaf(node.namedCaptureBody, flags, inner, calls)
+  of nkGroup:
+    annotateLazyScanLeaf(node.groupBody, flags, inner, calls)
+  else:
+    for child in node.childNodes:
+      annotateLazyScanLeaf(child, flags, nil, calls)
+
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
   ## Unbounded greedy repeat over a one-way leaf every match must start
   ## inside, or nil. The run must be unbounded: a bounded one reaches further
@@ -1163,6 +1254,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
   # ``regex.flags``), since an annotation is used only while the two agree.
   annotateLookaroundBounds(ast, finalFlags)
+  # Same flags: the leaf test holds only while folding stays off.
+  annotateLazyScanLeaf(ast, finalFlags, nil, hasSubexpCall(ast))
   # Re-collect group bodies after AST transformation
   bodies = @[]
   groupFlags = @[]

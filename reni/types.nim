@@ -289,6 +289,10 @@ type
         ## quantifier needs no per-iteration capture snapshot.  The default
         ## ``false`` is the safe value, so a node the pass never visits
         ## degrades to "always snapshot", never to "never".
+      quantNextLeaf*: Node
+        ## Lazy repeats only: leaf the continuation must match where the repeat
+        ## stops, or nil. Set by ``annotateLazyScanLeaf``; borrowed, not a
+        ## child, so ``childNodes`` skips it.
     of nkCharClass:
       # The widest branch in the variant, so its layout alone decides
       # ``sizeof(Node[])`` -- see the check under the type.  Keep the bools
