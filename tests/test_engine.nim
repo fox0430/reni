@@ -3196,3 +3196,139 @@ suite "MatchContext-based API":
   test "searchBackward rejects start < -1":
     expect ValueError:
       discard searchBackward("abc", re("a"), start = -2)
+
+suite "literal alternation trie":
+  # A trie answers the alternation in place of its branches, so what it has to
+  # preserve is the order the branches were written in -- the matcher owes the
+  # continuation the *first* branch that matches here, not the longest -- and
+  # it has to keep offering the rest on a backtrack.  Each test therefore
+  # pins a shape where a plain "longest wins" or "first found wins" walk gives
+  # a different answer, and ``hasTrie`` pins that the trie is what ran.
+
+  proc hasTrie(pattern: string, flags: RegexFlags = {}): bool =
+    proc walk(n: Node): bool =
+      if n == nil:
+        return false
+      if n.kind == nkAlternation and n.altTrie != nil:
+        return true
+      for c in n.childNodes:
+        if walk(c):
+          return true
+      false
+
+    walk(re(pattern, flags).ast)
+
+  test "a trie is built for an alternation of plain literals":
+    check hasTrie("(int|int8|uint|float)")
+    check hasTrie("a|bb")
+    # One branch that is not a literal takes the whole alternation back to the
+    # first-byte hints.
+    check not hasTrie("(int|int8|\\w|float)")
+    check not hasTrie("(int|int8|(u)|float)")
+    # An empty branch is zero-width, which the trie does not express.
+    check not hasTrie("(int|int8||float)")
+
+  test "case folding takes the alternation off the trie":
+    # Folding for the whole match is known when the tree is annotated, so no
+    # trie is built at all.
+    check not hasTrie("(int|int8|uint|float)", {rfIgnoreCase})
+    # A ``(?i)`` inside the pattern is not: the tree is annotated once, under
+    # no particular position's flags, so the trie is built and the matcher is
+    # what refuses it -- which it must, since the branches would then have to
+    # match folded.
+    check hasTrie("(?i)(int|int8|uint|float)")
+    check search("INT8", re("(?i)(int8|int)")).matchSpan == 0 .. 4
+    check search("Int", re("(?i)(int8|int)")).matchSpan == 0 .. 3
+    check search("uINT", re("(?i)(int|uint)\\b")).matchSpan == 0 .. 4
+    check search("INT8", re("(int8|int)", {rfIgnoreCase})).matchSpan == 0 .. 4
+    # Folding switched on past the alternation leaves it on the trie: the
+    # scoped group restores the flag on the way out, so a backtrack into the
+    # alternation is back to the bytes it was walked with.
+    check hasTrie("(int|int8|uint|float)(?i:x)")
+    check search("intX", re("(int|int8)(?i:x)")).matchSpan == 0 .. 4
+
+  test "the first branch written wins, not the longest":
+    check search("int8", re("(int|int8)")).matchSpan == 0 .. 3
+    check search("int8", re("(int8|int)")).matchSpan == 0 .. 4
+
+  test "a longer branch is still reachable through the continuation":
+    # ``int`` matches first and the ``\b`` after it fails, so the alternation
+    # has to hand back ``int8`` -- the walk found both and kept the order.
+    let r = re("\\b(int|int8|int16)\\b")
+    check search("int8 ", r).matchSpan == 0 .. 4
+    check search("int16 ", r).matchSpan == 0 .. 5
+    check search("int ", r).matchSpan == 0 .. 3
+    check not search("int32 ", r).found
+
+  test "every prefix is offered, deepest branch first where written first":
+    let r = re("(abcd|abc|ab|a)x")
+    check search("abcdx", r).matchSpan == 0 .. 5
+    check search("abcx", r).matchSpan == 0 .. 4
+    check search("abx", r).matchSpan == 0 .. 3
+    check search("ax", r).matchSpan == 0 .. 2
+
+  test "two branches spelling the same string are two branches":
+    # The second is unreachable in the span it matches, but it is what the
+    # group is left holding when the first is rolled back -- both name the
+    # same text, so the answer is the same either way and the retry must not
+    # crash or drop the match.
+    let r = re("(ab|ab|abc)\\b")
+    check search("abc ", r).matchSpan == 0 .. 3
+    check search("ab ", r).matchSpan == 0 .. 2
+
+  test "a branch is passed over when the subject does not spell it":
+    let r = re("(cat|car|cab)")
+    check not search("cap", r).found
+    check search("carp", r).matchSpan == 0 .. 3
+
+  test "multibyte literals walk the trie by bytes":
+    let r = re("(日本|日本語|日)")
+    check search("日本語", r).matchSpan == 0 .. 6
+    check search("日本", r).matchSpan == 0 .. 6
+    check search("日", r).matchSpan == 0 .. 3
+    # The branch order decides again: 日本 is written first, so the longer
+    # 日本語 is only reached when the continuation refuses the shorter one.
+    check search("日本語", re("(日本|日本語)$")).matchSpan == 0 .. 9
+
+  test "the group holds the branch the trie picked":
+    let r = re("(int|int8|uint)\\b")
+    let m = search("int8 ", r)
+    check captureText(m, 1, "int8 ").get == "int8"
+    let m2 = search("uint ", r)
+    check captureText(m2, 1, "uint ").get == "uint"
+
+  test "a quantified trie alternation repeats and gives back":
+    check search("abab", re("^(?:ab|abab)+$")).matchSpan == 0 .. 4
+    check search("aaa", re("^(?:a|aa)+$")).matchSpan == 0 .. 3
+    check search("ab", re("^(?:ab|a)+b?$")).matchSpan == 0 .. 2
+
+  test "findLongest takes the longest branch, not the first":
+    check search("int8", re("(?L)(int|int8)")).matchSpan == 0 .. 4
+
+  test "a trie alternation inside a lookaround":
+    check search("int8", re("(?=int8)(int|int8)")).matchSpan == 0 .. 3
+    # The assertion refuses position 0, so the scan takes the match one
+    # position along rather than not at all.
+    check search("into", re("(?!int|uint|float)\\w+")).matchSpan == 1 .. 4
+    check search("byte", re("(?!int|uint|float)\\w+")).matchSpan == 0 .. 4
+
+  test "an atomic trie alternation keeps the branch it took":
+    # The atomic group refuses to hand ``int8`` back, so the ``\b`` after it
+    # has nothing to retry and the whole match fails.
+    check not search("int8 ", re("(?>int|int8)\\b")).found
+    check search("int ", re("(?>int|int8)\\b")).matchSpan == 0 .. 3
+
+  test "a branch the narrowed end cut short is still offered once it widens":
+    # ``(?~|...)`` pulls ``subjectEnd`` in and ``(?~|)`` pushes it back out
+    # again, so a branch that does not fit while the end is narrow has to stay
+    # reachable afterwards.  The choice point therefore hangs on how many
+    # branches are untried, never on which of them the subject spells under
+    # the end at hand.
+    check hasTrie("(?~|bX)(a|ab)(?~|)X")
+    check search("abX", re("(?~|bX)(a|ab)(?~|)X")).matchSpan == 0 .. 3
+    check search("abcd", re("(?~|c)(ab|abcd|aa|abx)(?~|)\\b")).matchSpan == 0 .. 4
+    check search("abcabc", re("(?~|b)(?:a|abc|abcd)(?~|)ab")).matchSpan == 0 .. 5
+
+  test "nothing matches at the end of the subject":
+    check not search("in", re("(int|uint|float)")).found
+    check not search("", re("(int|uint|float)")).found

@@ -258,6 +258,11 @@ type
         ## widens a hint or gives up, so the entry stays a superset whatever
         ## flags are live at match time.  Empty means "no hints" and every
         ## alternative is tried.
+      altTrie*: AltTrie
+        ## Set when every branch is a plain literal and the pattern never
+        ## switches ``rfIgnoreCase`` on partway through: the matcher then
+        ## walks the trie instead of trying the branches, and ``altFirst``
+        ## goes unread. ``nil`` is the ordinary hinted path.
     of nkCapture:
       captureIndex*: int
       captureBody*: Node
@@ -385,6 +390,42 @@ type
         ## ``bytes`` under ``asciiFoldByte``, for the ignore-case compare of an
         ## ASCII run. Built alongside ``bytes`` so the compare loop tests a
         ## folded subject byte against a constant.
+
+  AltTrieEdge* = object
+    ## One labelled step of an [AltTrie]. The edges leaving a state are
+    ## contiguous and ascending in ``label``, so a walk gives up as soon as it
+    ## passes the byte it is after.
+    label*: uint8
+    next*: int32 ## state the edge leads to
+
+  AltTrieState* = object
+    ## One [AltTrie] state: where its edges and its terminals live in the
+    ## trie's flat arrays, and how many subject bytes reaching it consumed.
+    edgeOff*, edgeLen*: int32
+    termOff*, termLen*: int32
+      ## Run in ``AltTrie.terms`` of the alternatives that end here, ascending.
+      ## A run and not a single index because two branches may spell the same
+      ## string, and the second is still a branch the matcher must offer.
+    depth*: int32 ## bytes from the root, i.e. what a terminal here consumed
+
+  AltTrie* = ref object
+    ## Byte trie over an alternation whose every branch is a plain literal.
+    ## One walk answers what a first-byte hint per branch answers one branch
+    ## at a time, and more: a terminal names the branch *and* the offset past
+    ## it, so the matcher never re-compares the bytes the walk read.
+    ##
+    ## Only sound while ``rfIgnoreCase`` is off -- the edges are the literal's
+    ## own bytes, and a fold is neither a byte nor, for the multi-character
+    ## ones, a fixed number of them. Every reader tests the flag first, and
+    ## the compiler refuses to build one for a pattern that can switch the
+    ## flag on partway through (see ``altTriesUsable``).
+    states*: seq[AltTrieState] ## state 0 is the root
+    edges*: seq[AltTrieEdge]
+    terms*: seq[int32]
+    firstBytes*: set[uint8]
+      ## Bytes the root has an edge for. Most positions the alternation is
+      ## reached from start no branch at all, so the common answer is one set
+      ## test rather than an edge scan.
 
   FirstCharKind* = enum
     fcNone ## no optimization possible
