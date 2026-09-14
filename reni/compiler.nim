@@ -1,4 +1,4 @@
-import std/[tables, sets, unicode]
+import std/[algorithm, tables, sets, unicode]
 
 import types, unicode_utils, parser
 
@@ -705,11 +705,141 @@ proc sameFirstChar(a, b: FirstCharInfo): bool =
   of fcNone, fcAnchorStart, fcLineStart:
     true
 
+const AltTrieMaxStates = 4096
+  ## Ceiling on the distinct prefixes one trie may hold, so a machine-written
+  ## alternation of thousands of literals does not pay for the table at every
+  ## ``re()``.  Past it the alternation keeps the hints; refusing a trie only
+  ## ever costs speed.
+
+const AltTrieMaxWordLen = 16
+  ## Longest branch a trie will take, mirroring ``BulkCompareLen`` in the
+  ## matcher: from that length a branch compares as one ``memcmp``, which a
+  ## walk spending a state lookup and an edge scan per byte cannot match --
+  ## and long branches share long prefixes, so the walk pays that depth at
+  ## every position.  Below the bound both paths compare byte at a time, and
+  ## the walk does every branch at once.
+
+proc literalBytes(node: Node): string =
+  ## The exact bytes ``node`` matches with case folding off, or ``""`` when it
+  ## is not a plain literal.  Read where the matcher reads them: an
+  ## ``nkString`` carries ``bytes``, a literal re-encodes its rune.
+  case node.kind
+  of nkString:
+    node.bytes
+  of nkLiteral, nkEscapedLiteral:
+    var buf: array[4, char]
+    let cp = int32(if node.kind == nkLiteral: node.rune else: node.escapedRune)
+    let n = utf8Encode(cp, buf)
+    var s = newString(n)
+    for i in 0 ..< n:
+      s[i] = buf[i]
+    s
+  else:
+    ""
+
+proc buildAltTrie(alternatives: seq[Node]): AltTrie =
+  ## Trie over ``alternatives`` when every one of them is a non-empty plain
+  ## literal, else ``nil``.  Built as a linked tree and then flattened, so the
+  ## matcher walks arrays and not a graph of ``ref``s.
+  ##
+  ## No lower bound on the branch count, from the structure of the work and
+  ## not a measurement: a hint test reads the same byte the branch's own
+  ## compare would read next, so two hints do not cost less than one walk --
+  ## the walk *is* that compare, and it also names the branch.  (Two-branch
+  ## patterns do measure faster, but inside the swing this benchmark shows
+  ## from code alignment alone.)  The bound on branch *length* is real,
+  ## though: see [AltTrieMaxWordLen].
+  if alternatives.len < 2:
+    return nil
+  var words = newSeq[string](alternatives.len)
+  for i, alt in alternatives:
+    words[i] = literalBytes(alt)
+    if words[i].len == 0:
+      # A root terminal could express a zero-width branch, but
+      # ``stringAdvance`` refuses an empty run, so the trie would not agree
+      # with the path it replaces.  Leave the alternation to the hints.
+      return nil
+    if words[i].len >= AltTrieMaxWordLen:
+      return nil
+  type BuildState = object
+    kids: seq[tuple[label: uint8, next: int32]]
+    terms: seq[int32]
+    depth: int32
+
+  var build = @[BuildState()]
+  for i, w in words:
+    var s = 0'i32
+    for ch in w:
+      let b = uint8(ch)
+      var nxt = -1'i32
+      for k in build[s].kids:
+        if k.label == b:
+          nxt = k.next
+          break
+      if nxt < 0:
+        if build.len >= AltTrieMaxStates:
+          return nil
+        build.add BuildState(depth: build[s].depth + 1)
+        nxt = int32(build.len - 1)
+        build[s].kids.add (b, nxt)
+      s = nxt
+    # Ascending by construction: the branches are walked in their own order.
+    build[s].terms.add int32(i)
+  result = AltTrie(states: newSeq[AltTrieState](build.len))
+  for s in 0 ..< build.len:
+    # Sorted, so a walk can stop at the first label past the byte it wants.
+    var kids = build[s].kids
+    kids.sort(
+      proc(a, b: tuple[label: uint8, next: int32]): int =
+        cmp(a.label, b.label)
+    )
+    result.states[s] = AltTrieState(
+      edgeOff: int32(result.edges.len),
+      edgeLen: int32(kids.len),
+      termOff: int32(result.terms.len),
+      termLen: int32(build[s].terms.len),
+      depth: build[s].depth,
+    )
+    for k in kids:
+      result.edges.add AltTrieEdge(label: k.label, next: k.next)
+    for t in build[s].terms:
+      result.terms.add t
+  let root = result.states[0]
+  for e in root.edgeOff ..< root.edgeOff + root.edgeLen:
+    result.firstBytes.incl result.edges[e].label
+
+proc altTriesUsable(node: Node): bool =
+  ## Whether a trie stays sound for the life of a match.  It reads the
+  ## literal's own bytes, so it may only run with ``rfIgnoreCase`` off, and
+  ## the matcher's test of that flag is worth nothing unless the flag cannot
+  ## come on *after* it, while a choice point of the alternation is still on
+  ## the stack.
+  ##
+  ## A scoped ``(?i:...)`` cannot: it pushes its restore as it is entered.
+  ## The isolated ``(?i)`` sets the flag with nothing left to undo it, so it
+  ## extends across the branches of an alternation it follows -- and a branch
+  ## the trie passed over on the bytes could match once folding is on.  One
+  ## such spelling anywhere takes tries off the table for the whole pattern.
+  ##
+  ## ``parseConcat`` rewrites every isolated group into a scoped one, so no
+  ## pattern spells this today; the guard is against the matcher's own
+  ## ``flagBody == nil`` arm, which is still there and still undoes nothing.
+  if node == nil:
+    return true
+  if node.kind == nkFlagGroup and node.flagBody == nil and
+      (node.flagsOn * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return false
+  for child in node.childNodes:
+    if not altTriesUsable(child):
+      return false
+  true
+
 proc annotateTree(
     node: Node,
     hintFlags: RegexFlags,
     cache: var FirstCharCache,
     levelBackrefs: var bool,
+    triesUsable: bool,
 ) =
   ## Single post-parse walk over the finished AST: precomputes each character
   ## class's ASCII membership bitmap, so the matcher can answer ASCII input
@@ -751,6 +881,11 @@ proc annotateTree(
     # than the test costs everywhere else.
     if discriminates:
       node.altFirst = hints
+    # Left beside the hints, not in place of them: the trie is only sound
+    # with folding off, and the hints answer the same alternation under
+    # ``(?i)``.
+    if triesUsable:
+      node.altTrie = buildAltTrie(node.alternatives)
   of nkCharClass:
     # A bare ``\p{...}``: one atom, no fold variant, nothing past the first
     # element.  Read the shape off here so [classAdvance] need not.
@@ -782,7 +917,7 @@ proc annotateTree(
   else:
     discard
   for child in node.childNodes:
-    annotateTree(child, hintFlags, cache, levelBackrefs)
+    annotateTree(child, hintFlags, cache, levelBackrefs, triesUsable)
 
 proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
   ## Exact ASCII byte set a leaf accepts, or false when it is not one ASCII
@@ -1034,7 +1169,15 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   collectGroupBodies(ast, bodies, groupFlags, flags)
   var firstCharCache: FirstCharCache = nil
   var levelBackrefs = false
-  annotateTree(ast, finalFlags + {rfIgnoreCase}, firstCharCache, levelBackrefs)
+  annotateTree(
+    ast,
+    finalFlags + {rfIgnoreCase},
+    firstCharCache,
+    levelBackrefs,
+    # Folding off throughout, and no ``(?i)`` that could switch it on under a
+    # trie the matcher already entered.
+    (finalFlags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0 and altTriesUsable(ast),
+  )
   initRegex(
     pattern = pattern,
     ast = ast,

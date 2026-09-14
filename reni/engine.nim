@@ -231,6 +231,7 @@ type
     ## the rest undo an effect and keep failing.
     chAlt ## alternation: try the next branch
     chAltHinted ## alternation carrying first-byte hints: skip dead branches
+    chAltTrie ## alternation of literals: ask the trie for the next branch
     chLeafVariant ## literal / class: try the next way it can match
     chQuantGreedy ## greedy quantifier: stop repeating, run the continuation
     chQuantLazy ## lazy quantifier: the continuation failed, repeat once more
@@ -262,7 +263,7 @@ type
     ## ``storeSlot`` move one with ``copyMem`` under every memory management,
     ## and lets an arm read a node out of an entry it has already popped.
     case kind: ChoiceKind
-    of chAlt, chAltHinted:
+    of chAlt, chAltHinted, chAltTrie:
       aNode: NodeId
       aIdx: int32 ## next branch to try
       aCont: ContId
@@ -1525,6 +1526,59 @@ proc nextAltBranch(node: Node, start: int, b: uint8, hasByte: bool): int {.inlin
     inc i
   -1
 
+proc nextTrieBranch(
+    ctx: MatchContext, trie: AltTrie, start: int32
+): tuple[idx: int32, endPos: int] =
+  ## Lowest-numbered alternative at or after ``start`` whose literal the
+  ## subject spells at ``ctx.pos``, and the offset just past it.  ``idx`` is
+  ## -1 when none does.  One walk answers the whole alternation: the caller
+  ## never compares those bytes again.
+  ##
+  ## The order is the alternation's own, not the trie's -- two branches can
+  ## both match here (``int`` and ``int8`` at ``int8``) -- which is why the
+  ## terminals carry their index.
+  ##
+  ## Re-walked on each backtrack rather than cached, for the reason
+  ## [nextAltBranch] gives: ``subjectEnd`` moves under a running match.
+  result = (idx: -1'i32, endPos: 0)
+  var p = ctx.pos
+  if p >= ctx.subjectEnd or uint8(ctx.subject[p]) notin trie.firstBytes:
+    # Nothing the root can step on, and ``buildAltTrie`` refuses an empty
+    # branch, so there is no root terminal either.
+    return
+  var state = 0'i32
+  while true:
+    let st = trie.states[state]
+    for k in st.termOff ..< st.termOff + st.termLen:
+      let ti = trie.terms[k]
+      if ti < start:
+        continue
+      if result.idx < 0 or ti < result.idx:
+        result.idx = ti
+        result.endPos = ctx.pos + int(st.depth)
+      else:
+        # The run is ascending, so nothing further in it can beat ``idx``.
+        break
+    if result.idx == start:
+      # ``start`` is the floor the caller asked from, so nothing deeper can
+      # be admitted earlier.  Stopping here keeps ``(a|aaaaaaaa...)`` from
+      # spelling out the long branch at every position and every backtrack.
+      return
+    if p >= ctx.subjectEnd:
+      return
+    let b = uint8(ctx.subject[p])
+    var nxt = -1'i32
+    for e in st.edgeOff ..< st.edgeOff + st.edgeLen:
+      if trie.edges[e].label == b:
+        nxt = trie.edges[e].next
+        break
+      if trie.edges[e].label > b:
+        break
+    if nxt < 0:
+      return
+    state = nxt
+    inc p
+
 proc prevCharCode(s: openArray[char], pos: int): int32 =
   ## Code point ending just before ``pos``, or -1 at 0. Always defined for
   ## ``pos > 0``.
@@ -2497,6 +2551,15 @@ proc runMachine(
     else:
       restore(ctx, ctx.choices[top].qcSaved)
 
+  template chargeTrieBranch(): untyped =
+    ## What running the picked branch would have cost: the old path re-entered
+    ## ``mMatch`` on it and paid a step.  The walk stays inside the
+    ## alternation's own step, so without this a pattern would quietly buy
+    ## more real backtracking under the same ``stepLimit``.
+    inc ctx.steps
+    if ctx.steps > ctx.stepLimit:
+      raise newException(RegexLimitError, "match step limit exceeded")
+
   while true:
     case mode
     of mMatch:
@@ -2568,6 +2631,32 @@ proc runMachine(
       of nkAlternation:
         if node.alternatives.len == 0:
           mode = mFail
+        elif node.altTrie != nil and rfIgnoreCase notin ctx.flags:
+          # Every branch is a literal, so one walk both picks the branch and
+          # consumes it: no branch node is left to run, and a pick of the last
+          # branch leaves no choice point and so costs no capture snapshot.
+          let trie {.cursor.} = node.altTrie
+          let pick = nextTrieBranch(ctx, trie, 0'i32)
+          if pick.idx < 0:
+            mode = mFail
+          else:
+            chargeTrieBranch()
+            if pick.idx + 1 < node.alternatives.len:
+              # The next *untried* branch, as under the hints: the walk runs
+              # again on backtrack, so a branch that spells nothing here is
+              # not passed over for good.
+              ctx.pushChoice Choice(
+                kind: chAltTrie,
+                aNode: node.id,
+                aIdx: pick.idx + 1,
+                aCont: cont,
+                aFramesLen: ctx.framesLen.int32,
+                aCapOff: pushCaptures(ctx),
+                aPos: ctx.pos,
+                aKeepStart: ctx.keepStart,
+              )
+            ctx.pos = pick.endPos
+            mode = mCont
         elif node.altFirst.len != node.alternatives.len:
           # No usable hints here: the untouched path, which reads no subject
           # byte and tests nothing.  ``annotateTree`` leaves ``altFirst``
@@ -3315,6 +3404,33 @@ proc runMachine(
             ctx.choices[top].aIdx = int32(nxt + 1)
           node = altNode.alternatives[nxt]
           mode = mMatch
+      of chAltTrie:
+        # As ``chAltHinted``, with the trie in place of the hints: the walk
+        # runs again from ``aIdx``, so a branch is judged against the state at
+        # hand.  ``rfIgnoreCase`` needs no second test -- ``altTrie`` is nil
+        # for any pattern that could have switched it on since the entry (see
+        # ``altTriesUsable``).
+        ctx.pos = ctx.choices[top].aPos
+        ctx.keepStart = ctx.choices[top].aKeepStart
+        capturesBackTo(ctx, ctx.choices[top].aCapOff)
+        ctx.framesLen = ctx.choices[top].aFramesLen
+        cont = ctx.choices[top].aCont
+        let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
+        let trie {.cursor.} = altNode.altTrie
+        let pick = nextTrieBranch(ctx, trie, ctx.choices[top].aIdx)
+        if pick.idx < 0:
+          releaseTo(ctx, ctx.choices[top].aCapOff)
+          ctx.choicesLen = top
+          mode = mFail
+        else:
+          chargeTrieBranch()
+          if pick.idx + 1 < altNode.alternatives.len:
+            ctx.choices[top].aIdx = pick.idx + 1
+          else:
+            releaseTo(ctx, ctx.choices[top].aCapOff)
+            ctx.choicesLen = top
+          ctx.pos = pick.endPos
+          mode = mCont
       of chLeafVariant:
         ctx.pos = ctx.choices[top].lPos
         ctx.framesLen = ctx.choices[top].lFramesLen
