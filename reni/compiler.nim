@@ -1198,6 +1198,236 @@ proc annotateLazyScanLeaf(node: Node, flags: RegexFlags, after: Node, calls: boo
     for child in node.childNodes:
       annotateLazyScanLeaf(child, flags, nil, calls)
 
+type
+  NonAsciiSet = enum
+    ## Which characters above U+007F a leaf accepts, coarsely enough for
+    ## [nonAsciiDisjoint] to answer without walking the code space.
+    naWord ## ``\w``: letters, marks, digits, connector punctuation
+    naDigit ## ``\d``, a subset of ``naWord``
+    naSpace ## ``\s``
+    naOther ## anything else, every negated type included
+
+  AcceptSet = object
+    ## The characters a leaf accepts, or the union over several.  ``ascii``
+    ## is exact: [AsciiCharTypeSets] does not depend on the ASCII-only flags
+    ## and [exactAsciiLeaf] refuses what it cannot state.  ``nonAscii`` is a
+    ## superset.
+    ascii: set[uint8]
+    nonAscii: set[NonAsciiSet]
+
+  FollowStep = enum
+    fsStop ## the node consumes a character, and its leaves are in the union
+    fsPass ## it may match empty, so the next node speaks too
+    fsUnknown ## not stated exactly; the caller must give up
+
+  Follow = object
+    ## What the continuation requires at the position a give-back would hand
+    ## it.  ``known`` is false where the walk ran into something it cannot
+    ## state, and the repeat then stays greedy.
+    accept: AcceptSet
+    known: bool
+
+const UnknownFollow = Follow(known: false)
+
+proc nonAsciiDisjoint(a, b: NonAsciiSet): bool =
+  ## Whether two non-ASCII families provably share no character.  Only these
+  ## two pairs are claimed, and ``test_engine.nim`` pins both against every
+  ## code point.
+  (a == naWord and b == naSpace) or (a == naSpace and b == naWord) or
+    (a == naDigit and b == naSpace) or (a == naSpace and b == naDigit)
+
+proc disjointAccept(a, b: AcceptSet): bool =
+  ## Whether no character is in both sets.  An empty intersection proves it
+  ## on either half: ``ascii`` is exact, and ``nonAscii`` is a superset.
+  if a.ascii * b.ascii != {}:
+    return false
+  for x in a.nonAscii:
+    for y in b.nonAscii:
+      if not nonAsciiDisjoint(x, y):
+        return false
+  true
+
+proc leafAccept(node: Node, flags: RegexFlags, s: var AcceptSet): bool =
+  ## The set ``node`` accepts as its first character, or false when it cannot
+  ## be stated.  Callers must have ruled out case folding first.
+  if node == nil:
+    return false
+  case node.kind
+  of nkLiteral, nkEscapedLiteral, nkCharClass:
+    var ascii: set[uint8]
+    if not exactAsciiLeaf(node, ascii):
+      return false
+    s = AcceptSet(ascii: ascii)
+    true
+  of nkString:
+    # Only the first character stands at the position in question.
+    if node.runes.len == 0 or int32(node.runes[0]) >= 128:
+      return false
+    s = AcceptSet(ascii: {uint8(int32(node.runes[0]))})
+    true
+  of nkCharType:
+    # ``\h`` is ASCII throughout; ``.``, ``\O``, ``\R`` and ``\X`` state no
+    # fixed set of characters at all.
+    let family =
+      case node.charType
+      of ctWord:
+        {naWord}
+      of ctDigit:
+        {naDigit}
+      of ctSpace:
+        {naSpace}
+      of ctHexDigit:
+        {}
+      of ctNotWord, ctNotDigit, ctNotSpace, ctNotHexDigit, ctNotNewline:
+        {naOther}
+      else:
+        return false
+    s = AcceptSet(ascii: AsciiCharTypeSets[node.charType], nonAscii: family)
+    true
+  else:
+    false
+
+proc addFollow(node: Node, flags: RegexFlags, f: var Follow): FollowStep =
+  ## Add what ``node`` requires at the start of the continuation to ``f``, and
+  ## say whether the node after it speaks too.
+  ##
+  ## ``f`` must stay a *superset* of what the continuation can begin with:
+  ## an extra leaf costs a refusal, a missing one drops matches.  So a node
+  ## that cannot be stated stops the walk, unless it is zero-width and can
+  ## only refuse positions.
+  if node == nil:
+    return fsUnknown
+  case node.kind
+  of nkAnchor:
+    fsPass # zero-width, ``\K`` included: a failed continuation rolls it back
+  of nkLookaround:
+    if node.lookKind == lkAhead:
+      # A positive lookahead demands its own first character right here; a
+      # body that does not state one is read as zero-width.
+      case addFollow(node.lookBody, flags, f)
+      of fsStop: fsStop
+      of fsPass, fsUnknown: fsPass
+    else:
+      fsPass
+  of nkConcat:
+    for child in node.children:
+      case addFollow(child, flags, f)
+      of fsStop:
+        return fsStop
+      of fsUnknown:
+        return fsUnknown
+      of fsPass:
+        discard
+    fsPass
+  of nkGroup:
+    addFollow(node.groupBody, flags, f)
+  of nkCapture:
+    addFollow(node.captureBody, flags, f)
+  of nkNamedCapture:
+    addFollow(node.namedCaptureBody, flags, f)
+  of nkAtomicGroup:
+    # Atomic cuts backtracking only; its first character is its body's.
+    addFollow(node.atomicBody, flags, f)
+  of nkAlternation:
+    var mayPass = false
+    for alt in node.alternatives:
+      case addFollow(alt, flags, f)
+      of fsUnknown:
+        return fsUnknown
+      of fsPass:
+        mayPass = true
+      of fsStop:
+        discard
+    if mayPass: fsPass else: fsStop
+  of nkQuantifier:
+    # An inverted range only swaps its bounds (``{3,1}`` like ``{1,3}``), so
+    # it can still be mandatory: read them normalised rather than skipping it.
+    let (lo, hi) = effectiveQuantBounds(node.quantMin, node.quantMax)
+    if hi == 0:
+      return fsPass
+    let step = addFollow(node.quantBody, flags, f)
+    if step == fsUnknown:
+      fsUnknown
+    elif lo >= 1:
+      step
+    else:
+      fsPass
+  of nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType, nkString:
+    var leaf: AcceptSet
+    if not leafAccept(node, flags, leaf):
+      return fsUnknown
+    f.accept.ascii = f.accept.ascii + leaf.ascii
+    f.accept.nonAscii = f.accept.nonAscii + leaf.nonAscii
+    fsStop
+  else:
+    fsUnknown
+
+proc followFrom(
+    children: seq[Node], start: int, flags: RegexFlags, outer: Follow
+): Follow =
+  ## The continuation that begins at ``children[start]``, running off the end
+  ## into ``outer``.
+  result = Follow(known: true)
+  for i in start ..< children.len:
+    case addFollow(children[i], flags, result)
+    of fsStop:
+      return
+    of fsUnknown:
+      return UnknownFollow
+    of fsPass:
+      discard
+  if not outer.known:
+    return UnknownFollow
+  result.accept.ascii = result.accept.ascii + outer.accept.ascii
+  result.accept.nonAscii = result.accept.nonAscii + outer.accept.nonAscii
+
+proc possessifyRepeats(node: Node, flags: RegexFlags, after: Follow) =
+  ## Rewrite a greedy repeat that cannot succeed by giving characters back
+  ## into a possessive one -- PCRE2's auto-possessification.
+  ##
+  ## The body is one leaf, so a shorter split hands the continuation a
+  ## character that leaf accepted.  A continuation that can begin with none
+  ## of them fails at every split, so the give-backs cannot succeed.
+  ##
+  ## Runs before every annotation that reads ``quantKind``, so that
+  ## [leadSimpleRepeat] sees the rewritten kind.
+  if node == nil:
+    return
+  case node.kind
+  of nkConcat:
+    for i in 0 ..< node.children.len:
+      possessifyRepeats(
+        node.children[i], flags, followFrom(node.children, i + 1, flags, after)
+      )
+  of nkQuantifier:
+    # What follows the body is the next iteration, or what follows the repeat
+    # on the last one; neither is analysed, so the body walks under an
+    # unknown follower.
+    possessifyRepeats(node.quantBody, flags, UnknownFollow)
+    if node.quantKind == qkGreedy and after.known and
+        not isInvertedRange(node.quantMin, node.quantMax):
+      var body: AcceptSet
+      if leafAccept(node.quantBody, flags, body) and disjointAccept(body, after.accept):
+        node.quantKind = qkPossessive
+  of nkAlternation:
+    for alt in node.alternatives:
+      possessifyRepeats(alt, flags, after)
+  of nkCapture:
+    possessifyRepeats(node.captureBody, flags, after)
+  of nkNamedCapture:
+    possessifyRepeats(node.namedCaptureBody, flags, after)
+  of nkGroup:
+    possessifyRepeats(node.groupBody, flags, after)
+  of nkFlagGroup:
+    # An inline ``(?i)`` widens every leaf below it, and the sets above are
+    # written for folding off.
+    discard
+  else:
+    # An atomic group, a lookaround body, an absent expression: each ends its
+    # own continuation, which is not ``after``.
+    for child in node.childNodes:
+      possessifyRepeats(child, flags, UnknownFollow)
+
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
   ## Unbounded greedy or possessive repeat over a one-way leaf every match
   ## must start inside, or nil. The run must be unbounded: a bounded one
@@ -1373,6 +1603,12 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # Same rule: must see the final AST.  Annotate under ``finalFlags``, the
   # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
   # ``regex.flags``), since an annotation is used only while the two agree.
+  # Folding off, because the leaf sets the rewrite compares are written for
+  # it; no ``\g<...>``, which runs a body under a continuation this walk
+  # never sees.
+  if (finalFlags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0 and
+      not hasSubexpCall(ast):
+    possessifyRepeats(ast, finalFlags, UnknownFollow)
   annotateLookaroundBounds(ast, finalFlags)
   # Same flags: the leaf test holds only while folding stays off.
   annotateLazyScanLeaf(ast, finalFlags, nil, hasSubexpCall(ast))

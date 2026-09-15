@@ -3,6 +3,7 @@ import std/[unittest, strutils, options, unicode]
 import ../reni
 import ../reni/engine
 import ../reni/types
+import ../reni/unicode_utils
 
 # What a pattern answers; the invariants behind it are in
 # ``test_engine_internals.nim``.  Keep the two apart: ``refc`` allows 3500
@@ -2451,6 +2452,136 @@ suite "leadRun scan skip":
     # The outer leaf accepts what the body rejects, so its starts differ.
     check not skips("c(?:b[ab]+c){2,}")
     check all("xcbbcbabc", "c(?:b[ab]+c){2,}") == @["cbbcbabc"]
+
+suite "auto-possessification":
+  # A wrong rewrite drops matches silently, so each shape is pinned twice:
+  # the kind the compiler left on the quantifier, and, where a wrong rewrite
+  # would lose a give-back, the matches found.
+  proc kinds(pattern: string, flags: RegexFlags = {}): seq[QuantKind] =
+    ## Every quantifier's kind, outermost first.
+    proc walk(node: Node, into: var seq[QuantKind]) =
+      if node == nil:
+        return
+      if node.kind == nkQuantifier:
+        into.add node.quantKind
+      for child in node.childNodes:
+        walk(child, into)
+
+    walk(re(pattern, flags).ast, result)
+
+  proc all(subject, pattern: string, flags: RegexFlags = {}): seq[string] =
+    for m in findAll(subject, re(pattern, flags)):
+      result.add captureText(m, 0, subject).get("")
+
+  test "a follower that rejects the body possessifies the repeat":
+    check kinds("(\\w+)\\s*=\\s*(\\w+)") ==
+      @[qkPossessive, qkPossessive, qkPossessive, qkGreedy]
+    check all("a = b, cc=dd", "(\\w+)\\s*=\\s*(\\w+)") == @["a = b", "cc=dd"]
+    check kinds("[A-Za-z_][A-Za-z0-9_]*\\s*=") == @[qkPossessive, qkPossessive]
+    check all("x1 = 2, _y=3", "[A-Za-z_][A-Za-z0-9_]*\\s*=") == @["x1 =", "_y="]
+
+  test "a positive lookahead is the follower, not a node to walk past":
+    check kinds("\\w+(?=\\()") == @[qkPossessive]
+    check all("f(x) g y(", "\\w+(?=\\()") == @["f", "y"]
+
+  test "the last repeat of a repeated group keeps its greedy exits":
+    # ``(?:\w+\s+){3,}``: what follows ``\s+`` is the next iteration or
+    # whatever follows the group, neither of which this pass reads.
+    check kinds("(?:\\w+\\s+){3,}") == @[qkGreedy, qkPossessive, qkGreedy]
+    check all("aa bb cc dd ", "(?:\\w+\\s+){3,}") == @["aa bb cc dd "]
+
+  test "nothing after the repeat proves nothing":
+    check kinds("\\w+") == @[qkGreedy]
+    check kinds("\\w+$") == @[qkGreedy] # an anchor is zero-width, not a follower
+    check kinds("(\\w+)\\s*") == @[qkGreedy, qkGreedy]
+
+  test "a follower that shares a character is refused":
+    check kinds("\\w+x") == @[qkGreedy]
+    check all("aax", "\\w+x") == @["aax"] # the give-back this rewrite would lose
+    check kinds("\\w+\\d") == @[qkGreedy]
+    check kinds("\\d+\\w") == @[qkGreedy]
+    check kinds("\\w+\\W") == @[qkGreedy] # a complement is claimed disjoint from nothing
+    check kinds("[a-c]+[c-e]") == @[qkGreedy]
+    check kinds("[a-c]+[d-e]") == @[qkPossessive]
+
+  test "an optional follower is walked past, and joins the union":
+    # ``x?`` may match empty, so ``=`` speaks too -- and ``x`` still counts.
+    # ``x?`` is a repeat of its own, which ``=`` refuses just the same.
+    check kinds("\\s+x?=") == @[qkPossessive, qkPossessive]
+    check kinds("\\w+x?=") == @[qkGreedy, qkPossessive]
+    check all("aax=", "\\w+x?=") == @["aax="]
+    check kinds("\\w+x?x") == @[qkGreedy, qkGreedy]
+    check all("aax", "\\w+x?x") == @["aax"]
+
+  test "an inverted range follower swaps its bounds, it does not go optional":
+    # ``x{3,1}`` matches like ``x{1,3}``: mandatory, and it speaks first.
+    check kinds("\\w+x{3,1}=") == @[qkGreedy, qkGreedy]
+    check all("aaxx=", "\\w+x{3,1}=") == @["aaxx="]
+    check kinds("a+a{3,1}b") == @[qkGreedy, qkGreedy]
+    check all("aaab", "a+a{3,1}b") == @["aaab"]
+    check kinds("\\s+x{3,1}=") == @[qkPossessive, qkGreedy]
+    # ``{0,0}`` matches empty whatever else follows, so the walk reads past it
+    # -- and ``x{0,0}`` is a repeat ``=`` refuses just the same.
+    check kinds("\\s+x{0,0}=") == @[qkPossessive, qkPossessive]
+    check kinds("\\w+x{2,0}=") == @[qkGreedy, qkGreedy]
+    check all("aax=", "\\w+x{2,0}=") == @["aax="]
+
+  test "a zero-width follower only restricts, so the walk reads past it":
+    check kinds("\\w+(?!x)=") == @[qkPossessive]
+    check kinds("\\w+\\b=") == @[qkPossessive]
+    check kinds("\\w+\\K=") == @[qkPossessive]
+    check all("aa=b", "\\w+\\K=") == @["="]
+    check kinds("\\w+(?!x)") == @[qkGreedy] # zero-width, then nothing
+
+  test "an unstatable follower stops the walk":
+    check kinds("(a)\\w+\\1") == @[qkGreedy] # a backreference names no set
+    check kinds("(a)\\w+(?(1)a|b)") == @[qkGreedy]
+    check kinds("\\w+\\X") == @[qkGreedy] # variable width, no fixed set
+    check kinds("\\w+.") == @[qkGreedy] # ``.`` follows (?m) at match time
+
+  test "case folding takes the pattern off the pass":
+    # The leaf sets are written for folding off, and an inline ``(?i)`` is a
+    # flag group, which nothing below is entered for.
+    check kinds("(?i)\\w+=") == @[qkGreedy]
+    check kinds("\\w+=", {rfIgnoreCase}) == @[qkGreedy]
+    check kinds("(?i:\\w+=)") == @[qkGreedy]
+    check kinds("(?m:\\w+=)") == @[qkGreedy]
+
+  test "a subexpression call takes the whole pattern off the pass":
+    # A called body runs under the continuation at the call, which this walk
+    # never sees.
+    check kinds("(\\w+=)\\g<1>") == @[qkGreedy]
+
+  test "a body that is not one leaf is left alone":
+    check kinds("(?:ab)+=") == @[qkGreedy]
+    check kinds("(\\w)+=") == @[qkGreedy]
+    check kinds("[^a]+=") == @[qkGreedy] # a negated class states no exact set
+    check kinds("\\p{L}+=") == @[qkGreedy]
+    check kinds(".+=") == @[qkGreedy]
+
+  test "only a greedy repeat is rewritten":
+    check kinds("\\w+?=") == @[qkLazy]
+    check kinds("\\w*+=") == @[qkPossessive] # already possessive, untouched
+    check kinds("\\w{3,1}=") == @[qkGreedy] # inverted, normalised at match time
+
+  test "the rewrite reaches inside groups and alternation branches":
+    check kinds("(?>\\w+=)") == @[qkPossessive]
+    check kinds("(?=\\w+=)") == @[qkPossessive]
+    check kinds("(?:\\w+=|\\s+;)") == @[qkPossessive, qkPossessive]
+    check kinds("(?<name>\\s+)=") == @[qkPossessive]
+
+  test "the rewritten repeat still drives the leading-run skip":
+    # Which is what makes the rewrite pay rather than cost.
+    check re("(\\w+)\\s*=").leadRun != nil
+    check all("aaa bbb=", "(\\w+)\\s*=") == @["bbb="]
+
+  test "no character is both a word character and a space":
+    # What ``nonAsciiDisjoint`` claims and the ASCII sets do not settle.
+    for cp in 0 .. 0x10FFFF:
+      let r = Rune(cp)
+      for asciiOnly in [false, true]:
+        check not (isWordChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
+        check not (isDigitChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
 
 suite "lead anchor prefilter":
   # The prefilter only refuses: a wrong verdict drops matches, so pin both
