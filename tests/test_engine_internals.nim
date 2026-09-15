@@ -2160,7 +2160,8 @@ suite "the leading-repeat prefilter refuses only what no match can start with":
     check not leadRepeatOf("(\\w)\\1", {rfIgnoreCase, rfIgnoreCaseAscii})
     check not leadRepeatOf("(?iI)(\\w)\\1")
     check search("aa", re("(\\w)\\1", {rfIgnoreCaseAscii})).matchSpan == 0 .. 2
-    check search("aA", re("(\\w)\\1", {rfIgnoreCase, rfIgnoreCaseAscii})).matchSpan == 0 .. 2
+    check search("aA", re("(\\w)\\1", {rfIgnoreCase, rfIgnoreCaseAscii})).matchSpan ==
+      0 .. 2
     check search("aA", re("(?iI)(\\w)\\1")).matchSpan == 0 .. 2
 
   test "a level backreference is not the shape":
