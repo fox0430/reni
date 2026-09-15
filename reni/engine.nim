@@ -213,6 +213,9 @@ type
       ## Cached ``Regex.leadAnchors``. Shares the ``leadLeaf`` counters as one
       ## prefilter. Placed here to fit the padding after the ``bool`` above.
     leadLeafCool: int32 ## Positions left before retrying an off prefilter.
+    leadRepeat: NodeId
+      ## Cached ``Regex.leadRepeat``, or ``NoNodeId``. Replaces ``leadLeaf``
+      ## on the same counters.
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -1466,22 +1469,35 @@ const LeadLeafCapacity = 256'i32
   ## Counter ceiling: both counters halve here, keeping the recent ratio
   ## without reaching the int32 limit.
 
-proc leadLeafMatches(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether the leaf matches at ``ctx.pos``. One character test, no writes.
-  ## Only single-way leaves qualify, so one variant decides; for a class that
-  ## is the plain match, not variant 0 (a fold). ``nkString`` tests the whole
-  ## run; only the lazy scan reaches it.
+proc leadLeafEnd(ctx: MatchContext, node: Node): int {.inline.} =
+  ## End offset of the leaf matched at ``ctx.pos``, or -1. One character test,
+  ## no writes. ``nkString`` tests the whole run; only the lazy scan reaches it.
   case node.kind
   of nkLiteral, nkEscapedLiteral:
-    leafVariantAdvance(ctx, node, 0) >= 0
+    leafVariantAdvance(ctx, node, 0)
   of nkCharClass:
-    leafVariantAdvance(ctx, node, classFirstVariant(ctx, node)) >= 0
+    leafVariantAdvance(ctx, node, classFirstVariant(ctx, node))
   of nkCharType:
-    charTypeAdvance(ctx, node.charType) >= 0
+    charTypeAdvance(ctx, node.charType)
   of nkString:
-    stringAdvance(ctx, node) >= 0
+    stringAdvance(ctx, node)
   else:
     raiseAssert "leadLeaf is not a leaf kind"
+
+proc leadLeafMatches(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## Whether the leaf matches at ``ctx.pos``.
+  leadLeafEnd(ctx, node) >= 0
+
+proc leadRepeatHolds(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## Whether the leaf at ``ctx.pos`` is followed by the same bytes
+  ## (``(leaf)\1``). Byte comparison only; folding is excluded by the compiler.
+  let e = leadLeafEnd(ctx, node)
+  if e < 0:
+    return false
+  let w = e - ctx.pos
+  if e + w > ctx.subjectEnd:
+    return false
+  equalMem(addr ctx.subject.data[ctx.pos], addr ctx.subject.data[e], w)
 
 proc lazyScanAdvance(
     ctx: MatchContext, body, nextLeaf: Node, count: var int32, maxRep: int32
@@ -3890,6 +3906,8 @@ proc resetForRegex(
   assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
   ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
   ctx.leadAnchors = regex[].leadAnchors
+  assert regex[].leadRepeat == nil or isSingleWayLeaf(ctx, regex[].leadRepeat)
+  ctx.leadRepeat = if regex[].leadRepeat == nil: NoNodeId else: regex[].leadRepeat.id
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
@@ -3982,6 +4000,7 @@ proc releaseBorrowed(ctx: MatchContext) {.inline.} =
   ctx.subject = Subject(data: nil, size: 0)
   ctx.leadRun = NoNodeId
   ctx.leadLeaf = NoNodeId
+  ctx.leadRepeat = NoNodeId
   ctx.leadAnchors = {}
 
 proc searchImplInto*(
@@ -4028,10 +4047,11 @@ proc searchImplInto*(
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
   let leadLeafNode {.cursor.} = nodeAt(ctx, ctx.leadLeaf)
+  let leadRepeatNode {.cursor.} = nodeAt(ctx, ctx.leadRepeat)
   # Hoisted: iterating a Nim set walks the whole enum range, so an empty set
   # still costs per candidate.
   let hasLeadAnchors = ctx.leadAnchors != {}
-  let hasPrefilter = leadLeafNode != nil or hasLeadAnchors
+  let hasPrefilter = leadLeafNode != nil or leadRepeatNode != nil or hasLeadAnchors
   # ``\G``/``\y``/``\Y`` read this state, which ``resetForPosition`` otherwise
   # writes only after the prefilter runs.
   ctx.searchStart = start
@@ -4121,7 +4141,8 @@ proc searchImplInto*(
         # Assertions first for locality: they touch the bytes the leaf reads.
         prefiltered =
           (hasLeadAnchors and not leadAnchorsHold(ctx)) or
-          (leadLeafNode != nil and not leadLeafMatches(ctx, leadLeafNode))
+          (leadLeafNode != nil and not leadLeafMatches(ctx, leadLeafNode)) or
+          (leadRepeatNode != nil and not leadRepeatHolds(ctx, leadRepeatNode))
         # Adaptive off switch: an accepted position costs a second character
         # test the matcher repeats anyway, so stay on well past break-even.
         # Halve (not reset) at capacity: keeps the recent ratio, bounds both

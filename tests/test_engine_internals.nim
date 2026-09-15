@@ -2092,3 +2092,109 @@ suite "the leading-leaf prefilter refuses only what no match can start with":
     check search("えあ", re("あ")).matchSpan == 3 .. 6
     check search("えあ", re("あ", {rfFindLongest})).matchSpan == 3 .. 6
     check search("えあ", re("(?L)あ")).matchSpan == 3 .. 6
+
+suite "the leading-repeat prefilter refuses only what no match can start with":
+  # ``(X)\1`` fixes the second character to the first rather than to a set,
+  # so the scan compares bytes at a candidate start instead of entering the
+  # matcher.  These pin what may be read as that shape: a capture that holds
+  # more than the one leaf, or a backreference to something else, makes the
+  # comparison say nothing about a match.
+
+  proc leadRepeatOf(pattern: string, flags: RegexFlags = {}): bool =
+    re(pattern, flags).leadRepeat != nil
+
+  test "the repeat shape is recognized and subsumes the leading leaf":
+    check leadRepeatOf("(\\w)\\1")
+    check leadRepeatOf("(a)\\1")
+    check leadRepeatOf("([abc])\\1")
+    check leadRepeatOf("(\\w)\\1x")
+    # The leaf test is the repeat test's own first half, so it is not run
+    # twice: where the repeat applies, the leading leaf is left unset.
+    check re("(\\w)\\1").leadLeaf == nil
+
+  test "a recognized repeat answers what the matcher answers":
+    check search("abccde", re("(\\w)\\1")).matchSpan == 2 .. 4
+    check not search("abcde", re("(\\w)\\1")).found
+    check search("xaay", re("(a)\\1")).matchSpan == 1 .. 3
+    # A multibyte character repeats as its whole byte sequence, and the
+    # comparison must not answer on the lead byte alone: 本 and 語 share one.
+    check search("日本語語", re("(\\w)\\1")).matchSpan == 6 .. 12
+    check not search("日本語", re("(\\w)\\1")).found
+    # The second character running past the end is a refusal, not a read.
+    check not search("a", re("(\\w)\\1")).found
+    check not search("", re("(\\w)\\1")).found
+
+  test "a capture holding more than the one leaf is not the shape":
+    # The backreference then spans what the leaf test did not measure, so the
+    # comparison would be made against the wrong width.
+    check not leadRepeatOf("(\\w\\w)\\1")
+    check not leadRepeatOf("(\\w+)\\1")
+    check not leadRepeatOf("(\\w?)\\1")
+    check not leadRepeatOf("(\\w|ab)\\1")
+    check not leadRepeatOf("((\\w))\\1")
+    check not leadRepeatOf("(.)\\1")
+    check search("abab", re("(\\w\\w)\\1")).matchSpan == 0 .. 4
+    check search("abcabc", re("(\\w+)\\1")).matchSpan == 0 .. 6
+    check search("x", re("(\\w?)\\1")).matchSpan == 0 .. 0
+    check search("abab", re("(\\w|ab)\\1")).matchSpan == 0 .. 4
+    check search("qaa", re("((\\w))\\1")).matchSpan == 1 .. 3
+    check search("a\nx", re("(.)\\1")).matchSpan == -1 .. -1
+
+  test "a backreference to another group is not the shape":
+    check not leadRepeatOf("(\\w)(\\d)\\1")
+    check search("a1a", re("(\\w)(\\d)\\1")).matchSpan == 0 .. 3
+
+  test "case folding disqualifies the shape":
+    # ``\1`` then compares folds, not bytes, so ``aA`` matches and a byte
+    # comparison would skip it.
+    check not leadRepeatOf("(\\w)\\1", {rfIgnoreCase})
+    check not leadRepeatOf("(?i)(\\w)\\1")
+    check search("aA", re("(\\w)\\1", {rfIgnoreCase})).matchSpan == 0 .. 2
+    check search("aA", re("(?i)(\\w)\\1")).matchSpan == 0 .. 2
+
+  test "ascii case folding disqualifies the shape":
+    # The guard excludes both folding flags. Combined with ``rfIgnoreCase``,
+    # ASCII folds, so ``aA`` matches and a byte comparison would skip it.
+    check not leadRepeatOf("(\\w)\\1", {rfIgnoreCaseAscii})
+    check not leadRepeatOf("(?I)(\\w)\\1")
+    check not leadRepeatOf("(\\w)\\1", {rfIgnoreCase, rfIgnoreCaseAscii})
+    check not leadRepeatOf("(?iI)(\\w)\\1")
+    check search("aa", re("(\\w)\\1", {rfIgnoreCaseAscii})).matchSpan == 0 .. 2
+    check search("aA", re("(\\w)\\1", {rfIgnoreCase, rfIgnoreCaseAscii})).matchSpan == 0 .. 2
+    check search("aA", re("(?iI)(\\w)\\1")).matchSpan == 0 .. 2
+
+  test "a level backreference is not the shape":
+    # ``\k<n+1>`` reads the recursion history, not the capture the pattern
+    # just wrote, so the byte comparison would answer a different question.
+    check not leadRepeatOf("(\\w)\\k<1+1>")
+    check search("aa", re("(\\w)\\k<1+1>")).matchSpan == 0 .. 2
+
+  test "a zero-width prefix still admits the repeat behind it":
+    check leadRepeatOf("^(\\w)\\1")
+    check leadRepeatOf("\\b(\\w)\\1")
+    check leadRepeatOf("(?<=x)(\\w)\\1")
+    check search("x\naab", re("^(\\w)\\1")).matchSpan == 2 .. 4
+    check search(" aab", re("\\b(\\w)\\1")).matchSpan == 1 .. 3
+    check search("yaaxaab", re("(?<=x)(\\w)\\1")).matchSpan == 4 .. 6
+
+  test "a transparent group around the repeat still admits it":
+    # Groups that add no capture are entered at the start position.
+    check leadRepeatOf("(?:(\\w)\\1)")
+    check leadRepeatOf("(?>(\\w)\\1)")
+    check search("abccde", re("(?:(\\w)\\1)")).matchSpan == 2 .. 4
+    check search("abccde", re("(?>(\\w)\\1)")).matchSpan == 2 .. 4
+
+  test "a repeat prefilter agrees across the switch that turns it off":
+    # The counters are shared with the leading leaf's, so the repeat crosses
+    # the same trial and cooldown.  A subject long enough to cross it must
+    # answer the same on either side.
+    let subject = "aa bb cd ".repeat(200)
+    var runs = 0
+    for m in findAll(subject, re("(\\w)\\1")):
+      inc runs
+    check runs == 400
+    check search(subject & "zz", re("(z)\\1")).found
+
+  test "a repeat prefilter agrees under findLongest":
+    check leadRepeatOf("(\\w)\\1", {rfFindLongest})
+    check search("abccd", re("(\\w)\\1", {rfFindLongest})).matchSpan == 2 .. 4
