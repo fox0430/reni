@@ -1497,8 +1497,10 @@ type FirstCharCache* = TableRef[(uint, RegexFlags), FirstCharInfo]
   ## alternations re-walks everything below it once per level.
 
 proc isInvertedRange*(quantMin, quantMax: int): bool {.inline.} =
-  ## Whether ``{quantMin,quantMax}`` is inverted (bounded ``m < n``). Swapped
-  ## at match time; readers must use [effectiveQuantBounds] instead.
+  ## Whether ``{quantMin,quantMax}`` is inverted (bounded ``m < n``).
+  ## ``normaliseInvertedRanges`` swaps these at compile time, so only the
+  ## passes that run before it need [effectiveQuantBounds]; everything
+  ## downstream -- the analyses and the matcher -- may assume ``min <= max``.
   quantMax >= 0 and quantMin > quantMax
 
 proc effectiveQuantBounds*(quantMin, quantMax: int): tuple[lo, hi: int] {.inline.} =
@@ -1517,6 +1519,7 @@ proc extractFirstChar*(
 ): FirstCharInfo =
   ## Extract optimization hint about the first character/anchor of a pattern.
   ## ``cache``, when given, is consulted and filled as the walk descends.
+  ## Runs after ``normaliseInvertedRanges``, so ``quantMin`` reads as written.
   if node == nil:
     return FirstCharInfo(kind: fcNone)
   if cache.isNil:
@@ -1598,7 +1601,7 @@ proc extractFirstCharUncached(
     else:
       FirstCharInfo(kind: fcNone)
   of nkQuantifier:
-    if node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax):
+    if node.quantMin >= 1:
       extractFirstChar(node.quantBody, flags, cache)
     else:
       FirstCharInfo(kind: fcNone)
@@ -1632,6 +1635,8 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
   ## optimization and walks characters — finds nothing.  A literal is
   ## compared byte for byte anyway (``matchBytes``), so a match found this way
   ## is a real one; it is only the set of positions that widens.
+  ##
+  ## Runs after ``normaliseInvertedRanges``, so ``quantMin`` reads as written.
   if node == nil:
     return false
   case node.kind
@@ -1649,9 +1654,8 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
     else:
       false
   of nkQuantifier:
-    # An optional prefix is no prefix; an inverted range counts as optional.
-    node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax) and
-      hasLiteralPrefix(node.quantBody, flags)
+    # An optional prefix is no prefix.
+    node.quantMin >= 1 and hasLiteralPrefix(node.quantBody, flags)
   of nkConcat:
     var currentFlags = flags
     for child in node.children:
@@ -1685,6 +1689,7 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
 proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
   ## Extract a byte that must appear somewhere in any successful match.
   ## Used to quickly reject subjects that cannot possibly match.
+  ## Runs after ``normaliseInvertedRanges``, so ``quantMin`` reads as written.
   if node == nil:
     return RequiredByteInfo(valid: false)
   case node.kind
@@ -1729,8 +1734,7 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
     else:
       RequiredByteInfo(valid: false)
   of nkQuantifier:
-    # Inverted range: the effective minimum is ``quantMax``.
-    if node.quantMin >= 1 and not isInvertedRange(node.quantMin, node.quantMax):
+    if node.quantMin >= 1:
       extractRequiredByte(node.quantBody, flags)
     else:
       RequiredByteInfo(valid: false)
