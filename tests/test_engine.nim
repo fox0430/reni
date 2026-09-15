@@ -2513,18 +2513,20 @@ suite "auto-possessification":
     check kinds("\\w+x?x") == @[qkGreedy, qkGreedy]
     check all("aax", "\\w+x?x") == @["aax"]
 
-  test "an inverted range follower swaps its bounds, it does not go optional":
-    # ``x{3,1}`` matches like ``x{1,3}``: mandatory, and it speaks first.
-    check kinds("\\w+x{3,1}=") == @[qkGreedy, qkGreedy]
+  test "an inverted range follower is mandatory, not optional":
+    # ``x{3,1}`` is ``x{1,3}`` possessive by then: mandatory, and it speaks
+    # first, so ``\w+`` may not be told that ``=`` is all that follows.
+    check kinds("\\w+x{3,1}=") == @[qkGreedy, qkPossessive]
     check all("aaxx=", "\\w+x{3,1}=") == @["aaxx="]
-    check kinds("a+a{3,1}b") == @[qkGreedy, qkGreedy]
+    check kinds("a+a{3,1}b") == @[qkGreedy, qkPossessive]
     check all("aaab", "a+a{3,1}b") == @["aaab"]
-    check kinds("\\s+x{3,1}=") == @[qkPossessive, qkGreedy]
+    check kinds("\\s+x{3,1}=") == @[qkPossessive, qkPossessive]
+    # ``{2,0}`` is ``{0,2}``: optional, so ``=`` speaks too and ``x`` counts.
+    check kinds("\\w+x{2,0}=") == @[qkGreedy, qkPossessive]
+    check all("aax=", "\\w+x{2,0}=") == @["aax="]
     # ``{0,0}`` matches empty whatever else follows, so the walk reads past it
     # -- and ``x{0,0}`` is a repeat ``=`` refuses just the same.
     check kinds("\\s+x{0,0}=") == @[qkPossessive, qkPossessive]
-    check kinds("\\w+x{2,0}=") == @[qkGreedy, qkGreedy]
-    check all("aax=", "\\w+x{2,0}=") == @["aax="]
 
   test "a zero-width follower only restricts, so the walk reads past it":
     check kinds("\\w+(?!x)=") == @[qkPossessive]
@@ -2562,7 +2564,7 @@ suite "auto-possessification":
   test "only a greedy repeat is rewritten":
     check kinds("\\w+?=") == @[qkLazy]
     check kinds("\\w*+=") == @[qkPossessive] # already possessive, untouched
-    check kinds("\\w{3,1}=") == @[qkGreedy] # inverted, normalised at match time
+    check kinds("\\w{3,1}=") == @[qkPossessive] # inverted, possessive already
 
   test "the rewrite reaches inside groups and alternation branches":
     check kinds("(?>\\w+=)") == @[qkPossessive]
@@ -2582,6 +2584,85 @@ suite "auto-possessification":
       for asciiOnly in [false, true]:
         check not (isWordChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
         check not (isDigitChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
+
+suite "inverted range normalisation":
+  # ``{n,m}`` with ``n > m`` is Oniguruma's spelling for the swapped range
+  # taken possessively.  The compiler rewrites it once, so everything below
+  # reads the bounds and the kind as written -- pin both the rewritten node
+  # and the matches, since a wrong rewrite changes what the pattern means.
+  proc quant(pattern: string, flags: RegexFlags = {}): Node =
+    proc walk(node: Node): Node =
+      if node == nil:
+        return nil
+      if node.kind == nkQuantifier:
+        return node
+      for child in node.childNodes:
+        let q = walk(child)
+        if q != nil:
+          return q
+      nil
+
+    walk(re(pattern, flags).ast)
+
+  proc shape(pattern: string, flags: RegexFlags = {}): (int, int, QuantKind) =
+    let q = quant(pattern, flags)
+    (q.quantMin, q.quantMax, q.quantKind)
+
+  proc shapes(pattern: string, flags: RegexFlags = {}): seq[(int, int, QuantKind)] =
+    ## Every quantifier's bounds and kind, outermost first.
+    proc walk(node: Node, into: var seq[(int, int, QuantKind)]) =
+      if node == nil:
+        return
+      if node.kind == nkQuantifier:
+        into.add (node.quantMin, node.quantMax, node.quantKind)
+      for child in node.childNodes:
+        walk(child, into)
+
+    walk(re(pattern, flags).ast, result)
+
+  test "an inverted range is rewritten into the possessive swapped range":
+    check shape("a{3,1}") == (1, 3, qkPossessive)
+    check shape("a{2,0}") == (0, 2, qkPossessive)
+    check shape("a{3,2}") == (2, 3, qkPossessive)
+
+  test "a suffix on an inverted range chains onto it":
+    # ``?`` and ``+`` after ``{3,1}`` parse as a quantifier of their own, so
+    # the rewritten range keeps the kind the bounds gave it.
+    check shapes("a{3,1}?") == @[(0, 1, qkGreedy), (1, 3, qkPossessive)]
+    check shapes("a{3,1}+") == @[(1, -1, qkGreedy), (1, 3, qkPossessive)]
+    check shapes("a{1,3}?") == @[(1, 3, qkLazy)] # not inverted: plain lazy
+
+  test "a range that is not inverted is left as written":
+    check shape("a{1,3}") == (1, 3, qkGreedy)
+    check shape("a{3,3}") == (3, 3, qkGreedy)
+    check shape("a{3,}") == (3, -1, qkGreedy) # open-ended, so never inverted
+    check shape("a{3,}?") == (3, -1, qkLazy)
+
+  test "the rewrite runs where auto-possessification does not":
+    # ``possessifyRepeats`` bails on case folding and on ``\g<...>``; this
+    # pass is about what the range means, so it runs regardless.
+    check shape("a{3,1}", {rfIgnoreCase}) == (1, 3, qkPossessive)
+    check shape("(?i)a{3,1}") == (1, 3, qkPossessive)
+    check shape("(x{3,1})\\g<1>") == (1, 3, qkPossessive)
+
+  test "the rewrite reaches every body a quantifier can sit in":
+    check shape("(?:a{3,1})") == (1, 3, qkPossessive)
+    check shape("(a{3,1})") == (1, 3, qkPossessive)
+    check shape("(?=a{3,1})") == (1, 3, qkPossessive)
+    check shape("(?>a{3,1})") == (1, 3, qkPossessive)
+    check shape("b|a{3,1}") == (1, 3, qkPossessive)
+
+  test "the rewritten range takes its characters without giving them back":
+    # Which is what ``{3,1}`` meant all along -- ``a{1,3}`` would give one up.
+    check not search("aaa", re("a{3,1}a")).found
+    check search("aaa", re("a{1,3}a")).matchSpan == 0 .. 3
+    check search("aaa", re("a{3,1}")).matchSpan == 0 .. 3
+
+  test "the swapped minimum is what the match requires":
+    check search("aab", re("a{3,2}b")).matchSpan == 0 .. 3
+    check search("aaab", re("a{3,2}b")).matchSpan == 0 .. 4
+    check not search("b", re("a{3,2}b")).found # two ``a`` are still mandatory
+    check search("y", re("x{2,0}y")).matchSpan == 0 .. 1 # ``{0,2}``: none are
 
 suite "lead anchor prefilter":
   # The prefilter only refuses: a wrong verdict drops matches, so pin both

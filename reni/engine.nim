@@ -2858,14 +2858,14 @@ proc runMachine(
         node = body
         mode = mMatch
       of nkQuantifier:
-        # Oniguruma: {n,m} with n > m means possessive {0, max(n,m)}.
-        var qmin = node.quantMin
-        var qmax = node.quantMax
-        var qkind = node.quantKind
-        if qmax >= 0 and qmin > qmax:
-          swap(qmin, qmax)
-          qkind = qkPossessive
-        case qkind
+        # ``normaliseInvertedRanges`` rewrote every inverted ``{n,m}``, so the
+        # bounds and the kind are read as written.  The assert is erased under
+        # ``-d:danger``.
+        assert not isInvertedRange(node.quantMin, node.quantMax),
+          "matcher entered an inverted range the compiler did not normalise"
+        let qmin = node.quantMin
+        let qmax = node.quantMax
+        case node.quantKind
         of qkGreedy:
           let body {.cursor.} = node.quantBody
           if ctx.isSingleWayLeaf(body):
