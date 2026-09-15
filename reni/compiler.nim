@@ -976,9 +976,6 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   of nkAtomicGroup:
     leadFirstLeaf(node.atomicBody, flags)
   of nkQuantifier:
-    # Inverted range proves nothing about the first character.
-    if isInvertedRange(node.quantMin, node.quantMax):
-      return nil
     if node.quantMin >= 1:
       leadFirstLeaf(node.quantBody, flags)
     else:
@@ -1099,9 +1096,6 @@ proc leadAnchorSet(node: Node, flags: RegexFlags): set[AnchorKind] =
   of nkAtomicGroup:
     result = leadAnchorSet(node.atomicBody, flags)
   of nkQuantifier:
-    # Inverted range proves nothing about the first character.
-    if isInvertedRange(node.quantMin, node.quantMax):
-      return {}
     if node.quantMin >= 1:
       result = leadAnchorSet(node.quantBody, flags)
   else:
@@ -1135,10 +1129,7 @@ proc lazyScanLeaf(node: Node, flags: RegexFlags): Node =
   of nkAtomicGroup:
     lazyScanLeaf(node.atomicBody, flags)
   of nkQuantifier:
-    # Inverted range proves nothing about the first character.
-    if isInvertedRange(node.quantMin, node.quantMax):
-      nil
-    elif node.quantMin >= 1:
+    if node.quantMin >= 1:
       lazyScanLeaf(node.quantBody, flags)
     else:
       nil
@@ -1182,7 +1173,7 @@ proc annotateLazyScanLeaf(node: Node, flags: RegexFlags, after: Node, calls: boo
         # Anchors are zero-width; anything else without a leaf resets the tail.
         tail = lazyScanLeaf(child, flags)
   of nkQuantifier:
-    if node.quantKind == qkLazy and not isInvertedRange(node.quantMin, node.quantMax):
+    if node.quantKind == qkLazy:
       node.quantNextLeaf = after
     annotateLazyScanLeaf(node.quantBody, flags, nil, calls)
   of nkAlternation:
@@ -1340,15 +1331,12 @@ proc addFollow(node: Node, flags: RegexFlags, f: var Follow): FollowStep =
         discard
     if mayPass: fsPass else: fsStop
   of nkQuantifier:
-    # An inverted range only swaps its bounds (``{3,1}`` like ``{1,3}``), so
-    # it can still be mandatory: read them normalised rather than skipping it.
-    let (lo, hi) = effectiveQuantBounds(node.quantMin, node.quantMax)
-    if hi == 0:
-      return fsPass
+    if node.quantMax == 0:
+      return fsPass # ``{0,0}`` matches empty, so the node after it speaks
     let step = addFollow(node.quantBody, flags, f)
     if step == fsUnknown:
       fsUnknown
-    elif lo >= 1:
+    elif node.quantMin >= 1:
       step
     else:
       fsPass
@@ -1381,6 +1369,19 @@ proc followFrom(
   result.accept.ascii = result.accept.ascii + outer.accept.ascii
   result.accept.nonAscii = result.accept.nonAscii + outer.accept.nonAscii
 
+proc normaliseInvertedRanges(node: Node) =
+  ## Rewrite an inverted range into what Oniguruma matches for it: ``{3,1}``
+  ## is ``{1,3}`` possessive, whatever kind it was spelled with.  Doing it
+  ## once here lets every later pass read ``quantMin`` / ``quantKind`` as
+  ## written.
+  if node == nil:
+    return
+  if node.kind == nkQuantifier and isInvertedRange(node.quantMin, node.quantMax):
+    swap(node.quantMin, node.quantMax)
+    node.quantKind = qkPossessive
+  for child in node.childNodes:
+    normaliseInvertedRanges(child)
+
 proc possessifyRepeats(node: Node, flags: RegexFlags, after: Follow) =
   ## Rewrite a greedy repeat that cannot succeed by giving characters back
   ## into a possessive one -- PCRE2's auto-possessification.
@@ -1404,8 +1405,7 @@ proc possessifyRepeats(node: Node, flags: RegexFlags, after: Follow) =
     # on the last one; neither is analysed, so the body walks under an
     # unknown follower.
     possessifyRepeats(node.quantBody, flags, UnknownFollow)
-    if node.quantKind == qkGreedy and after.known and
-        not isInvertedRange(node.quantMin, node.quantMax):
+    if node.quantKind == qkGreedy and after.known:
       var body: AcceptSet
       if leafAccept(node.quantBody, flags, body) and disjointAccept(body, after.accept):
         node.quantKind = qkPossessive
@@ -1485,10 +1485,7 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
       else:
         discard
     # Mandatory repeat looks through to the body's run. Possessive is left
-    # out here -- an atomic body's end is not the outer repeat's -- as are
-    # inverted ranges, which normalise to possessive.
-    if isInvertedRange(node.quantMin, node.quantMax):
-      return nil
+    # out here -- an atomic body's end is not the outer repeat's.
     if node.quantMin >= 1 and node.quantKind in {qkGreedy, qkLazy}:
       return leadSimpleRepeat(body, flags)
     nil
@@ -1589,6 +1586,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   validateNumericRefs(ast, captureCount, namedCaptures)
   # Merge consecutive literals into nkString nodes
   ast = mergeLiterals(ast)
+  # Must run before any analysis that reads a quantifier's bounds or kind.
+  normaliseInvertedRanges(ast)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
