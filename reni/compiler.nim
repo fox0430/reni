@@ -990,6 +990,48 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   else:
     nil
 
+proc leadAnchorSet(node: Node, flags: RegexFlags): set[AnchorKind] =
+  ## Zero-width assertions every match must satisfy at the start position.
+  ##
+  ## Same descent as [leadFirstLeaf]: everything walked past is zero-width or
+  ## entered at the start position. The result is a conjunction of pure
+  ## position predicates, so order is irrelevant.
+  ##
+  ## ``akKeep`` is excluded: it writes ``keepStart`` and cannot run early.
+  ## Lookarounds and callouts are walked past as in ``leadFirstLeaf``.
+  if node == nil:
+    return {}
+  case node.kind
+  of nkConcat:
+    for child in node.children:
+      case child.kind
+      of nkAnchor:
+        if child.anchor != akKeep:
+          result.incl child.anchor
+      of nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+        discard
+      else:
+        return result + leadAnchorSet(child, flags)
+  of nkAnchor:
+    if node.anchor != akKeep:
+      result.incl node.anchor
+  of nkCapture:
+    result = leadAnchorSet(node.captureBody, flags)
+  of nkNamedCapture:
+    result = leadAnchorSet(node.namedCaptureBody, flags)
+  of nkGroup:
+    result = leadAnchorSet(node.groupBody, flags)
+  of nkAtomicGroup:
+    result = leadAnchorSet(node.atomicBody, flags)
+  of nkQuantifier:
+    # Inverted range proves nothing about the first character.
+    if isInvertedRange(node.quantMin, node.quantMax):
+      return {}
+    if node.quantMin >= 1:
+      result = leadAnchorSet(node.quantBody, flags)
+  else:
+    discard
+
 proc lazyScanLeaf(node: Node, flags: RegexFlags): Node =
   ## Leaf a continuation entered at ``node`` must match at entry, or nil.
   ## Only kinds with a ``leadLeafMatches`` arm qualify, and only where the test
@@ -1293,4 +1335,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
         let q = leadSimpleRepeat(ast, finalFlags)
         if q != nil and leadRunSkipSafe(ast): q else: nil,
     leadLeaf = leadFirstLeaf(ast, finalFlags),
+    leadAnchors = leadAnchorSet(ast, finalFlags),
   )

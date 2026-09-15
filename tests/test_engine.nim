@@ -2447,6 +2447,97 @@ suite "leadRun scan skip":
     check not skips("c(?:b[ab]+c){2,}")
     check all("xcbbcbabc", "c(?:b[ab]+c){2,}") == @["cbbcbabc"]
 
+suite "lead anchor prefilter":
+  # The prefilter only refuses: a wrong verdict drops matches, so pin both
+  # the compiled set and the matches found.
+  proc leads(pattern: string, flags: RegexFlags = {}): set[AnchorKind] =
+    re(pattern, flags).leadAnchors
+
+  proc all(subject, pattern: string, flags: RegexFlags = {}): seq[string] =
+    for m in findAll(subject, re(pattern, flags)):
+      result.add captureText(m, 0, subject).get("")
+
+  test "a leading assertion is collected":
+    check leads("\\bresult\\b") == {akWordBoundary}
+    check all("result presulting result", "\\bresult\\b") == @["result", "result"]
+    check leads("^foo") == {akLineBegin}
+    check leads("\\Afoo") == {akStringBegin}
+    check leads("\\Bfoo") == {akNotWordBoundary}
+    check all("foo xfoo", "\\Bfoo") == @["foo"]
+
+  test "several assertions are one conjunction":
+    check leads("^\\bfoo") == {akLineBegin, akWordBoundary}
+    check all("foo\nxfoo\nfoo", "^\\bfoo") == @["foo", "foo"]
+    # A contradiction refuses every start, which is the right answer.
+    check leads("\\b\\Bfoo") == {akWordBoundary, akNotWordBoundary}
+    check all("foo", "\\b\\Bfoo").len == 0
+
+  test "\\K is never collected":
+    # ``\K`` writes ``keepStart``, so it cannot run before the attempt.
+    check leads("\\Kfoo") == {}
+    check leads("\\b\\Kfoo") == {akWordBoundary}
+    check all("foo xfoo", "\\b\\Kfoo") == @["foo"]
+
+  test "zero-width company is walked past":
+    check leads("(?=f)\\bfoo") == {akWordBoundary}
+    check all("foo xfoo", "(?=f)\\bfoo") == @["foo"]
+    check leads("\\b(?=f)foo") == {akWordBoundary}
+
+  test "wrappers are peeled":
+    check leads("(\\bfoo)") == {akWordBoundary}
+    check leads("(?:\\bfoo)") == {akWordBoundary}
+    check leads("(?<n>\\bfoo)") == {akWordBoundary}
+    check leads("(?>\\bfoo)") == {akWordBoundary}
+    check all("foo xfoo", "(\\bfoo)") == @["foo"]
+
+  test "a mandatory repeat is looked through, an optional one is not":
+    check leads("(?:\\bfoo\\s*){2,}") == {akWordBoundary}
+    check leads("(?:\\bfoo\\s*){0,}") == {}
+    check leads("(?:\\bfoo\\s*){1,0}") == {}
+    check all("foo foo ", "(?:\\bfoo\\s*){2,}") == @["foo foo "]
+
+  test "an alternation is not looked through":
+    # Only one branch has to hold, so neither branch's assertion is required.
+    check leads("\\bfoo|bar") == {}
+    check all("xbar", "\\bfoo|bar") == @["bar"]
+    check leads("(?:\\bfoo|\\bbar)") == {}
+
+  test "an assertion after the first leaf is not collected":
+    # It is not evaluated at the start position, so it proves nothing there.
+    check leads("foo\\b") == {}
+    check leads("f\\boo") == {}
+
+  test "\\G is answered against the search start":
+    check leads("\\Gfoo") == {akSearchBegin}
+    check all("foofoo bar foo", "\\Gfoo") == @["foo", "foo"]
+    check all("xfoofoo", "\\Gfoo").len == 0
+
+  test "an end assertion may lead too":
+    check leads("$") == {akLineEnd}
+    check leads("\\z") == {akStringEnd}
+    check leads("\\Z") == {akStringEndOrNewline}
+    check all("ab\ncd", "$") == @["", ""]
+
+  test "a grapheme boundary leads":
+    check leads("\\yfoo") == {akGraphemeBoundary}
+    check all("foo xfoo", "\\yfoo") == @["foo", "foo"]
+
+  test "a negated grapheme boundary leads":
+    check leads("\\Yfoo") == {akNotGraphemeBoundary}
+    # No grapheme boundary holds between 'e' and the combining mark, so only
+    # position 1 may match.
+    check all("e\xCC\x81", "\\Y\xCC\x81") == @["\xCC\x81"]
+
+  test "a reused context after a limit error still answers \\y":
+    # ``\y`` reads ``graphemeMode``. A limit-aborted search may leave it dirty;
+    # the prefilter must see the attempt-start value.
+    let ctx = newMatchContext()
+    var m: Match
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, "aaaa", re("(?y{w}:a+)"), m, stepLimit = 2)
+    check searchIntoCtx(ctx, "aa", re("\\ya"), m, start = 1)
+    check m.boundaries[0] == 1 .. 2
+
 suite "UTF-8 validation":
   test "overlong 2-byte encoding (0xC0 0x80)":
     expect RegexError:
