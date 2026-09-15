@@ -819,6 +819,9 @@ type
       ## Zero-width assertions every match starts with, as a conjunction.
       ## Tested beside ``leadLeaf`` before entering the matcher; never
       ## contains ``akKeep``.
+    leadRepeat: Node
+      ## Leaf every match starts with twice running (``(leaf)\1``), or nil.
+      ## Replaces ``leadLeaf`` where set.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -938,6 +941,10 @@ proc leadLeaf*(r: Regex): lent Node {.inline.} =
 proc leadAnchors*(r: Regex): set[AnchorKind] {.inline.} =
   ## Zero-width assertions every match starts with; empty when there are none.
   r.leadAnchors
+
+proc leadRepeat*(r: Regex): lent Node {.inline.} =
+  ## Leaf every match starts with twice running, or nil.
+  r.leadRepeat
 
 proc span*(a, b: int): Span {.inline.} =
   Span(a: a, b: b)
@@ -1095,6 +1102,7 @@ proc initRegex*(
     leadRun: Node = nil,
     leadLeaf: Node = nil,
     leadAnchors: set[AnchorKind] = {},
+    leadRepeat: Node = nil,
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1123,6 +1131,7 @@ proc initRegex*(
     leadRun: leadRun,
     leadLeaf: leadLeaf,
     leadAnchors: leadAnchors,
+    leadRepeat: leadRepeat,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =

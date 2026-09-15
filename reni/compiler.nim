@@ -945,6 +945,10 @@ proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
   else:
     false
 
+const LeadZeroWidth =
+  {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}
+  ## Zero-width node kinds skipped when finding the first consuming node.
+
 proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   ## Leaf every match must start with, or nil. The scan tests it at each
   ## candidate start, so a refusal costs one character test, not a full
@@ -959,11 +963,9 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   of nkConcat:
     # Zero-width nodes consume nothing; look past them.
     for child in node.children:
-      case child.kind
-      of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+      if child.kind in LeadZeroWidth:
         continue
-      else:
-        return leadFirstLeaf(child, flags)
+      return leadFirstLeaf(child, flags)
     nil
   of nkCapture:
     leadFirstLeaf(node.captureBody, flags)
@@ -987,6 +989,79 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   of nkCharType:
     # Variable-width types are no single character test.
     if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+  else:
+    nil
+
+proc soleLeafBody(node: Node, flags: RegexFlags): Node =
+  ## The single leaf a capture body consumes, or nil. Skips anchors; anything
+  ## else beyond one leaf fails.
+  if node == nil:
+    return nil
+  case node.kind
+  of nkConcat:
+    var leaf: Node = nil
+    for child in node.children:
+      if child.kind == nkAnchor:
+        continue
+      if leaf != nil:
+        return nil
+      leaf = soleLeafBody(child, flags)
+      if leaf == nil:
+        return nil
+    leaf
+  of nkGroup:
+    soleLeafBody(node.groupBody, flags)
+  of nkAtomicGroup:
+    soleLeafBody(node.atomicBody, flags)
+  of nkLiteral, nkEscapedLiteral, nkCharClass:
+    node
+  of nkCharType:
+    # Variable-width types are no single character test.
+    if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+  else:
+    nil
+
+proc leadRepeatLeaf(node: Node, flags: RegexFlags): Node =
+  ## Leaf every match starts with twice running (``(leaf)\1``), or nil.
+  ## Case folding and non-level-0 backreferences disqualify.
+  if node == nil:
+    return nil
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return nil
+  case node.kind
+  of nkConcat:
+    # Same zero-width nodes [leadFirstLeaf] skips.
+    var i = 0
+    while i < node.children.len and node.children[i].kind in LeadZeroWidth:
+      inc i
+    if i + 1 >= node.children.len:
+      return nil
+    let cap = node.children[i]
+    # ``\1`` is ``captureIndex`` 0.
+    var capIndex: int
+    var body: Node
+    case cap.kind
+    of nkCapture:
+      capIndex = cap.captureIndex + 1
+      body = cap.captureBody
+    of nkNamedCapture:
+      # Unreachable today: validation rejects numeric backrefs here.
+      capIndex = cap.namedCaptureIndex + 1
+      body = cap.namedCaptureBody
+    else:
+      return nil
+    let leaf = soleLeafBody(body, flags)
+    if leaf == nil:
+      return nil
+    let after = node.children[i + 1]
+    if after.kind != nkBackreference or after.backrefLevel != 0 or
+        after.backrefIndex != capIndex:
+      return nil
+    leaf
+  of nkGroup:
+    leadRepeatLeaf(node.groupBody, flags)
+  of nkAtomicGroup:
+    leadRepeatLeaf(node.atomicBody, flags)
   else:
     nil
 
@@ -1313,6 +1388,13 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     # trie the matcher already entered.
     (finalFlags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0 and altTriesUsable(ast),
   )
+  let leadRepeat = leadRepeatLeaf(ast, finalFlags)
+  # ``leadRepeat`` includes the leaf test, so it replaces ``leadLeaf``.
+  let leadLeaf =
+    if leadRepeat != nil:
+      nil
+    else:
+      leadFirstLeaf(ast, finalFlags)
   initRegex(
     pattern = pattern,
     ast = ast,
@@ -1334,6 +1416,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       else:
         let q = leadSimpleRepeat(ast, finalFlags)
         if q != nil and leadRunSkipSafe(ast): q else: nil,
-    leadLeaf = leadFirstLeaf(ast, finalFlags),
+    leadLeaf = leadLeaf,
     leadAnchors = leadAnchorSet(ast, finalFlags),
+    leadRepeat = leadRepeat,
   )
