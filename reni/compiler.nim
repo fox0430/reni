@@ -1199,13 +1199,15 @@ proc annotateLazyScanLeaf(node: Node, flags: RegexFlags, after: Node, calls: boo
       annotateLazyScanLeaf(child, flags, nil, calls)
 
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
-  ## Unbounded greedy repeat over a one-way leaf every match must start
-  ## inside, or nil. The run must be unbounded: a bounded one reaches further
-  ## from the next start. Zero-width wrappers are peeled, as is a repeat with
-  ## ``min >= 1``, greedy/lazy, and non-inverted bounds, whose body must match
-  ## at the start -- ``(?:\w+\s+){3,}`` leads with ``\w+``.
-  ## Fixed-width prefix leaves are allowed only as a subset of the repeat
-  ## body, so skipped starts share the same run end.
+  ## Unbounded greedy or possessive repeat over a one-way leaf every match
+  ## must start inside, or nil. The run must be unbounded: a bounded one
+  ## reaches further from the next start. Zero-width wrappers are peeled, as
+  ## is a repeat with ``min >= 1``, greedy/lazy, and non-inverted bounds,
+  ## whose body must match at the start -- ``(?:\w+\s+){3,}`` leads with
+  ## ``\w+``.
+  ## Possessive qualifies too, and more simply: it has one end, the run's,
+  ## from every start inside it. Fixed-width prefix leaves are allowed only
+  ## as a subset of the repeat body, so skipped starts share the same run end.
   if node == nil:
     return nil
   case node.kind
@@ -1241,7 +1243,7 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
     let body = node.quantBody
     if body == nil:
       return nil
-    if node.quantKind == qkGreedy and node.quantMax < 0:
+    if node.quantKind in {qkGreedy, qkPossessive} and node.quantMax < 0:
       case body.kind
       of nkLiteral, nkEscapedLiteral, nkCharClass:
         return node
@@ -1252,8 +1254,9 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
         return nil
       else:
         discard
-    # Mandatory repeat looks through to the body's run. Possessive and
-    # inverted ranges are normalised to possessive, so both are left out.
+    # Mandatory repeat looks through to the body's run. Possessive is left
+    # out here -- an atomic body's end is not the outer repeat's -- as are
+    # inverted ranges, which normalise to possessive.
     if isInvertedRange(node.quantMin, node.quantMax):
       return nil
     if node.quantMin >= 1 and node.quantKind in {qkGreedy, qkLazy}:

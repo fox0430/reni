@@ -2347,9 +2347,14 @@ suite "leadRun scan skip":
     check not skips("A{0,4}=")
     check all("AAAAA=", "A{0,4}=") == @["AAAA="]
 
-  test "only a greedy repeat qualifies":
+  test "a lazy repeat does not qualify, a possessive one does":
+    # Lazy stops at the shortest run, so a later start is not refuted by the
+    # first attempt's failure; possessive has one end for every start inside.
     check not skips("\\w*?=")
-    check not skips("\\w*+=")
+    check skips("\\w*+=")
+    check all("aaa bbb=", "\\w*+=") == @["bbb="]
+    check skips("\\w++=")
+    check all("aaa bbb=", "\\w++=") == @["bbb="]
 
   test "a fixed leaf may lead only while it is a subset of the body":
     check skips("[A-Za-z_][A-Za-z0-9_]*=")

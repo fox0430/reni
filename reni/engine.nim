@@ -2961,6 +2961,9 @@ proc runMachine(
               if ctx.pos == attemptScalars.pos:
                 break # zero-width: count as one rep, then stop
             releaseTo(ctx, attemptOff) # release the scratch slot
+            if ctx.leadRunEnd < 0 and node.id == ctx.leadRun:
+              # First visit to the leading repeat: record its run end.
+              ctx.leadRunEnd = ctx.pos
             if count >= qmin:
               ctx.pushChoice Choice(
                 kind: chUndoState,
@@ -2983,6 +2986,9 @@ proc runMachine(
               count += 1
               if ctx.pos == attemptPos:
                 break # zero-width: count as one rep, then stop
+            if ctx.leadRunEnd < 0 and node.id == ctx.leadRun:
+              # First visit to the leading repeat: record its run end.
+              ctx.leadRunEnd = ctx.pos
             if count >= qmin:
               ctx.pushChoice Choice(
                 kind: chUndoScalars,
