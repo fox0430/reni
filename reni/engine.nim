@@ -209,6 +209,9 @@ type
       ## Whether the counters turned the prefilter off. Retried after
       ## ``leadLeafCool`` positions: a refusing-nothing prefix says nothing
       ## about what follows.
+    leadAnchors: set[AnchorKind]
+      ## Cached ``Regex.leadAnchors``. Shares the ``leadLeaf`` counters as one
+      ## prefilter. Placed here to fit the padding after the ``bool`` above.
     leadLeafCool: int32 ## Positions left before retrying an off prefilter.
 
   CapUndo = object
@@ -1638,6 +1641,21 @@ proc matchWordBoundary(ctx: MatchContext): bool =
     else:
       false
   prevIsWord xor nextIsWord
+
+proc leadAnchorsHold(ctx: MatchContext): bool {.inline.} =
+  ## Whether every leading assertion holds at ``ctx.pos``.
+  for a in ctx.leadAnchors:
+    let holds =
+      case a
+      of akWordBoundary:
+        matchWordBoundary(ctx)
+      of akNotWordBoundary:
+        not matchWordBoundary(ctx)
+      else:
+        anchorHolds(ctx, a)
+    if not holds:
+      return false
+  true
 
 proc resolveCapture(ctx: MatchContext, capIdx: int, level: int): Span =
   ## Resolve a capture, optionally using recursion-level stack.
@@ -3855,6 +3873,7 @@ proc resetForRegex(
   ## parameter, never of a local that dies before the match runs.
   ctx.subject = toSubject(subject)
   ctx.flags = regex[].flags
+  ctx.graphemeMode = gmNone
   ctx.regex = regex
   ctx.trackCaptureStacks = regex[].levelBackrefs
   ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
@@ -3870,6 +3889,7 @@ proc resetForRegex(
   # Only single-way leaves qualify; pin the compile-time guarantee.
   assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
   ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
+  ctx.leadAnchors = regex[].leadAnchors
   ctx.subjectEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
@@ -3962,6 +3982,7 @@ proc releaseBorrowed(ctx: MatchContext) {.inline.} =
   ctx.subject = Subject(data: nil, size: 0)
   ctx.leadRun = NoNodeId
   ctx.leadLeaf = NoNodeId
+  ctx.leadAnchors = {}
 
 proc searchImplInto*(
     ctx: MatchContext,
@@ -4007,7 +4028,15 @@ proc searchImplInto*(
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
   let leadLeafNode {.cursor.} = nodeAt(ctx, ctx.leadLeaf)
-  # Set once an attempt may have moved the leaf test's inputs.
+  # Hoisted: iterating a Nim set walks the whole enum range, so an empty set
+  # still costs per candidate.
+  let hasLeadAnchors = ctx.leadAnchors != {}
+  let hasPrefilter = leadLeafNode != nil or hasLeadAnchors
+  # ``\G``/``\y``/``\Y`` read this state, which ``resetForPosition`` otherwise
+  # writes only after the prefilter runs.
+  ctx.searchStart = start
+  ctx.graphemeMode = gmNone
+  # Set once an attempt may have moved the prefilter's inputs.
   var prefilterDirty = false
   while true:
     if startPos > subject.len:
@@ -4070,11 +4099,10 @@ proc searchImplInto*(
     if exhausted:
       break
 
-    # Leading-leaf prefilter: a refused position cannot match. Restores the
-    # ``flags``/``subjectEnd`` the test reads, which an attempt may have moved,
-    # and clears ``leadRunEnd`` the way ``resetForPosition`` does.
+    # Leading-prefix prefilter: a refused position cannot match. Restores the
+    # inputs an attempt may have moved, as ``resetForPosition`` does.
     var prefiltered = false
-    if leadLeafNode != nil:
+    if hasPrefilter:
       if ctx.leadLeafOff:
         dec ctx.leadLeafCool
         if ctx.leadLeafCool <= 0:
@@ -4085,10 +4113,15 @@ proc searchImplInto*(
         if prefilterDirty:
           ctx.flags = regex.flags
           ctx.subjectEnd = subject.len
+          ctx.searchStart = start
+          ctx.graphemeMode = gmNone
           prefilterDirty = false
         ctx.pos = startPos
         ctx.leadRunEnd = -1
-        prefiltered = not leadLeafMatches(ctx, leadLeafNode)
+        # Assertions first for locality: they touch the bytes the leaf reads.
+        prefiltered =
+          (hasLeadAnchors and not leadAnchorsHold(ctx)) or
+          (leadLeafNode != nil and not leadLeafMatches(ctx, leadLeafNode))
         # Adaptive off switch: an accepted position costs a second character
         # test the matcher repeats anyway, so stay on well past break-even.
         # Halve (not reset) at capacity: keeps the recent ratio, bounds both
