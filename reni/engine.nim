@@ -2944,6 +2944,11 @@ proc runMachine(
           let body {.cursor.} = node.quantBody
           let savedScalars = saveScalars(ctx)
           var count = 0
+          # The loop never gives characters back, so it can miss a ``qmin`` only
+          # a shorter split would reach.  Nothing arrives here able to:
+          # ``{n,m}+`` parses as chaining, [normaliseInvertedRanges] sends
+          # ``qmin >= 2`` through ``(?>X{m,n})``, and [possessifyRepeats]
+          # rewrites only single-leaf bodies, which split one way.
           if not node.quantBodyPure:
             # Full rollback plus one scratch slot reused in place.
             let savedCapOff = pushCaptures(ctx)

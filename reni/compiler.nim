@@ -1374,11 +1374,33 @@ proc normaliseInvertedRanges(node: Node) =
   ## is ``{1,3}`` possessive, whatever kind it was spelled with.  Doing it
   ## once here lets every later pass read ``quantMin`` / ``quantKind`` as
   ## written.
+  ##
+  ## A possessive repeat is an atomic group around a greedy one, and they part
+  ## only when the minimum needs the body to give characters back:
+  ## ``(?:a+){4,2}`` matches ``"aaaa"`` as ``"aaa"`` + ``"a"``, a split the
+  ## possessive loop -- which keeps each iteration's first match -- never
+  ## reaches.  So a minimum above one is spelled out as ``(?>X{m,n})``.  Up to
+  ## one rep that first answer is the greedy one already, so those stay
+  ## possessive and keep the fast paths that read the kind, [leadSimpleRepeat]
+  ## among them.
   if node == nil:
     return
   if node.kind == nkQuantifier and isInvertedRange(node.quantMin, node.quantMax):
     swap(node.quantMin, node.quantMax)
-    node.quantKind = qkPossessive
+    if node.quantMin >= 2:
+      # Rewritten in place: a fresh node carries the repeat, and this one --
+      # which a parent already points at -- becomes the atomic group over it.
+      # Numbering runs on the final tree, so the new node is unnumbered here.
+      let repeat = Node(
+        kind: nkQuantifier,
+        quantBody: node.quantBody,
+        quantMin: node.quantMin,
+        quantMax: node.quantMax,
+        quantKind: qkGreedy,
+      )
+      node[] = Node(kind: nkAtomicGroup, atomicBody: repeat)[]
+    else:
+      node.quantKind = qkPossessive
   for child in node.childNodes:
     normaliseInvertedRanges(child)
 

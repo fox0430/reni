@@ -2620,10 +2620,52 @@ suite "inverted range normalisation":
 
     walk(re(pattern, flags).ast, result)
 
+  proc atomicRepeat(pattern: string, flags: RegexFlags = {}): bool =
+    ## Whether the outermost quantifier sits under an atomic group of its own.
+    proc walk(node: Node): bool =
+      if node == nil:
+        return false
+      if node.kind == nkAtomicGroup and node.atomicBody != nil and
+          node.atomicBody.kind == nkQuantifier:
+        return true
+      if node.kind == nkQuantifier:
+        return false # a bare repeat came first
+      for child in node.childNodes:
+        if walk(child):
+          return true
+      false
+
+    walk(re(pattern, flags).ast)
+
   test "an inverted range is rewritten into the possessive swapped range":
     check shape("a{3,1}") == (1, 3, qkPossessive)
     check shape("a{2,0}") == (0, 2, qkPossessive)
-    check shape("a{3,2}") == (2, 3, qkPossessive)
+    check not atomicRepeat("a{3,1}") # up to one rep the loop is enough
+
+  test "a swapped minimum above one is spelled out as atomic greedy":
+    # Possessive is atomic around greedy, and the two part only when the
+    # minimum needs the body to give characters back.  The possessive loop
+    # takes each iteration's first match and keeps it, so that minimum is
+    # matched the long way instead -- see ``normaliseInvertedRanges``.
+    check atomicRepeat("a{3,2}")
+    check shape("a{3,2}") == (2, 3, qkGreedy)
+    # Still atomic: the repeat as a whole gives nothing back afterwards.
+    check not search("aaa", re("a{3,2}a")).found
+
+  test "the swapped minimum may split the body to reach itself":
+    # ``(?:a+){4,2}`` takes ``"aaa"`` then ``"a"``: two reps, the minimum.
+    check search("aaaa", re("(?:a+){4,2}$")).matchSpan == 0 .. 4
+    check search("aaaa", re("(?:.a*){3,2}\\b")).matchSpan == 0 .. 4
+    check search("aaab", re("a(?:a*a){3,2}")).matchSpan == 0 .. 3
+    block:
+      let m = search("aaaa", re("((a|)a){5,4}\\b"))
+      check m.matchSpan == 0 .. 4
+      check m.captureSpan(1) == 3 .. 4
+      check m.captureSpan(2) == 3 .. 3
+    block:
+      let m = search("aaaa", re("(a+a*|b){4,2}"))
+      check m.matchSpan == 0 .. 4
+      check m.captureSpan(1) == 3 .. 4
 
   test "a suffix on an inverted range chains onto it":
     # ``?`` and ``+`` after ``{3,1}`` parse as a quantifier of their own, so
@@ -2663,6 +2705,26 @@ suite "inverted range normalisation":
     check search("aaab", re("a{3,2}b")).matchSpan == 0 .. 4
     check not search("b", re("a{3,2}b")).found # two ``a`` are still mandatory
     check search("y", re("x{2,0}y")).matchSpan == 0 .. 1 # ``{0,2}``: none are
+
+  test "a body that matches empty satisfies the swapped minimum":
+    # Repeating an empty match would stay empty, so one such iteration answers
+    # every rep the minimum still wants -- as ``(?:x?){3,}`` already has it.
+    check search("b", re("(?:x?){3,2}")).matchSpan == 0 .. 0
+    check search("", re("a?{3,2}")).matchSpan == 0 .. 0
+    check search("", re("(?:){5,2}")).matchSpan == 0 .. 0
+    # The empty iteration's captures are what the match reports.
+    block:
+      let m = search("", re("(x*){3,2}"))
+      check m.matchSpan == 0 .. 0
+      check m.captureSpan(1) == 0 .. 0
+    block:
+      let m = search("", re("(?:(x)|(y?)){3,2}"))
+      check m.matchSpan == 0 .. 0
+      check m.captureSpan(1).a < 0
+      check m.captureSpan(2) == 0 .. 0
+    # A body that can consume still takes what it can before going empty.
+    check search("aab", re("(a*){5,2}b")).matchSpan == 0 .. 3
+    check search("ac", re("(?:a|){4,2}c")).matchSpan == 0 .. 2
 
 suite "lead anchor prefilter":
   # The prefilter only refuses: a wrong verdict drops matches, so pin both
