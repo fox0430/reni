@@ -859,6 +859,13 @@ proc annotateTree(
   ## the right place anyway.
   if node == nil:
     return
+  # Children first: the alternation arm below memoises a hint into ``cache``
+  # off every node under it, and ``classFirstChar``'s fallback reads the
+  # ``asciiSet`` this walk fills.  Parent-first would cache the ``fcNone``
+  # that fallback returns before the set was there and hand that stale answer
+  # to every enclosing alternation afterwards.
+  for child in node.childNodes:
+    annotateTree(child, hintFlags, cache, levelBackrefs, triesUsable)
   case node.kind
   of nkAlternation:
     # Allocated on first use, so a pattern with no alternation in it pays for
@@ -904,8 +911,9 @@ proc annotateTree(
         exactAsciiClassSet(node.atoms, ascii):
       # Masked, so the field means the same whichever producer filled it:
       # [classAsciiMatches] fills 0x80..0xFF for a range written across the
-      # ASCII boundary (what [classFirstChar] wants), [exactAsciiClassSet]
-      # never does, and no reader of ``asciiSet`` looks above 0x7F.
+      # ASCII boundary, [exactAsciiClassSet] never does.  The mask is the
+      # field's contract: a reader wanting the high bytes asks the atoms
+      # ([classCrossesAsciiBoundary]) instead.
       node.asciiSet = ascii * AllAsciiBytes
       node.asciiSetOk = true
   of nkBackreference:
@@ -916,8 +924,6 @@ proc annotateTree(
       levelBackrefs = true
   else:
     discard
-  for child in node.childNodes:
-    annotateTree(child, hintFlags, cache, levelBackrefs, triesUsable)
 
 proc exactAsciiLeaf(node: Node, s: var set[uint8]): bool =
   ## Exact ASCII byte set a leaf accepts, or false when it is not one ASCII

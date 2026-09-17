@@ -2199,3 +2199,113 @@ suite "the leading-repeat prefilter refuses only what no match can start with":
   test "a repeat prefilter agrees under findLongest":
     check leadRepeatOf("(\\w)\\1", {rfFindLongest})
     check search("abccd", re("(\\w)\\1", {rfFindLongest})).matchSpan == 2 .. 4
+
+suite "the first-byte hint is a superset of what can start a match":
+  # A hint that is too narrow makes the scan step over a position the pattern
+  # matches, and nothing else in the suite notices -- the match is simply never
+  # found.  So it is checked exhaustively over the byte range: whenever the
+  # pattern matches at a lead byte, the hint has to admit that byte.
+  # ``matchAt`` is the oracle because ``matchAtImpl`` reads no hint at all.
+  const HintPatterns = [
+    # A range written across the ASCII boundary, mixed with the atoms that
+    # send ``classFirstChar`` down the ``asciiSet`` fallback: the class then
+    # accepts stray bytes up to ``rangeTo`` that no lead byte stands for.
+    r"[a-\x{FF}\p{Han}]",
+    r"[^a-\x{FF}\p{Han}]",
+    r"[\p{Han}a-\x{FF}]+",
+    r"[a-\x{10FFFF}\p{Han}]",
+    r"[\x{7F}-\x{80}\p{Nd}]",
+    r"[a-\x{FF}&&\p{L}]",
+    r"[^a-\x{FF}&&\p{L}]",
+    r"[[a-c][x-\x{FF}]]",
+    r"(?i)[a-\x{FF}\p{Han}]",
+    r"(?-i:[a-\x{FF}\p{Han}])",
+    r"[a-\x{FF}\p{Han}]+x",
+    # The same shape through an alternation, where the branches' hints union.
+    r"x|[a-\x{FF}\p{Han}]",
+    r"\p{Han}|[a-\x{FF}\p{Nd}]",
+    # The boundary-crossing range on its own, and the fallback without it.
+    r"[a-\x{FF}]",
+    r"[^a-\x{FF}]",
+    r"[\p{Han}a-z]",
+    r"[^\p{Han}]",
+    r"[\p{L}\d_]",
+    # The fallback shapes no atom of which reaches U+0080, where the hint is
+    # the ASCII set alone and one stray lead byte would be a missed match.
+    r"[[a-c][x-z]]",
+    r"[^[a-c][x-z]]",
+    r"[a-z&&[^aeiou]]",
+    r"[[:alpha:]&&[a-c]]",
+    r"[\d&&[0-5]]",
+    r"[[\h]]",
+    r"[[\w]]",
+    r"[[a-c]&&[b-z]]",
+    r"[[\x{100}]&&[a-z]]",
+    r"[[a-z]&&[\x{100}]]",
+    r"\p{Han}",
+    r"\P{L}",
+    r"\w",
+    r"\W",
+    r".",
+  ]
+  # Enough continuation bytes for a lead byte to decode, plus the one-byte
+  # reading and an ASCII tail for the patterns that need a second character.
+  const Tails = ["", "\xA9", "\x80\x80", "\xA9\xB0\xB0", "x", "\xA9x"]
+
+  proc admits(fc: FirstCharInfo, b: uint8): bool =
+    ## Whether the hint lets the scan try a position holding ``b``.  ``fcNone``
+    ## filters nothing and the anchor kinds gate on position, not the byte.
+    case fc.kind
+    of fcByte:
+      fc.byte == b
+    of fcByteSet:
+      b in fc.bytes
+    else:
+      true
+
+  proc report(bad: seq[string]): string =
+    ## The whole sweep in one line, so a failure names every byte that broke.
+    if bad.len <= 8:
+      bad.join(", ")
+    else:
+      bad[0 .. 7].join(", ") & ", ... (" & $bad.len & " total)"
+
+  test "no lead byte the pattern matches is missing from the hint":
+    for pat in HintPatterns:
+      let r = re(pat)
+      let fc = firstCharInfo(r)
+      var bad: seq[string]
+      for b in 0'u8 .. 255'u8:
+        for tail in Tails:
+          let subject = $char(b) & tail
+          if matchAt(subject, r, 0).found and not admits(fc, b):
+            bad.add("0x" & toHex(b) & "+" & escape(tail))
+      checkpoint("pattern=" & pat & " dropped=" & report(bad))
+      check bad.len == 0
+
+  test "the scan reaches the same first position a sweep does":
+    # End to end, so a hint wrong for a reason other than the class bitmap
+    # shows up too.  The sweep steps with [nextScanPos] rather than a rule of
+    # its own: a position the scan never visits is not one it owes an answer
+    # at, though ``matchAt`` answers there anyway (``\w`` on "\x01\xF1\xA9x"
+    # matches the ``x`` the lead byte's declared length steps over).
+    for pat in HintPatterns:
+      let r = re(pat)
+      var bad: seq[string]
+      for b in 0'u8 .. 255'u8:
+        let subject = "\x01" & $char(b) & "\xA9x"
+        var sweep = -1
+        var i = 0
+        while i <= subject.len:
+          if matchAt(subject, r, i).found:
+            sweep = i
+            break
+          if i == subject.len:
+            break
+          i = nextScanPos(subject, i)
+        let m = search(subject, r)
+        let scanned = if m.found: m.matchSpan.a else: -1
+        if scanned != sweep:
+          bad.add("0x" & toHex(b) & " sweep=" & $sweep & " scan=" & $scanned)
+      checkpoint("pattern=" & pat & " diverged=" & report(bad))
+      check bad.len == 0

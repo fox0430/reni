@@ -1465,13 +1465,82 @@ proc classAsciiMatches*(
       return false
   true
 
+proc classCrossesAsciiBoundary*(node: Node): bool =
+  ## Whether an atom of ``node`` is a range written from below U+0080 to at or
+  ## above it -- the one shape that lets a stray byte above 0x7F match the
+  ## class as a one-byte character, read the way [classHasByte] reads it.
+  for atom in node.atoms:
+    if atom.kind == ccRange and int32(atom.rangeFrom) < 0x80 and
+        int32(atom.rangeTo) >= 0x80:
+      return true
+  false
+
+proc atomsReachNonAscii(atoms: seq[CcAtom]): bool =
+  ## Whether a member of ``atoms`` can be a character at or above U+0080.
+  ## Only answers false when every atom is provably ASCII-only, so
+  ## [classFirstChar] dropping the lead bytes on that answer stays a superset.
+  for atom in atoms:
+    case atom.kind
+    of ccLiteral:
+      if int32(atom.rune) >= 0x80:
+        return true
+    of ccRange:
+      if int32(atom.rangeTo) >= 0x80:
+        return true
+    of ccCharType:
+      case atom.charType
+      of ctDot, ctAnyChar, ctGraphemeCluster:
+        return true
+      else:
+        # As [charTypeBytes] reads it: high bytes in the set mean the type
+        # accepts characters above U+007F.
+        if (charTypeBytes(atom.charType) - AllAsciiBytes).card > 0:
+          return true
+    of ccNestedClass:
+      # A negated class accepts everything it does not list, high characters
+      # included.
+      if atom.nestedNegated or atomsReachNonAscii(atom.nestedAtoms):
+        return true
+    of ccIntersection:
+      # The intersection is a subset of both sides, so it can only reach above
+      # U+007F when both sides do.
+      let left = atom.interLeftNeg or atomsReachNonAscii(atom.interLeft)
+      let right = atom.interRightNeg or atomsReachNonAscii(atom.interRight)
+      if left and right:
+        return true
+    else:
+      # ``\p{...}``, ``\P{...}`` and the POSIX classes are Unicode-aware
+      # outside ASCII.
+      return true
+  false
+
 proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
   ## Lead bytes a character class can start with — always a superset of the
   ## truth, so the scan never skips a position the class could match.
   var matched: set[uint8]
   var nonAscii, predicate: bool
   if not classAsciiMatches(node, matched, nonAscii, predicate):
-    return FirstCharInfo(kind: fcNone)
+    # What the shape reader gives up on -- a ``\p{...}``, a nested class, an
+    # intersection -- ``asciiSet`` still answers below U+0080, exact and
+    # before negation; above U+007F it says nothing, so the high bytes come
+    # from the atoms.  ``rfIgnoreCase`` is out for [classBitmapAnswers]'s
+    # reason: the set is built without folding.
+    if not node.asciiSetOk or rfIgnoreCase in flags:
+      return FirstCharInfo(kind: fcNone)
+    if node.negated:
+      return byteSetInfo((AllAsciiBytes - node.asciiSet) + NonAsciiBytes)
+    # A range across the ASCII boundary accepts stray bytes up to its end
+    # ([classHasByte]), so take every high byte: the lead bytes alone would
+    # drop 0x80..0xC1 and 0xF5..0xFF and the scan would skip a position the
+    # class matches.  When no atom reaches U+0080 at all -- ``[[a-c][x-z]]``,
+    # ``[a-z&&[^aeiou]]`` -- the ASCII set is the whole truth, and adding the
+    # lead bytes would leave a hint that refuses nothing on a UTF-8 subject.
+    var high: set[uint8]
+    if classCrossesAsciiBoundary(node):
+      high = NonAsciiBytes
+    elif atomsReachNonAscii(node.atoms):
+      high = ClassLeadBytes
+    return byteSetInfo(node.asciiSet + high)
   if node.negated:
     # ``matched`` is exact below U+0080 and case folding only ever adds to
     # it, so its complement is a superset of what the negated class accepts.
