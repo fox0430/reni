@@ -1272,6 +1272,18 @@ suite "Absent operator":
     check m.found
     check m.boundaries[0] == 0 .. 1
 
+  test "abFunction an empty match counts as containing":
+    # An absent body that matches empty is contained at that position, so the
+    # longest non-containing text is empty there.  Verified against Oniguruma.
+    check search("xa", re("(?~(?:a|))")).boundaries[0] == 0 .. 0
+    check search("bbb", re("(?~a*)")).boundaries[0] == 0 .. 0
+    check search("xa", re("(?~(?:a|){3,2})")).boundaries[0] == 0 .. 0
+    check search("xa", re("(?~(?:a|){7,3})")).boundaries[0] == 0 .. 0
+    check search("xa", re("(?~a{3,0})")).boundaries[0] == 0 .. 0
+    # A body that matches nothing stays absent-free.
+    check search("bbb", re("(?~a)")).boundaries[0] == 0 .. 3
+    check search("bbb", re("(?~a+)")).boundaries[0] == 0 .. 3
+
   test "abExpression limits match range":
     let m = search("abcxdef", re("(?~|x|.+)"))
     check m.found
@@ -2182,6 +2194,358 @@ suite "Lookbehind edge cases":
     let m3 = search("zzxy", re("(?<!ab|cd)xy"))
     check m3.found
 
+suite "look-behind body window":
+  # A look-behind body is matched forward from a candidate start and has to
+  # end exactly where the look-behind sits, but Oniguruma also refuses it the
+  # subject past that position: the body takes what fits in the window instead
+  # of running past it.  It only shows on a body that will not give the
+  # overshoot back -- an atomic group, a possessive repeat, and so the
+  # possessive repeat an inverted range compiles into.
+
+  test "an atomic body takes only what the window holds":
+    # ``\w{2,3}`` would take all of "abc" and then fail the end check at 2.
+    let m = search("abc", re("(?<=(?>\\w{2,3}))c"))
+    check m.found
+    check m.boundaries[0] == 2 .. 3
+
+  test "an inverted range in a look-behind is the same shape":
+    # ``{3,2}`` is ``{2,3}`` possessive, so it overshoots the same way.
+    let m1 = search("abc", re("(?<=\\w{3,2})c"))
+    check m1.found
+    check m1.boundaries[0] == 2 .. 3
+
+    let m2 = search("ac", re("(?<=\\w{2,1})c"))
+    check m2.found
+    check m2.boundaries[0] == 1 .. 2
+
+  test "the window is what the body captured":
+    let m = search("abc", re("(?<=((?>\\w{2,3})))c"))
+    check m.found
+    check m.boundaries[1] == 0 .. 2
+
+  test "a negative look-behind sees the clipped body too":
+    # The body now matches, so the assertion fails -- before the clip the
+    # overshoot made it succeed.
+    check not search("abc", re("(?<!(?>\\w{2,3}))c")).found
+    check not search("abc", re("(?<!\\w{3,2})c")).found
+
+  test "an alternation look-behind clips each alternative":
+    for pattern in ["(?<=zz|(?>\\w{2,3}))c", "(?<=(?>\\w{2,3})|zz)c"]:
+      let m = search("abc", re(pattern))
+      check m.found
+      check m.boundaries[0] == 2 .. 3
+
+  test "the clip is by character, not by byte":
+    let m = search("\xC3\xA1bc", re("(?<=(?>\\w{2,3}))c"))
+    check m.found
+    check m.boundaries[0] == 3 .. 4
+
+  test "the window does not hand the body a match it has to earn":
+    # ``(?>a*)`` eats both a's and the trailing ``a`` then finds nothing
+    # left, at every start: clipping the end is not backtracking.
+    check not search("aab", re("(?<=(?>a*)a)b")).found
+    check not search("abcx", re("(?<=(?>ab|abc))x")).found
+
+  test "the end anchors read past the clip":
+    # Oniguruma answers ``$``, ``\z``, ``\Z`` and ``\b`` inside a look-behind
+    # from the real subject, so the window's edge is no end of string and no
+    # word boundary.
+    check not search("aab", re("(?<=\\w{1,2}$)b")).found
+    check not search("aab", re("(?<=\\w{1,2}\\Z)b")).found
+    check not search("aab", re("(?<=\\w{1,2}\\b)b")).found
+
+    # The same position is inside a word, which is what ``\B`` wants.
+    let m = search("aab", re("(?<=\\w{1,2}\\B)b"))
+    check m.found
+    check m.boundaries[0] == 2 .. 3
+
+  test "an empty window at the start of the subject has no word after it":
+    # ``\b`` reads the *content* of the next character past the window, but a
+    # boundary still needs the window to hold a subject at all: there is no
+    # boundary anywhere in an empty string, and the string a windowed body
+    # runs against is ``[0, window)``.  A body that matched empty at offset 0
+    # leaves nothing there, so there is no boundary.
+    #
+    # Every one of these writes the ``\b`` with something consuming behind it,
+    # which is what keeps it inside the window; the tail case is the test
+    # below.
+    for pattern in ["(?<=\\ba*)", "(?<=\\ba?)", "(?<=\\b\\w{0,2})", "(?<=\\ba*+)"]:
+      let m = search("ab", re(pattern))
+      check m.found
+      check m.boundaries[0] != 0 .. 0
+
+    let lead = search("ab", re("(?<=\\ba*+)"))
+    check lead.found
+    check lead.boundaries[0] == 1 .. 1
+
+    # ``\B`` takes the position ``\b`` gives up, and reads the empty window
+    # the same way: no boundary in it means ``\B`` holds there.
+    for pattern in ["(?<=\\Ba*)", "(?<=\\B\\w{0,2})", "(?<=\\Ba*+)"]:
+      let b = search("ab", re(pattern))
+      check b.found
+      check b.boundaries[0] == 0 .. 0
+
+  test "the absent operator does not widen the window away":
+    # ``(?~)`` clears the absent range by putting the subject end back, and
+    # the window used to *be* that end, so a no-op assertion silently undid
+    # the whole window.  They are separate now: ``(?~)`` moves what the
+    # zero-width shapes answer against, the window bounds consumption.
+    for pattern in ["(?<=(?~)(?>\\w{2,3}))c", "(?<=(?~)\\w{3,2})c"]:
+      let m = search("abc", re(pattern))
+      check m.found
+      check m.boundaries[0] == 2 .. 3
+
+    # ...and it is still the no-op it is everywhere else.
+    check search("abc", re("(?~)abc")).boundaries[0] == 0 .. 3
+    check search("abc", re("(?<=(?~)ab)c")).boundaries[0] == 2 .. 3
+
+  test "a leading repeat of a simple atom takes its fewest iterations":
+    # Oniguruma pins a look-behind body's leading repeat to its lower bound
+    # and drops it when that is zero -- ``node_reduce_in_look_behind``.  The
+    # body has to end where the look-behind sits, so a longer run is never
+    # needed: whatever it matches, the shorter one matches by starting nearer.
+    # ``(?<=a*\b)`` is ``(?<=\b)``, which is a fixed-length body and so runs
+    # against the real subject rather than a window.
+    for pattern in [
+      "(?<=a*\\b)a", "(?<=\\w*\\b)a", "(?<=\\w{0,2}\\b)a", "(?<=a*?\\b)a",
+      "(?<=z*\\b)a", "(?<=a*b*\\b)a",
+    ]:
+      let m = search("abcd", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 1
+
+    # Pinned, not deleted, when the lower bound is not zero: ``\w{1,3}`` is
+    # ``\w{1}`` and ``\w{3,4}`` is ``\w{3}``, which "abc" has no room for.
+    check search("abc", re("(?<=\\w{1,3})c")).boundaries[0] == 2 .. 3
+    check search("abc", re("(?<=\\w{2,3})c")).boundaries[0] == 2 .. 3
+    check search("abc", re("(?<=[a-z]{1,3})c")).boundaries[0] == 2 .. 3
+    check not search("abc", re("(?<=\\w{3,4})c")).found
+
+    # Pinning sees through a bare group the same way emptying does:
+    # ``(?:ab){1,2}`` is ``(?:ab){1}``.
+    check search("abcabc", re("(?<=(?:ab){1,2}c)")).boundaries[0] == 3 .. 3
+
+    # The walk is along the *front* and stops at the first element it does not
+    # empty, so a repeat written behind anything is left alone.
+    check not search("abcd", re("(?<=\\ba*)a")).found
+    check not search("abcd", re("(?<=a*\\bz*)a")).found
+    check not search("abcd", re("(?<=\\bz*a*)a")).found
+
+    # A bare ``(?:...)`` is no obstacle -- onig's parser has taken it away
+    # before its reducer runs -- and each alternative is its own body.
+    for pattern in [
+      "(?<=(?:a*\\b))a", "(?<=(?:(?:a*\\b)))a", "(?<=a*(?:\\b))a", "(?<=a*\\b\\b)a",
+      "(?<=a*\\b(?:))a", "(?<=a*\\b|zz)a", "(?<=zz|a*\\b)a", "(?<=(?:a*\\b|zz))a",
+    ]:
+      let m = search("abcd", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 1
+
+    # The group is transparent to the reducer, not just around the body: a
+    # string behind one is still a string, and a repeat behind one is still
+    # the front element, so both pin to nothing and the body goes unclipped.
+    for pattern in ["(?<=(?:ab)*\\b)a", "(?<=(?:a*)\\b)a", "(?<=(?:a*b*)\\b)a"]:
+      let m = search("abcd", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 1
+
+    # A backreference behind the repeat is simple too, so it pins the same
+    # way: the reduced body holds at ``0`` in "a" where the window would deny
+    # it.
+    check search("a", re("(?<=\\1*\\b)(a)")).boundaries[0] == 0 .. 1
+
+    # ...while what is not simple behind one stays variable and clipped: a
+    # capture, and an alternation, stop the walk where a string does not.
+    check not search("abcd", re("(?<=(a)*\\b)a")).found
+    check not search("abcd", re("(?<=(?:a|b)*\\b)a")).found
+
+    # ``\B`` reads itself false where ``\b`` reads true, so the reduced body
+    # has nowhere to end in "a", which has a boundary at 0.
+    check not search("a", re("(?<=\\w*\\B)")).found
+    check search("xay", re("(?<!a*\\B).")).boundaries[0] == 0 .. 1
+
+    # The negative reads the same body, so the two stay complements.
+    check not search("abcd", re("(?<!a*\\b)a")).found
+
+  test "a repeat the reduction does not reach keeps its window":
+    # The reduction is a quantifier over a string, char type, char class or
+    # backreference, and nothing else.  A possessive repeat, an atomic group
+    # and a grapheme cluster all survive it, the body stays variable-length,
+    # and a variable-length body runs clipped to the position it must end at
+    # -- where ``\b`` at offset 0 reads an empty clip and refuses.
+    check search("ab", re("(?<=a*\\b)")).boundaries[0] == 0 .. 0
+    for pattern in ["(?<=a*+\\b)", "(?<=a?+\\b)", "(?<=(?>a*)\\b)", "(?<=\\X*\\b)"]:
+      let m = search("ab", re(pattern))
+      check m.found
+      check m.boundaries[0] == 2 .. 2
+
+    for pattern in ["(?<=a*+\\b)a", "(?<=(?>a*)\\b)a"]:
+      check not search("abcd", re(pattern)).found
+      check not search("axac", re(pattern)).found
+    check search("axac", re("(?<=a*\\b)a")).boundaries[0] == 0 .. 1
+
+    # ``\B`` is the complement under the same clip rather than a third answer,
+    # so these three part company at 0 the other way round.
+    check search("ab", re("(?<=a*\\B)")).boundaries[0] == 1 .. 1
+    check search("ab", re("(?<=a*+\\B)")).boundaries[0] == 0 .. 0
+    check search("ab", re("(?<=(?>a*)\\B)")).boundaries[0] == 0 .. 0
+
+    # The window still bounds what such a body *consumes*, which is what it
+    # is for: ``(?>\w{2,3})`` may not keep the third byte when the body has to
+    # end after two.
+    check search("abc", re("(?<=(?>\\w{2,3}))c")).boundaries[0] == 2 .. 3
+
+  test "a capturing group stops the reduction where a bare one does not":
+    # Oniguruma's reducer walks a list and stops at anything that is not a
+    # repeat, a capture included -- and its parser has already removed the
+    # bare groups, so only the capture is left to stop it.  A capture *behind*
+    # the leading repeat is behind the walk and takes nothing away.
+    for pattern in [
+      "(?<=a*(\\b))a", "(?<=a*(?<x>\\b))a", "(?<=a*(\\b|\\B))a", "(?<=a*((\\b)))a",
+      "(?<=a*(?>\\b))a", "(?<=a*(?:(?>(\\b))))a",
+    ]:
+      let m = search("abcd", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 1
+    check search("abcd", re("(?<=a*(\\b))")).boundaries[0] == 0 .. 0
+
+    # Wrapped around the repeat instead, it stops the walk before it starts:
+    # the body keeps its ``a*``, stays variable-length, and keeps its window.
+    check not search("abcd", re("(?<=(a*\\b))a")).found
+
+    # A ``\g<...>`` says nothing about any of this.  The reduction is a fact
+    # about the body it rewrites, not about where that body is run from, so a
+    # called group answers what it answers.
+    check search("abcd", re("(?<=a*(\\b))a\\g<1>?")).boundaries[0] == 0 .. 1
+    check search("abcd", re("(?<=a*(\\b))a\\g<0>?")).boundaries[0] == 0 .. 1
+
+  test "a trailing zero-width shape keeps the body fixed-length":
+    # What the reduction leaves has to read as fixed-length for the body to go
+    # unclipped, and ``lengthBounds`` is what reads it.  Answering -1 for
+    # something that plainly consumes nothing is the failure mode, and it is
+    # silent: the look-behind simply stops holding.  ``(?:\b)+`` was that --
+    # an unbounded repeat answered -1 without looking at what it repeats --
+    # and so was ``(?(...)\b|\b)``, a conditional answering -1 with two
+    # branches of the same length.  Oniguruma compiles none of these, so they
+    # are reni's own rule followed through.
+    for pattern in [
+      "(?<=a*\\b)a", # the shape they all have to match
+      "(?<=a*(?(?=a)\\b|\\b))a", "(?<=a*(?(?=z)\\b|\\b))a", "(?<=a*(?:\\b){1,2})a",
+      "(?<=a*(?:\\b){1})a", "(?<=a*(?:\\b){2})a", "(?<=a*(?:\\b)+)a",
+      "(?<=a*(?:(?:\\b){1,2}){1,2})a",
+    ]:
+      let m = search("abcd", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 1
+
+    # A group-test conditional reads the same way.
+    check search("abcd", re("(z)?(?<=a*(?(1)\\b|\\b))")).boundaries[0] == 0 .. 0
+
+    # Branches of *different* lengths leave the body variable, and it is then
+    # clipped like any other -- no exemption for the zero-width branch.
+    check not search("abcd", re("(?<=a*(?(?=a)(?:\\b){1,2}|zz))a")).found
+
+    # The negative reads the same body, so the two stay complements.
+    check not search("abcd", re("(?<!a*(?(?=a)\\b|\\b))a")).found
+    check not search("abcd", re("(?<!a*(?:\\b){1,2})a")).found
+
+    # A repeat that can consume is not zero-width: a later iteration runs
+    # behind the ``\b``, which is ``(?<=a*\bz*)``'s case by another spelling.
+    check not search("abcd", re("(?<=a*(?:\\bz*){1,2})a")).found
+
+    # A ``{0}`` repeat consumes nothing whatever it repeats, even when the
+    # atom itself has no fixed width: ``\w{0}`` is fixed-length, so the body
+    # goes unclipped and holds at ``0``.
+    check search("ab", re("(?<=\\w{0}\\b)")).boundaries[0] == 0 .. 0
+
+  test "a piece that consumes nothing earns no window":
+    # [mayOvershoot] asks whether a piece can strand the body past the end it
+    # must reach and refuse to give the bytes back.  One that consumes nothing
+    # has nothing to strand, so it must not force a window -- ``(?<=(?>\b))``
+    # holds at ``0`` in "ab" exactly as ``(?<=\b)`` does, and a window would
+    # deny both.  Oniguruma agrees on every one of these.
+    for pattern in [
+      "(?<=(?>\\b))", "(?<=(?>\\b)\\b)", "(?<=\\b(?>\\b))", "(?<=(?>(?:)))",
+      "(?<=(?>\\b)?)", "(?<=a{0}+\\b)", "(?<=(?>\\b)*+)",
+    ]:
+      let m = search("ab", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 0
+
+    # A piece that does consume still earns one, zero-width neighbours and all.
+    check search("abc", re("(?<=\\b(?>\\w{2,3}))c")).boundaries[0] == 2 .. 3
+
+  test "a body that needs no window keeps the real subject's boundaries":
+    # A fixed-length body that backtracks gets no window at all, so ``\b``
+    # answers from the subject and holds at ``0`` -- where a window would
+    # have denied it.  Oniguruma agrees on every one of these.
+    for pattern in [
+      "(?<=\\b)", "(?<=^\\b)", "(?<=\\b\\b)", "(?<=(?:)\\b)", "(?<=a{0}\\b)",
+      "(?<=\\b|zz)", "(?<=zz|\\b)",
+    ]:
+      let m = search("ab", re(pattern))
+      check m.found
+      check m.boundaries[0] == 0 .. 0
+
+    # ``\B`` is its complement there, as it is outside a look-behind.
+    let b = search("ab", re("(?<=\\B)"))
+    check b.found
+    check b.boundaries[0] == 1 .. 1
+
+  test "an absent operator keeps its body clipped":
+    # ``(?~)`` consumes nothing, but a body holding one still runs under a
+    # window: the absent operator is not a repeat the reduction touches, so
+    # the body stays variable.  ``(?<=(?~)\b)`` answers where the clip leaves
+    # a boundary, while the same body without it answers at ``0``.
+    check search("ab", re("(?<=\\b)")).boundaries[0] == 0 .. 0
+    check search("a", re("(?<=(?~)\\b)")).boundaries[0] == 1 .. 1
+    check search("ab", re("(?<=(?~)\\b)")).boundaries[0] == 2 .. 2
+    check search("a", re("(?<=\\b(?~))")).boundaries[0] == 1 .. 1
+
+  test "a nested look-ahead reads past the clip":
+    # The clip bounds what the body may consume, not what an assertion inside
+    # it may look at -- the same line the end anchors are on.  A trailing
+    # ``(?=...)`` wants exactly the bytes the window took away, and
+    # Oniguruma rejects the shape outright, so reni follows PCRE, Perl and
+    # Python here: the look-ahead sees the real subject.
+    for pattern in ["(?<=ab(?=c))c", "(?<=a?b(?=c))c", "(?<=ab(?=c)|zz)c"]:
+      let m = search("abc", re(pattern))
+      check m.found
+      check m.boundaries[0] == 2 .. 3
+
+    # ...so an assertion and its negation do not both hold at one position.
+    check not search("abc", re("(?<!ab(?=c))c")).found
+    check not search("ac", re("(?<=a(?!c))c")).found
+    check not search("ac", re("(?<=a?a(?!c))c")).found
+
+  test "every alternative of a look-behind shares the one window":
+    # The fixed-length and the variable-length alternative have to agree, on
+    # the clip and on the look-ahead reading past it.
+    let m = search("abc", re("(?<=a?b(?=c)|zz)c"))
+    check m.found
+    check m.boundaries[0] == 2 .. 3
+    check not search("abc", re("(?<!ab(?=c)|zz)c")).found
+    check not search("abc", re("(?<!a?b(?=c)|zz)c")).found
+
+  test "a grapheme cluster ends at the window too":
+    # ``\X`` resolves its cluster forward, so it is one more shape that will
+    # not give an overshoot back: over "a" + U+0301 the cluster runs to 3,
+    # but a look-behind sitting at 1 only holds the "a".
+    let m1 = search("a\xCC\x81", re("(?<=\\X)"))
+    check m1.found
+    check m1.boundaries[0] == 1 .. 1
+
+    let m2 = search("a\xCC\x81b", re("(?<=\\X)\xCC\x81"))
+    check m2.found
+    check m2.boundaries[0] == 1 .. 3
+
+    check not search("a\xCC\x81b", re("(?<!\\X)\xCC\x81")).found
+
+    # ``.`` in grapheme mode is the same cluster, so it clips the same way.
+    let m3 = search("a\xCC\x81b", re("(?y{g})(?<=.)."))
+    check m3.found
+    check m3.boundaries[0] == 1 .. 3
+
 suite "Extended mode edge cases":
   test "(?x) whitespace in character class is literal":
     let m = search(" ", re("(?x)[ ]"))
@@ -2725,6 +3089,55 @@ suite "inverted range normalisation":
     # A body that can consume still takes what it can before going empty.
     check search("aab", re("(a*){5,2}b")).matchSpan == 0 .. 3
     check search("ac", re("(?:a|){4,2}c")).matchSpan == 0 .. 2
+
+suite "absent operator nesting":
+  # An absent operator narrows the range at the first position its own
+  # pattern matches.  Oniguruma reaches that by narrowing and then failing on
+  # purpose, so a *nested* absent operator -- whose own tail puts the range
+  # back as the failure unwinds through it -- takes the narrowing with it.
+  # Every span below is libonig 6.9.x's.
+  proc span(subject, pattern: string): Span =
+    search(subject, re(pattern)).matchSpan
+
+  const Alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+  test "an empty match of the absent pattern still narrows":
+    check span("abc", "(?~)") == 0 .. 0
+    check span("abc", "(?~(?:))") == 0 .. 0
+    check span("bbb", "(?~a*)") == 0 .. 0
+    check span("abc", "(?~(?:a|))") == 0 .. 0
+    # A zero-width assertion narrows where it holds and nowhere else.
+    check span("abc", "(?~\\b)") == 0 .. 0
+    check span("abc", "(?~\\B)") == 0 .. 1
+
+  test "a path that runs an absent operator does not narrow":
+    check span("abc", "(?~(?~))") == 0 .. 3
+    check span("abc", "(?~(?~|))") == 0 .. 3
+    check span("abc", "(?~(?~a))") == 0 .. 3
+    check span("abc", "(?~(?~)(?~))") == 0 .. 3
+    check span("abc", "(?~a*(?~))") == 0 .. 3
+    check span("abc", "(?~(?~)a)") == 0 .. 3
+    check span("abc", "(?~(?:(?~)))") == 0 .. 3
+    check span("abc", "(?~(?~)|(?~))") == 0 .. 3
+    check span(Alphabet, "a(?~(?~)).") == 0 .. 26
+
+  test "but another path to the same position does":
+    # The scan backtracks into whatever else the pattern can match, and an
+    # absent-free way through narrows as it always did.
+    check span("bab", "(?~(?:a|(?~)))") == 0 .. 1
+    check span("bab", "(?~(?:(?~)|a))") == 0 .. 1
+    check span("xaz", "(?~a|b(?~))") == 0 .. 1
+    # Skipping the operator is such a path.
+    check span("abc", "(?~(?:(?~))?)") == 0 .. 0
+    # And with no other path, nothing narrows.
+    check span("xyz", "(?~a|(?~))") == 0 .. 3
+
+  test "a scope that discards its backtracking narrows again":
+    # Nothing can unwind back into an atomic group or a lookaround, so the
+    # absent operator inside one behaves as it would outside.
+    check span("abc", "(?~(?>(?~)))") == 0 .. 0
+    check span("abc", "(?~(?=(?~)))") == 0 .. 0
+    check span("abc", "(?~(?<=(?~)))") == 0 .. 0
 
 suite "lead anchor prefilter":
   # The prefilter only refuses: a wrong verdict drops matches, so pin both

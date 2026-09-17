@@ -1386,6 +1386,8 @@ proc normaliseInvertedRanges(node: Node) =
   if node == nil:
     return
   if node.kind == nkQuantifier and isInvertedRange(node.quantMin, node.quantMax):
+    doAssert node.id == NoNodeId,
+      "normaliseInvertedRanges: numbering runs later, so no id is set yet"
     swap(node.quantMin, node.quantMax)
     if node.quantMin >= 2:
       # Rewritten in place: a fresh node carries the repeat, and this one --
@@ -1403,6 +1405,67 @@ proc normaliseInvertedRanges(node: Node) =
       node.quantKind = qkPossessive
   for child in node.childNodes:
     normaliseInvertedRanges(child)
+
+proc isSimpleRepeatBody(node: Node): bool {.inline.} =
+  ## Repeat bodies the look-behind reduction handles: strings, char types,
+  ## char classes and backreferences. Captures and alternations do not reduce.
+  node != nil and
+    node.kind in {
+      nkLiteral, nkEscapedLiteral, nkString, nkCharType, nkCharClass, nkBackreference,
+      nkNamedBackref,
+    }
+
+proc reduceLeadingRepeat(node: Node): bool =
+  ## Pin one leading repeat of a look-behind body to its lower bound.
+  ## Returns whether it became empty, letting the caller advance. Skips
+  ## possessives and non-simple bodies (see [isSimpleRepeatBody]).
+  if node == nil or node.kind != nkQuantifier or node.quantKind == qkPossessive:
+    return false
+  if not isSimpleRepeatBody(peelBareGroups(node.quantBody)):
+    return false
+  node.quantMax = node.quantMin
+  node.quantMin == 0
+
+proc reduceLeadingElement(node: Node): bool =
+  ## Pin one leading element of a look-behind front to empty where possible.
+  ## Bare groups are transparent; anything else is tried as a repeat.
+  let peeled = peelBareGroups(node)
+  if peeled == nil:
+    return true
+  if peeled.kind == nkConcat:
+    for child in peeled.children:
+      if not reduceLeadingElement(child):
+        return false
+    return true
+  reduceLeadingRepeat(peeled)
+
+proc reduceLookBehindBody(node: Node) =
+  ## Apply the reduction along the front of a look-behind body, stopping at
+  ## the first element that does not empty. Each alternative is its own body.
+  let peeled = peelBareGroups(node)
+  if peeled == nil:
+    return
+  case peeled.kind
+  of nkAlternation:
+    for alt in peeled.alternatives:
+      reduceLookBehindBody(alt)
+  of nkConcat:
+    for child in peeled.children:
+      if not reduceLeadingElement(child):
+        break
+  else:
+    discard reduceLeadingRepeat(peeled)
+
+proc reduceLookBehindBodies(node: Node) =
+  ## Run the reduction over every look-behind in the tree. Must run after
+  ## ``normaliseInvertedRanges`` and before ``possessifyRepeats``, whose
+  ## possessives this pass skips.
+  if node == nil:
+    return
+  if node.kind == nkLookaround and node.lookKind in {lkBehind, lkNegBehind}:
+    reduceLookBehindBody(node.lookBody)
+  for child in node.childNodes:
+    reduceLookBehindBodies(child)
 
 proc possessifyRepeats(node: Node, flags: RegexFlags, after: Follow) =
   ## Rewrite a greedy repeat that cannot succeed by giving characters back
@@ -1610,6 +1673,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   ast = mergeLiterals(ast)
   # Must run before any analysis that reads a quantifier's bounds or kind.
   normaliseInvertedRanges(ast)
+  # Pin a look-behind body's leading repeats to their lower bound.
+  # Runs before every pass that reads bounds; a reduced body may become fixed-length.
+  reduceLookBehindBodies(ast)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
