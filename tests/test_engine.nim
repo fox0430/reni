@@ -2370,13 +2370,16 @@ suite "look-behind body window":
     check not search("abcd", re("(?<!a*\\b)a")).found
 
   test "a repeat the reduction does not reach keeps its window":
-    # The reduction is a quantifier over a string, char type, char class or
-    # backreference, and nothing else.  A possessive repeat, an atomic group
-    # and a grapheme cluster all survive it, the body stays variable-length,
-    # and a variable-length body runs clipped to the position it must end at
-    # -- where ``\b`` at offset 0 reads an empty clip and refuses.
+    # The reduction is a quantifier over a string, plain char type, char class
+    # or backreference, and nothing else.  A possessive repeat, an atomic
+    # group, ``\X`` and ``\R`` all survive it, the body stays
+    # variable-length, and a variable-length body runs clipped to the position
+    # it must end at -- where ``\b`` at offset 0 reads an empty clip and
+    # refuses.
     check search("ab", re("(?<=a*\\b)")).boundaries[0] == 0 .. 0
-    for pattern in ["(?<=a*+\\b)", "(?<=a?+\\b)", "(?<=(?>a*)\\b)", "(?<=\\X*\\b)"]:
+    for pattern in [
+      "(?<=a*+\\b)", "(?<=a?+\\b)", "(?<=(?>a*)\\b)", "(?<=\\X*\\b)", "(?<=\\R*\\b)"
+    ]:
       let m = search("ab", re(pattern))
       check m.found
       check m.boundaries[0] == 2 .. 2
@@ -2396,6 +2399,22 @@ suite "look-behind body window":
     # is for: ``(?>\w{2,3})`` may not keep the third byte when the body has to
     # end after two.
     check search("abc", re("(?<=(?>\\w{2,3}))c")).boundaries[0] == 2 .. 3
+
+  test "the reduction reads the node kind, as Oniguruma's table does":
+    # ``\X`` and ``\R`` are char types here and nowhere in Oniguruma, which
+    # expands both into a subexpression while parsing.  Its reduction table
+    # never sees a node it accepts, so the repeat stays and the body keeps
+    # its window; reducing it would answer ``0 .. 0`` instead.  A plain char
+    # type does reduce, in whatever mode -- an option is not a node kind.
+    check search("ab", re("(?<=\\X*\\b)")).boundaries[0] == 2 .. 2
+    check search("ab", re("(?<=\\R*\\b)")).boundaries[0] == 2 .. 2
+    check search("ab", re("(?y{g})(?<=\\X*\\b)")).boundaries[0] == 2 .. 2
+    check search("ab", re("(?y{g})(?<=.*\\b)")).boundaries[0] == 0 .. 0
+    check search("ab", re("(?y{w})(?<=.*\\b)")).boundaries[0] == 0 .. 0
+    check search("ab", re("(?<=.*\\b)")).boundaries[0] == 0 .. 0
+    # A mode written *inside* the body is a node, and the leading run stops
+    # at the first element it cannot empty -- so the repeat behind it stays.
+    check search("ab", re("(?<=(?y{g}).*\\b)")).boundaries[0] == 2 .. 2
 
   test "a capturing group stops the reduction where a bare one does not":
     # Oniguruma's reducer walks a list and stops at anything that is not a
@@ -2461,9 +2480,8 @@ suite "look-behind body window":
     check search("ab", re("(?<=\\w{0}\\b)")).boundaries[0] == 0 .. 0
 
   test "a piece that consumes nothing earns no window":
-    # [mayOvershoot] asks whether a piece can strand the body past the end it
-    # must reach and refuse to give the bytes back.  One that consumes nothing
-    # has nothing to strand, so it must not force a window -- ``(?<=(?>\b))``
+    # A body that consumes nothing is fixed-length at zero, whatever it is
+    # built from, so it runs against the real subject -- ``(?<=(?>\b))``
     # holds at ``0`` in "ab" exactly as ``(?<=\b)`` does, and a window would
     # deny both.  Oniguruma agrees on every one of these.
     for pattern in [
