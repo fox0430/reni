@@ -1627,11 +1627,21 @@ proc tuneRepeats(node: Node, expand: bool) =
 proc isSimpleRepeatBody(node: Node): bool {.inline.} =
   ## Repeat bodies the look-behind reduction handles: strings, char types,
   ## char classes and backreferences. Captures and alternations do not reduce.
-  node != nil and
-    node.kind in {
-      nkLiteral, nkEscapedLiteral, nkString, nkCharType, nkCharClass, nkBackreference,
-      nkNamedBackref,
-    }
+  ##
+  ## ``\X`` and ``\R`` are char types here and are not ones Oniguruma
+  ## reduces: it has no node for either, expanding both into a subexpression
+  ## while parsing, and its table reads the node kind.  The difference is not
+  ## cosmetic.  Both run over as many characters as the text gives them, so a
+  ## body holding one has no fixed length and earns the window that makes
+  ## ``(?<=\X*\b)`` refuse at offset 0 -- which reducing the repeat away
+  ## would take from it.
+  if node == nil:
+    return false
+  if node.kind == nkCharType:
+    return node.charType notin {ctGraphemeCluster, ctNewlineSeq}
+  node.kind in {
+    nkLiteral, nkEscapedLiteral, nkString, nkCharClass, nkBackreference, nkNamedBackref
+  }
 
 proc reduceLeadingRepeat(node: Node): bool =
   ## Pin one leading repeat of a look-behind body to its lower bound.

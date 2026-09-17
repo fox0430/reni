@@ -1946,15 +1946,27 @@ proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.in
     lengthBounds(alt, ctx.flags, ctx.graphemeMode)
 
 proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether this look-behind body runs under a window: no fixed length, or
-  ## [mayOvershoot], or holds an absent operator. Fixed-length bodies that
-  ## backtrack get none.
+  ## Whether this look-behind body runs under a window; see
+  ## [lookbehindBodyEndsAt].  Oniguruma asks one question here -- is the body
+  ## fixed-length? -- and compiles the two cases differently
+  ## (``compile_anchor_look_behind_node``): a fixed one steps back a known
+  ## amount and runs against the real subject, anything else runs clipped to
+  ## the position it has to end at.  A fixed-length body that backtracks must
+  ## not get a window, so the test is not "may as well clip".
+  ##
+  ## The second term is reni's, and it is the one place the two engines are
+  ## not the same shape.  An absent operator narrows Oniguruma's
+  ## ``right_range``, which *is* the window, so a body holding one clips
+  ## itself from the inside; reni's narrows ``anchorEnd`` and spells ``(?~)``
+  ## as a range clear, which widens instead, so the clip has to be asked for
+  ## here.  ``(?<=(?~)\b)`` is the case that shows it -- Oniguruma holds only
+  ## at the end of the subject, and without this term reni would hold at 0.
   if ctx.bodyBounds(node).fixedLen < 0:
     return true
   if ctx.boundsUsable(node):
     node.lookNeedsWindow
   else:
-    mayOvershoot(node.lookBody, ctx.graphemeMode) or containsAbsentOp(node.lookBody)
+    containsAbsentOp(node.lookBody)
 
 proc altWindow(ctx: MatchContext, node: Node, i: int, alt: Node): bool {.inline.} =
   ## As [bodyWindow] for one alternative; each answers on its own.
@@ -1963,7 +1975,7 @@ proc altWindow(ctx: MatchContext, node: Node, i: int, alt: Node): bool {.inline.
     return info.bounds.fixedLen < 0 or info.needsWindow
   if lengthBounds(alt, ctx.flags, ctx.graphemeMode).fixedLen < 0:
     return true
-  mayOvershoot(alt, ctx.graphemeMode) or containsAbsentOp(alt)
+  containsAbsentOp(alt)
 
 proc lookbehindBodyEndsAt(
     ctx: MatchContext, body: Node, startPos, targetEnd: int, window: bool

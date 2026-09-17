@@ -354,9 +354,9 @@ type
       lookBoundsGm*: GraphemeMode
       lookBoundsValid*: bool
       lookNeedsWindow*: bool
-        ## Whether ``lookBody`` needs a window: [mayOvershoot] or
+        ## Whether ``lookBody`` needs a window although its length is fixed:
         ## [containsAbsentOp]. Asked only for fixed-length bodies; see
-        ## ``bodyWindow`` in ``engine``.
+        ## ``bodyWindow`` in ``engine``, which has the reason.
       lookBodyPure*: bool
         ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
         ## has to leave a rollback behind for the captures a positive
@@ -1992,60 +1992,6 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     of abFunction, abExpression:
       LenBounds(maxLen: -1, fixedLen: -1)
 
-proc mayOvershoot*(node: Node, gm = gmNone): bool =
-  ## Whether ``node`` can consume past a point and then refuse to give the
-  ## overshoot back. Only three shapes can: a possessive quantifier, an atomic
-  ## group, and a grapheme cluster (``\X``, or ``.`` in grapheme/word mode).
-  ## Anything that backtracks finds the right end on its own, so only these
-  ## force the window on a fixed-length look-behind body.
-  ##
-  ## A lookaround inside the body is zero-width, so this does not descend
-  ## into one. A piece that consumes nothing (``maxLen == 0``) cannot strand
-  ## anything and is exempt; the test ignores ``flags`` since nothing is
-  ## zero-width under one mode only.
-  ##
-  ## Backreferences and subexpression calls answer ``false`` without resolving
-  ## their target. This is covered only because ``lengthBounds`` reports
-  ## ``fixedLen: -1`` for them, so the window is granted on length before this
-  ## is asked -- resolve the callee here if that ever changes.
-  if node == nil:
-    return false
-  case node.kind
-  of nkAtomicGroup:
-    return lengthBounds(node.atomicBody, {}, gm).maxLen != 0
-  of nkQuantifier:
-    if node.quantKind == qkPossessive:
-      return lengthBounds(node.quantBody, {}, gm).maxLen != 0 and node.quantMax != 0
-  of nkCharType:
-    return
-      node.charType == ctGraphemeCluster or
-      (node.charType == ctDot and gm in {gmGrapheme, gmWord})
-  of nkLookaround:
-    return false
-  of nkSubexpCall, nkBackreference, nkNamedBackref:
-    # Unresolved; covered by their ``fixedLen: -1`` (see above).
-    return false
-  of nkFlagGroup:
-    # A flag group with a body scopes its mode to that body; a bare one
-    # applies to the rest of the concat, which the ``nkConcat`` arm carries.
-    let inner = if node.graphemeMode != gmNone: node.graphemeMode else: gm
-    return node.flagBody != nil and mayOvershoot(node.flagBody, inner)
-  of nkConcat:
-    var currentGm = gm
-    for child in node.children:
-      if child.kind == nkFlagGroup and child.flagBody == nil:
-        if child.graphemeMode != gmNone:
-          currentGm = child.graphemeMode
-      elif mayOvershoot(child, currentGm):
-        return true
-    return false
-  else:
-    discard
-  for child in node.childNodes:
-    if mayOvershoot(child, gm):
-      return true
-  false
-
 proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
   ## Cache [lengthBounds] of every lookaround body on its node.
   ## Must run on the final AST.
@@ -2060,14 +2006,12 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
       for alt in peeled.alternatives:
         node.lookAlts.add(
           LookAltInfo(
-            bounds: lengthBounds(alt, flags, gm),
-            needsWindow: mayOvershoot(alt, gm) or containsAbsentOp(alt),
+            bounds: lengthBounds(alt, flags, gm), needsWindow: containsAbsentOp(alt)
           )
         )
     node.lookBoundsFlags = flags
     node.lookBoundsGm = gm
-    node.lookNeedsWindow =
-      mayOvershoot(node.lookBody, gm) or containsAbsentOp(node.lookBody)
+    node.lookNeedsWindow = containsAbsentOp(node.lookBody)
     node.lookBoundsValid = true
     annotateLookaroundBounds(node.lookBody, flags, gm)
   of nkConcat:
