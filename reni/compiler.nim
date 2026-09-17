@@ -1406,6 +1406,224 @@ proc normaliseInvertedRanges(node: Node) =
   for child in node.childNodes:
     normaliseInvertedRanges(child)
 
+type ReduceAction = enum
+  raAsIs ## leave the pair as it stands
+  raDel ## the outer repeat becomes the inner one
+  raStar ## the pair becomes ``*``
+  raPlus ## the pair becomes ``+``
+  raLazyStar ## the pair becomes ``*?``
+  raLazyOpt ## the pair becomes ``??``
+  raPlusLazyOpt ## the pair becomes ``(?:X+)??``
+
+proc quantTypeNum(node: Node): int {.inline.} =
+  ## Oniguruma's ``quantifier_type_num``: which of the six popular spellings
+  ## this repeat is -- ``?`` 0, ``*`` 1, ``+`` 2, ``??`` 3, ``*?`` 4, ``+?`` 5
+  ## -- or -1 for a counted one, which [ReduceTable] has no row for.
+  ## Possessives answer -1 and never reach the table anyway:
+  ## [reduceNestedQuantifier] turns them away first, since Oniguruma spells
+  ## one as ``(?>...)`` around a greedy repeat and so never has a possessive
+  ## repeat node to put in a row.
+  case node.quantKind
+  of qkGreedy:
+    if node.quantMin == 0:
+      if node.quantMax == 1:
+        0
+      elif node.quantMax < 0:
+        1
+      else:
+        -1
+    elif node.quantMin == 1 and node.quantMax < 0:
+      2
+    else:
+      -1
+  of qkLazy:
+    if node.quantMin == 0:
+      if node.quantMax == 1:
+        3
+      elif node.quantMax < 0:
+        4
+      else:
+        -1
+    elif node.quantMin == 1 and node.quantMax < 0:
+      5
+    else:
+      -1
+  of qkPossessive:
+    -1
+
+const ReduceTable: array[6, array[6, ReduceAction]] = [
+  # Oniguruma's ``ReduceTypeTable``, transcribed. Indexed ``[inner][outer]``,
+  # both by [quantTypeNum].
+  [raDel, raStar, raStar, raLazyOpt, raLazyStar, raAsIs], # inner ``?``
+  [raDel, raDel, raDel, raPlusLazyOpt, raPlusLazyOpt, raDel], # inner ``*``
+  [raStar, raStar, raDel, raAsIs, raPlusLazyOpt, raDel], # inner ``+``
+  [raDel, raLazyStar, raLazyStar, raDel, raLazyStar, raLazyStar], # inner ``??``
+  [raDel, raDel, raDel, raDel, raDel, raDel], # inner ``*?``
+  [raAsIs, raStar, raPlus, raLazyStar, raLazyStar, raDel], # inner ``+?``
+]
+
+proc setQuant(node: Node, lo, hi: int, kind: QuantKind) {.inline.} =
+  node.quantMin = lo
+  node.quantMax = hi
+  node.quantKind = kind
+
+proc reduceNestedQuantifier(node: Node) =
+  ## Collapse a repeat whose body is itself a repeat, the way Oniguruma's
+  ## ``onig_reduce_nested_quantifier`` does: ``(?:a*)*`` is ``a*``,
+  ## ``(?:a?)+`` is ``a*``, ``(?:a{2}){3}`` is ``a{6}``.  Every rewrite is an
+  ## identity, so on its own this changes no answer; what it changes is the
+  ## *shape* the passes after it read.
+  ##
+  ## A look-behind body is where that shape becomes an answer.
+  ## [reduceLookBehindBodies] pins a leading repeat over a *simple* atom only
+  ## -- see [isSimpleRepeatBody] -- so it can only reduce ``(?:a*)*\b`` to
+  ## the bare ``\b`` Oniguruma ends up with once this pass has flattened the
+  ## pair first.  Oniguruma gets the ordering for free by doing this while
+  ## parsing, long before any look-behind tuning runs; here it is the
+  ## ordering in ``compileRegex`` that has to hold it.
+  ##
+  ## Bare groups are transparent, as in Oniguruma, where ``(?:...)`` leaves no
+  ## node behind.  A capture stops the reduction -- ``(a*)*`` and ``a*`` do
+  ## not write the same group -- and so does a possessive on either side,
+  ## which in Oniguruma is an atomic group and therefore not a repeat node the
+  ## pair could be read from.
+  if node.quantMin == 1 and node.quantMax == 1:
+    return # Oniguruma's ``assign_quantifier_body`` leaves ``X{1}`` alone.
+  let inner = peelBareGroups(node.quantBody)
+  if inner == nil or inner.kind != nkQuantifier:
+    return
+  if node.quantKind == qkPossessive or inner.quantKind == qkPossessive:
+    return
+  doAssert node.id == NoNodeId and inner.id == NoNodeId,
+    "reduceNestedQuantifier: numbering runs later, so no id is set yet"
+  let outerNum = quantTypeNum(node)
+  let innerNum = quantTypeNum(inner)
+  if outerNum < 0 or innerNum < 0:
+    if node.quantMin == node.quantMax and inner.quantMin == inner.quantMax:
+      # Two exact counts multiply.  A product past ``MaxRepeat`` is left as
+      # the pair it was written as: the parser refuses to spell a count that
+      # large, and Oniguruma reaching the same match through a product it does
+      # allow is no reason to put one in the tree here.
+      if inner.quantMin > 0 and node.quantMin > MaxRepeat div inner.quantMin:
+        return
+      node.quantMin = node.quantMin * inner.quantMin
+      node.quantMax = node.quantMin
+      node.quantBody = inner.quantBody
+    elif innerNum in {1, 2} and node.quantKind == qkGreedy and node.quantMax > 1:
+      # An unbounded inner repeat makes every iteration after the first match
+      # empty, so a counted outer one needs no more than its minimum:
+      # ``(?:a*){n,m}`` is ``(?:a*){n,n}``.  Oniguruma spells this rule out
+      # beside the table rather than in it.
+      node.quantMax = if node.quantMin == 0: 1 else: node.quantMin
+    return
+  let body = inner.quantBody
+  case ReduceTable[innerNum][outerNum]
+  of raAsIs:
+    discard
+  of raDel:
+    node.quantBody = body
+    node.setQuant(inner.quantMin, inner.quantMax, inner.quantKind)
+  of raStar:
+    node.quantBody = body
+    node.setQuant(0, -1, qkGreedy)
+  of raPlus:
+    node.quantBody = body
+    node.setQuant(1, -1, qkGreedy)
+  of raLazyStar:
+    node.quantBody = body
+    node.setQuant(0, -1, qkLazy)
+  of raLazyOpt:
+    node.quantBody = body
+    node.setQuant(0, 1, qkLazy)
+  of raPlusLazyOpt:
+    # The one rule that keeps the nesting rather than flattening it.
+    node.setQuant(0, 1, qkLazy)
+    inner.setQuant(1, -1, qkGreedy)
+
+const ExpandStringMaxLength = 100
+  ## Oniguruma's ``EXPAND_STRING_MAX_LENGTH``, in bytes, bounding both the
+  ## count and the result of [expandStringRepeat].
+
+proc foldsAnywhere(node: Node, flags: RegexFlags): bool =
+  ## Whether case folding is in effect anywhere in the pattern -- the leading
+  ## flags, or any ``(?i:...)`` scope inside it.  Answering per node would
+  ## mean threading the scopes, and the one caller only needs to know whether
+  ## to stand down.
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return true
+  if node == nil:
+    return false
+  if node.kind == nkFlagGroup and
+      (node.flagsOn * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
+    return true
+  for child in node.childNodes:
+    if foldsAnywhere(child, flags):
+      return true
+  false
+
+proc expandStringRepeat(node: Node) =
+  ## Write out an exact repeat of a literal run: ``a{2}`` is ``aa``, and
+  ## ``(?:ab){3}`` is ``ababab``.  Oniguruma's ``tune_quant`` does this, and
+  ## like [reduceNestedQuantifier] it is an identity that matters for the
+  ## shape it leaves: a repeat over a *string* is what the look-behind
+  ## reduction can pin, a repeat over a repeat is not, so ``(?<=(?:a{2})*\b)``
+  ## only reduces to the bare ``\b`` once the inner one is spelled out.
+  ##
+  ## The result is the node the pattern would have held had it been written
+  ## out by hand: ``mergeLiterals`` already folds any run of adjacent literals
+  ## into one ``nkString``, so this reaches no case that spelling does not.
+  ## Which is exactly why [tuneRepeats] stands it down under case folding.
+  ## ``(?i)ff`` matches ``\u{FB00}`` and ``(?i)f{2}`` does not, in Oniguruma
+  ## as here: Oniguruma expands a multi-character fold while the repeat still
+  ## holds a one-character string, and only writes the repeat out afterwards,
+  ## so the pair never becomes one the fold can reach.  Reni folds at match
+  ## time instead, so writing the repeat out *would* reach it.
+  if node.quantMin != node.quantMax or node.quantMin <= 1 or
+      node.quantMin > ExpandStringMaxLength:
+    return
+  let body = peelBareGroups(node.quantBody)
+  if body == nil:
+    return
+  var runes: seq[Rune]
+  case body.kind
+  of nkLiteral:
+    runes = @[body.rune]
+  of nkEscapedLiteral:
+    runes = @[body.escapedRune]
+  of nkString:
+    runes = body.runes
+  else:
+    return
+  var size = 0
+  for r in runes:
+    size += r.size
+  if size * node.quantMin > ExpandStringMaxLength:
+    return
+  doAssert node.id == NoNodeId,
+    "expandStringRepeat: numbering runs later, so no id is set yet"
+  var all = newSeqOfCap[Rune](runes.len * node.quantMin)
+  for _ in 1 .. node.quantMin:
+    all.add runes
+  node[] = newStringNode(all)[]
+
+proc tuneRepeats(node: Node, expand: bool) =
+  ## Bring every repeat into the shape Oniguruma compiles it in, innermost
+  ## first, so a stack of three collapses the way its bottom-up parse
+  ## collapses one.  Each node is offered to each rewrite once, which is all
+  ## Oniguruma does too -- it reduces a nested pair while parsing and expands
+  ## a string repeat in ``tune_quant``, and this pass stands in for both.
+  ##
+  ## ``expand`` carries [foldsAnywhere]'s answer, inverted: the reduction is
+  ## safe under folding, [expandStringRepeat] is not.
+  if node == nil:
+    return
+  for child in node.childNodes:
+    tuneRepeats(child, expand)
+  if node.kind == nkQuantifier:
+    reduceNestedQuantifier(node)
+    if expand:
+      expandStringRepeat(node)
+
 proc isSimpleRepeatBody(node: Node): bool {.inline.} =
   ## Repeat bodies the look-behind reduction handles: strings, char types,
   ## char classes and backreferences. Captures and alternations do not reduce.
@@ -1673,6 +1891,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   ast = mergeLiterals(ast)
   # Must run before any analysis that reads a quantifier's bounds or kind.
   normaliseInvertedRanges(ast)
+  # Collapse a repeat over a repeat and write out an exact repeat of a
+  # literal, as Oniguruma does while parsing and in ``tune_quant``.  Must run
+  # before the look-behind reduction, which only sees a leading repeat over a
+  # simple atom and so needs both shapes settled first.
+  tuneRepeats(ast, expand = not foldsAnywhere(ast, flags))
   # Pin a look-behind body's leading repeats to their lower bound.
   # Runs before every pass that reads bounds; a reduced body may become fixed-length.
   reduceLookBehindBodies(ast)

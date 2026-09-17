@@ -3040,7 +3040,9 @@ suite "inverted range normalisation":
 
   test "a range that is not inverted is left as written":
     check shape("a{1,3}") == (1, 3, qkGreedy)
-    check shape("a{3,3}") == (3, 3, qkGreedy)
+    # A literal body would be written out by ``tuneRepeats``, so this one asks
+    # a class instead; ``{3,3}`` is the shape under test either way.
+    check shape("[a]{3,3}") == (3, 3, qkGreedy)
     check shape("a{3,}") == (3, -1, qkGreedy) # open-ended, so never inverted
     check shape("a{3,}?") == (3, -1, qkLazy)
 
@@ -3089,6 +3091,186 @@ suite "inverted range normalisation":
     # A body that can consume still takes what it can before going empty.
     check search("aab", re("(a*){5,2}b")).matchSpan == 0 .. 3
     check search("ac", re("(?:a|){4,2}c")).matchSpan == 0 .. 2
+
+suite "repeat tuning":
+  # A repeat over a repeat collapses, and an exact repeat of a literal is
+  # written out -- both the way Oniguruma does it, and both identities on
+  # their own.  What they are for is the shape the look-behind reduction
+  # reads afterwards, so pin the compiled shape and the matches together.
+  proc shapes(pattern: string, flags: RegexFlags = {}): seq[(int, int, QuantKind)] =
+    ## Every quantifier's bounds and kind, outermost first.
+    proc walk(node: Node, into: var seq[(int, int, QuantKind)]) =
+      if node == nil:
+        return
+      if node.kind == nkQuantifier:
+        into.add (node.quantMin, node.quantMax, node.quantKind)
+      for child in node.childNodes:
+        walk(child, into)
+
+    walk(re(pattern, flags).ast, result)
+
+  test "a nested pair collapses to the one repeat that means the same":
+    check shapes("(?:a*)*") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a*)+") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a?)+") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a+)?") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a+)+") == @[(1, -1, qkGreedy)]
+    check shapes("(?:a?)?") == @[(0, 1, qkGreedy)]
+    check shapes("(?:a+?)*?") == @[(0, -1, qkLazy)]
+    check shapes("(?:a*?)*") == @[(0, -1, qkLazy)]
+    # Three deep is two collapses, innermost first.
+    check shapes("(?:(?:a*)*)*") == @[(0, -1, qkGreedy)]
+
+  test "every reduce-table cell collapses to its rule":
+    # The six ``??`` cells are pinned in their own test; the other twenty
+    # cells of the 6x6 table are pinned here. Each pair becomes the shape
+    # its cell dictates, so a mistranscribed cell changes one of these.
+    # Inner ``?`` row: the three cells the first test leaves out.
+    check shapes("(?:a?)*") == @[(0, -1, qkGreedy)] # raStar
+    check shapes("(?:a?)??") == @[(0, 1, qkLazy)] # raLazyOpt
+    check shapes("(?:a?)*?") == @[(0, -1, qkLazy)] # raLazyStar
+    # Inner ``*`` row.
+    check shapes("(?:a*)?") == @[(0, -1, qkGreedy)] # raDel
+    check shapes("(?:a*)*?") == @[(0, 1, qkLazy), (1, -1, qkGreedy)] # raPlusLazyOpt
+    check shapes("(?:a*)+?") == @[(0, -1, qkGreedy)] # raDel
+    # Inner ``+`` row.
+    check shapes("(?:a+)*") == @[(0, -1, qkGreedy)] # raStar
+    check shapes("(?:a+)??") == @[(0, 1, qkLazy), (1, -1, qkGreedy)] # raAsIs
+    check shapes("(?:a+)*?") == @[(0, 1, qkLazy), (1, -1, qkGreedy)] # raPlusLazyOpt
+    check shapes("(?:a+)+?") == @[(1, -1, qkGreedy)] # raDel
+    # Inner ``*?`` row: every cell keeps the inner ``*?``.
+    check shapes("(?:a*?)?") == @[(0, -1, qkLazy)] # raDel
+    check shapes("(?:a*?)+") == @[(0, -1, qkLazy)] # raDel
+    check shapes("(?:a*?)??") == @[(0, -1, qkLazy)] # raDel
+    check shapes("(?:a*?)*?") == @[(0, -1, qkLazy)] # raDel
+    check shapes("(?:a*?)+?") == @[(0, -1, qkLazy)] # raDel
+    # Inner ``+?`` row.
+    check shapes("(?:a+?)?") == @[(0, 1, qkGreedy), (1, -1, qkLazy)] # raAsIs
+    check shapes("(?:a+?)*") == @[(0, -1, qkGreedy)] # raStar
+    check shapes("(?:a+?)+") == @[(1, -1, qkGreedy)] # raPlus
+    check shapes("(?:a+?)??") == @[(0, -1, qkLazy)] # raLazyStar
+    check shapes("(?:a+?)+?") == @[(1, -1, qkLazy)] # raDel
+
+  test "the two rules that do not flatten the pair":
+    # ``(?:X*)??`` is ``(?:X+)??``: the outer repeat still owns the choice of
+    # taking nothing at all, so the inner one may as well take something.
+    check shapes("(?:a*)??") == @[(0, 1, qkLazy), (1, -1, qkGreedy)]
+    # And one pair Oniguruma leaves exactly as written.
+    check shapes("(?:a?)+?") == @[(1, -1, qkLazy), (0, 1, qkGreedy)]
+    check search("aab", re("(?:a*)??b")).matchSpan == 0 .. 3
+    check search("aab", re("(?:a?)+?b")).matchSpan == 0 .. 3
+
+  test "a capture or a possessive stops the collapse":
+    # ``(a*)*`` and ``a*`` do not write the same group, and a possessive is an
+    # atomic group in Oniguruma, so neither pair is one the table reads.
+    check shapes("(a*)*") == @[(0, -1, qkGreedy), (0, -1, qkGreedy)]
+    check shapes("(?:a*+)*") == @[(0, -1, qkGreedy), (0, -1, qkPossessive)]
+    check shapes("(?:a*)*+") == @[(0, -1, qkPossessive), (0, -1, qkGreedy)]
+    # The group is left holding the empty last iteration, as in Oniguruma.
+    check search("aaa", re("(a*)*")).captureSpan(1) == 3 .. 3
+
+  test "two exact counts multiply":
+    check re("(?:a{2}){3}").ast.bytes == "aaaaaa"
+    check shapes("(?:[ab]{2}){3}") == @[(6, 6, qkGreedy)]
+    check search("ababab", re("(?:a{2}){3}")).found == false
+    check search("aaaaaa", re("(?:a{2}){3}")).matchSpan == 0 .. 6
+    # A product past what the parser will spell stays the pair it was written
+    # as, which matches the same text.
+    check shapes("(?:a{1000}){1000}") ==
+      @[(1000, 1000, qkGreedy), (1000, 1000, qkGreedy)]
+
+  test "an unbounded inner repeat pins a counted outer one to its minimum":
+    # Every iteration after the first matches empty, so the count above the
+    # minimum buys nothing.
+    check shapes("(?:[ab]*){2,4}") == @[(2, 2, qkGreedy), (0, -1, qkGreedy)]
+    check shapes("(?:[ab]*){0,4}") == @[(0, 1, qkGreedy), (0, -1, qkGreedy)]
+    check shapes("(?:[ab]+){3,5}") == @[(3, 3, qkGreedy), (1, -1, qkGreedy)]
+
+  test "a lazy-optional inner collapses for every outer":
+    # The ``??`` row of the table, all six cells. Each pair becomes a lazy
+    # repeat: ``raDel`` keeps the inner ``??``, every other cell becomes
+    # ``*?``. A mistranscribed cell changes one of these shapes.
+    check shapes("(?:a??)?") == @[(0, 1, qkLazy)]
+    check shapes("(?:a??)*") == @[(0, -1, qkLazy)]
+    check shapes("(?:a??)+") == @[(0, -1, qkLazy)]
+    check shapes("(?:a??)??") == @[(0, 1, qkLazy)]
+    check shapes("(?:a??)*?") == @[(0, -1, qkLazy)]
+    check shapes("(?:a??)+?") == @[(0, -1, qkLazy)]
+    # Every span below is libonig 6.9.10's.
+    check search("aab", re("(?:a??)*b")).matchSpan == 0 .. 3
+    check search("aab", re("(?:a??)+b")).matchSpan == 0 .. 3
+    check search("aab", re("(?:a??)??b")).matchSpan == 1 .. 3
+    check search("aab", re("(?:a??)?b")).matchSpan == 1 .. 3
+    check search("aab", re("(?:a??)*?b")).matchSpan == 0 .. 3
+    check search("aab", re("(?:a??)+?b")).matchSpan == 0 .. 3
+
+  test "only a greedy outer over an unbounded greedy inner pins the count":
+    # The rule beside the table fires for ``*``/``+`` inside with a greedy
+    # counted outside. A lazy kind on either side, or an open-ended outer,
+    # leaves the pair as written; flipping the ``qkGreedy`` check or the
+    # ``{1, 2}`` set changes one of these shapes.
+    check shapes("(?:[ab]*){2,4}?") == @[(2, 4, qkLazy), (0, -1, qkGreedy)]
+    check shapes("(?:[ab]+){2,4}?") == @[(2, 4, qkLazy), (1, -1, qkGreedy)]
+    check shapes("(?:[ab]*){0,4}?") == @[(0, 4, qkLazy), (0, -1, qkGreedy)]
+    check shapes("(?:[ab]*?){2,4}") == @[(2, 4, qkGreedy), (0, -1, qkLazy)]
+    check shapes("(?:[ab]+?){2,4}") == @[(2, 4, qkGreedy), (1, -1, qkLazy)]
+    check shapes("(?:[ab]*){2,}") == @[(2, -1, qkGreedy), (0, -1, qkGreedy)]
+    # ``+`` after braces chains rather than turning possessive, so this is a
+    # greedy ``+`` over the pinned ``{2,2}``.
+    check shapes("(?:[ab]*){2,4}+") ==
+      @[(1, -1, qkGreedy), (2, 2, qkGreedy), (0, -1, qkGreedy)]
+    # Every span below is libonig 6.9.10's.
+    check search("aaab", re("(?:[ab]*){2,4}?")).matchSpan == 0 .. 4
+    check search("aaab", re("(?:[ab]*?){2,4}")).matchSpan == 0 .. 0
+    check search("aaab", re("(?:[ab]*){2,}")).matchSpan == 0 .. 4
+    check search("aaab", re("(?:[ab]*){2,4}+")).matchSpan == 0 .. 4
+
+  test "an exact repeat of a literal is written out":
+    check re("a{3}").ast.kind == nkString
+    check re("a{3}").ast.bytes == "aaa"
+    check re("(?:ab){2}").ast.bytes == "abab"
+    check search("aaa", re("a{3}")).matchSpan == 0 .. 3
+    check search("abab", re("(?:ab){2}")).matchSpan == 0 .. 4
+    # An escaped literal takes the nkEscapedLiteral branch.
+    check re("\\*{3}").ast.kind == nkString
+    check re("\\*{3}").ast.bytes == "***"
+    check search("***", re("\\*{3}")).matchSpan == 0 .. 3
+    # Not an exact count, not a literal body, and past the length bound: each
+    # stays a repeat.
+    check shapes("a{2,3}") == @[(2, 3, qkGreedy)]
+    check shapes("[ab]{3}") == @[(3, 3, qkGreedy)]
+    check shapes("a{101}") == @[(101, 101, qkGreedy)]
+
+  test "case folding stands the expansion down":
+    # ``(?i)ff`` matches U+FB00 and ``(?i)f{2}`` does not, in Oniguruma as
+    # here: it expands the multi-character fold while the repeat still holds a
+    # one-character string.  Writing the repeat out would hand reni's
+    # match-time folding a pair Oniguruma never gives it.
+    const Ff = "\u{FB00}"
+    check search(Ff, re("(?i)ff")).matchSpan == 0 .. 3
+    check not search(Ff, re("(?i)f{2}")).found
+    check shapes("(?i)f{2}") == @[(2, 2, qkGreedy)]
+    # A scoped fold anywhere in the pattern is enough to stand it down.
+    check shapes("(?i:z)f{2}") == @[(2, 2, qkGreedy)]
+    check re("f{2}").ast.kind == nkString
+
+  test "a look-behind body reduces only once the pair is flat":
+    # This is what the pass is for.  ``(?<=(?:a*)*\b)`` is ``(?<=\b)`` to
+    # Oniguruma: the pair collapses to ``a*``, the look-behind reduction pins
+    # that to ``a{0}`` and drops it, and the body left over is fixed-length,
+    # so it reads the real subject rather than a window.  Every answer below
+    # is libonig 6.9.x's.
+    check search("ab", re("(?<=(?:a*)*\\b)")).matchSpan == 0 .. 0
+    check search("ab", re("(?<=(?:a*)*\\b)a")).matchSpan == 0 .. 1
+    check search("ab", re("(?<=(?:a*)+\\b)")).matchSpan == 0 .. 0
+    check search("ab", re("(?<=(?:a+)*\\b)")).matchSpan == 0 .. 0
+    check search("ab", re("(?<=(?:(?:ab)*)*\\b)")).matchSpan == 0 .. 0
+    check search("ab", re("(?<=(?:a*)*\\B)")).matchSpan == 1 .. 1
+    # The same for a body the expansion is what flattens.
+    check search("ab", re("(?<=(?:a{2})*\\b)")).matchSpan == 0 .. 0
+    # A counted outer repeat is not a pair Oniguruma flattens, so the body
+    # stays variable-length and keeps its window.
+    check search("ab", re("(?<=(?:a*){1,2}\\b)")).matchSpan == 2 .. 2
 
 suite "absent operator nesting":
   # An absent operator narrows the range at the first position its own

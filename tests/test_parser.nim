@@ -110,10 +110,15 @@ suite "Step 3: Quantifiers":
     check r.ast.quantMax == 5
 
   test "counted {n}":
+    # An exact count over a literal is written out, as Oniguruma writes it
+    # out, so the compiled shape is the string and not the repeat.
     let r = re("a{3}")
-    check r.ast.kind == nkQuantifier
-    check r.ast.quantMin == 3
-    check r.ast.quantMax == 3
+    check r.ast.kind == nkString
+    check r.ast.bytes == "aaa"
+    let c = re("[a]{3}")
+    check c.ast.kind == nkQuantifier
+    check c.ast.quantMin == 3
+    check c.ast.quantMax == 3
 
   test "counted {n,}":
     let r = re("a{2,}")
