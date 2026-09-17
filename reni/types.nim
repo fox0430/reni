@@ -172,6 +172,11 @@ type
     maxLen*: int ## Upper bound on the bytes consumed; -1 when unbounded or unknown.
     fixedLen*: int ## The single length every match consumes; -1 when it varies.
 
+  LookAltInfo* = object
+    ## What a lookaround records about one alternative of an alternation body.
+    bounds*: LenBounds ## [lengthBounds] of the alternative.
+    needsWindow*: bool ## Whether the alternative needs a window.
+
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
     ## parsed trees; node kinds may change at any time without notice.
@@ -338,14 +343,20 @@ type
       lookBody*: Node
       lookBounds*: LenBounds
         ## [lengthBounds] of ``lookBody`` (and of each alternative, in
-        ## ``lookAltBounds``), so a lookbehind need not rewalk the body's tree
+        ## ``lookAlts``), so a lookbehind need not rewalk the body's tree
         ## at every position.  Filled in by ``annotateLookaroundBounds``; only
         ## usable while ``lookBoundsFlags`` matches the flags in force, since a
         ## subexpression call can reach the same lookaround under others.
-      lookAltBounds*: seq[LenBounds]
+      lookAlts*: seq[LookAltInfo]
+        ## Per-alternative annotation when ``lookBody`` is an alternation,
+        ## empty otherwise. Cached because ``altWindow`` runs per attempt.
       lookBoundsFlags*: RegexFlags
       lookBoundsGm*: GraphemeMode
       lookBoundsValid*: bool
+      lookNeedsWindow*: bool
+        ## Whether ``lookBody`` needs a window: [mayOvershoot] or
+        ## [containsAbsentOp]. Asked only for fixed-length bodies; see
+        ## ``bodyWindow`` in ``engine``.
       lookBodyPure*: bool
         ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
         ## has to leave a rollback behind for the captures a positive
@@ -1792,6 +1803,29 @@ proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
 proc runeBounds(r: Rune, flags: RegexFlags): LenBounds {.inline.} =
   LenBounds(maxLen: runeMaxByteLen(r, flags), fixedLen: runeFixedByteLen(r, flags))
 
+proc peelBareGroups*(node: Node): Node {.inline.} =
+  ## Follow ``(?:...)`` wrappers to the body they hold. Bare groups match what
+  ## their body matches, so shape readers see through them. Other groups stop it.
+  result = node
+  while result != nil and result.kind == nkGroup:
+    result = result.groupBody
+
+proc containsAbsentOp*(node: Node): bool =
+  ## Whether ``node`` holds an absent operator outside any nested lookaround.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAbsent:
+    return true
+  of nkLookaround:
+    return false
+  else:
+    discard
+  for child in node.childNodes:
+    if containsAbsentOp(child):
+      return true
+  false
+
 proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   ## Bound what ``node`` consumes.  See [LenBounds].
   ##
@@ -1882,6 +1916,9 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     let bb = lengthBounds(node.quantBody, flags, gm)
     # Inverted range: use the swapped bounds.
     let (qlo, qhi) = effectiveQuantBounds(node.quantMin, node.quantMax)
+    # ``{0,0}`` and repeats of zero-width bodies consume nothing.
+    if qhi == 0 or bb.maxLen == 0:
+      return LenBounds(maxLen: 0, fixedLen: 0)
     var total = -1
     if qhi >= 0 and bb.maxLen >= 0:
       if qhi == 0 or bb.maxLen <= int.high div qhi:
@@ -1942,32 +1979,95 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
           -1
         else:
           max(yes.maxLen, no.maxLen),
-      fixedLen: -1,
+      # One branch runs and the test is zero-width, so equal fixed lengths stay fixed.
+      fixedLen:
+        if yes.fixedLen >= 0 and yes.fixedLen == no.fixedLen: yes.fixedLen else: -1,
     )
   of nkAbsent:
-    LenBounds(maxLen: -1, fixedLen: -1)
+    # ``abClear`` and ``abRange`` are zero-width; the other two consume subject
+    # and stay unbounded. The window decision lives in [containsAbsentOp].
+    case node.absentKind
+    of abClear, abRange:
+      LenBounds(maxLen: 0, fixedLen: 0)
+    of abFunction, abExpression:
+      LenBounds(maxLen: -1, fixedLen: -1)
+
+proc mayOvershoot*(node: Node, gm = gmNone): bool =
+  ## Whether ``node`` can consume past a point and then refuse to give the
+  ## overshoot back. Only three shapes can: a possessive quantifier, an atomic
+  ## group, and a grapheme cluster (``\X``, or ``.`` in grapheme/word mode).
+  ## Anything that backtracks finds the right end on its own, so only these
+  ## force the window on a fixed-length look-behind body.
+  ##
+  ## A lookaround inside the body is zero-width, so this does not descend
+  ## into one. A piece that consumes nothing (``maxLen == 0``) cannot strand
+  ## anything and is exempt; the test ignores ``flags`` since nothing is
+  ## zero-width under one mode only.
+  ##
+  ## Backreferences and subexpression calls answer ``false`` without resolving
+  ## their target. This is covered only because ``lengthBounds`` reports
+  ## ``fixedLen: -1`` for them, so the window is granted on length before this
+  ## is asked -- resolve the callee here if that ever changes.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAtomicGroup:
+    return lengthBounds(node.atomicBody, {}, gm).maxLen != 0
+  of nkQuantifier:
+    if node.quantKind == qkPossessive:
+      return lengthBounds(node.quantBody, {}, gm).maxLen != 0 and node.quantMax != 0
+  of nkCharType:
+    return
+      node.charType == ctGraphemeCluster or
+      (node.charType == ctDot and gm in {gmGrapheme, gmWord})
+  of nkLookaround:
+    return false
+  of nkSubexpCall, nkBackreference, nkNamedBackref:
+    # Unresolved; covered by their ``fixedLen: -1`` (see above).
+    return false
+  of nkFlagGroup:
+    # A flag group with a body scopes its mode to that body; a bare one
+    # applies to the rest of the concat, which the ``nkConcat`` arm carries.
+    let inner = if node.graphemeMode != gmNone: node.graphemeMode else: gm
+    return node.flagBody != nil and mayOvershoot(node.flagBody, inner)
+  of nkConcat:
+    var currentGm = gm
+    for child in node.children:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        if child.graphemeMode != gmNone:
+          currentGm = child.graphemeMode
+      elif mayOvershoot(child, currentGm):
+        return true
+    return false
+  else:
+    discard
+  for child in node.childNodes:
+    if mayOvershoot(child, gm):
+      return true
+  false
 
 proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
-  ## Record [lengthBounds] of every lookaround body on the lookaround node.
-  ##
-  ## A lookbehind asks for its body's length once per position it is tried at,
-  ## which puts a whole recursive walk in the matcher's inner loop.  Computing
-  ## it here turns that into a flag check (see ``boundsUsable``).
-  ##
-  ## Must run on the final AST: a later rewrite would leave the annotation
-  ## describing a tree that no longer exists.  Nodes default to
-  ## ``lookBoundsValid == false`` and fall back to the walk.
+  ## Cache [lengthBounds] of every lookaround body on its node.
+  ## Must run on the final AST.
   if node == nil:
     return
   case node.kind
   of nkLookaround:
     node.lookBounds = lengthBounds(node.lookBody, flags, gm)
-    node.lookAltBounds = @[]
-    if node.lookBody != nil and node.lookBody.kind == nkAlternation:
-      for alt in node.lookBody.alternatives:
-        node.lookAltBounds.add(lengthBounds(alt, flags, gm))
+    node.lookAlts = @[]
+    let peeled = peelBareGroups(node.lookBody)
+    if peeled != nil and peeled.kind == nkAlternation:
+      for alt in peeled.alternatives:
+        node.lookAlts.add(
+          LookAltInfo(
+            bounds: lengthBounds(alt, flags, gm),
+            needsWindow: mayOvershoot(alt, gm) or containsAbsentOp(alt),
+          )
+        )
     node.lookBoundsFlags = flags
     node.lookBoundsGm = gm
+    node.lookNeedsWindow =
+      mayOvershoot(node.lookBody, gm) or containsAbsentOp(node.lookBody)
     node.lookBoundsValid = true
     annotateLookaroundBounds(node.lookBody, flags, gm)
   of nkConcat:
