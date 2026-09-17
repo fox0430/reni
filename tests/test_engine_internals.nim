@@ -1118,6 +1118,49 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
     check ctx.scratchCaps.choices <= 16
     check ctx.scratchCaps.frames <= 16
 
+  test "the step limit bounds the scan and not only the verdict":
+    # The run is charged in one go, so the limit has to clamp the scan too:
+    # charging afterwards raises on the same input, but only after reading the
+    # whole subject.
+    let ctx = newMatchContext()
+    var m: Match
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, "a".repeat(200_000), re("\\w+"), m, stepLimit = 10)
+    # One byte past the budget is what it takes to charge over the limit.
+    check ctx.stepsUsed == 11
+    # Classes, character types and a counted cap wider than the budget all
+    # take the scan, and none carries a literal the prefilter could refuse the
+    # subject on before a step is charged.
+    for pattern in ["[a-z]+", "\\w{1,100000}", "\\S*"]:
+      expect RegexLimitError:
+        discard searchIntoCtx(ctx, "a".repeat(200_000), re(pattern), m, stepLimit = 10)
+      check ctx.stepsUsed == 11
+
+  test "a run the budget covers is charged one step per repetition":
+    # A span the budget pays for has to come back whole, and cost what the
+    # per-repetition loop charged for it. A literal body never reaches the
+    # scan, so every pattern here carries a class or a character type.
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "aaaa" & "b", re("\\w+b"), m, stepLimit = 100)
+    check m.boundaries[0] == 0 .. 5
+    # Exactly on the budget: the last repetition is the last step it can pay.
+    check searchIntoCtx(ctx, "aaaa", re("^[a-z]+$"), m, stepLimit = 0)
+    let exact = ctx.stepsUsed
+    check searchIntoCtx(ctx, "aaaa", re("^[a-z]+$"), m, stepLimit = exact)
+    check m.boundaries[0] == 0 .. 4
+    check ctx.stepsUsed == exact
+    # One step short and it raises.
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, "aaaa", re("^[a-z]+$"), m, stepLimit = exact - 1)
+    # The literal body goes the per-repetition way: its count is the one the
+    # scan has to reproduce.
+    check searchIntoCtx(ctx, "aaaa", re("^a+$"), m, stepLimit = 0)
+    check ctx.stepsUsed == exact
+    # Unlimited stays unlimited -- the budget must not overflow into a clamp.
+    check searchIntoCtx(ctx, "a".repeat(50_000) & "b", re("\\S+b"), m, stepLimit = 0)
+    check m.boundaries[0] == 0 .. 50_001
+
   test "it still gives repetitions back one at a time":
     check search("aaa", re("a*a")).boundaries[0] == 0 .. 3
     check search("aaaa", re("^a{2,3}a$")).found
@@ -1126,6 +1169,9 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
     check search("12345", re("\\d*5")).boundaries[0] == 0 .. 5
     check search("aaab", re("a*ab")).boundaries[0] == 0 .. 4
     check not search("aa", re("a{3,}")).found
+    # A counted cap bounds the scan, not only the loop behind it.
+    check search("aaaaa", re("\\w{3}")).boundaries[0] == 0 .. 3
+    check not search("aaaaa", re("^[a-z]{2,3}$")).found
     check search("aaaa", re("a{3,}")).boundaries[0] == 0 .. 4
     # Zero-width body: one repetition, then the continuation.
     check search("b", re("(?:)*b")).found

@@ -337,7 +337,11 @@ type
       srFramesLen: int32
       srMinRep: int32
       srCount: int32 ## repetitions currently handed to the continuation
-      srPosOff: int32 ## start of this repeat's run in ``MatchContext.repPositions``
+      srPosOff: int32 ## start of this repeat's tail in ``MatchContext.repPositions``
+      srRunCount: int32
+        ## Leading repetitions taken as one ASCII run, storing no position:
+        ## each is one byte wide, so repetition ``k <= srRunCount`` ends ``k``
+        ## bytes past ``srScalars.pos``. ``srPosOff`` indexes the rest.
       srScalars: ScalarState
         ## State at repeat start. Only ``pos`` comes from the body; the rest
         ## covers what the continuation changed (``\K``, flags). Captures need
@@ -1533,6 +1537,93 @@ proc isSingleWayLeaf(ctx: MatchContext, node: Node): bool =
     not classFoldsApply(ctx, node)
   else:
     false
+
+proc leafRunAccepts(ctx: MatchContext, node: Node, accept: var set[uint8]): bool =
+  ## The ASCII bytes ``node`` accepts under ``ctx.flags``, or false when no
+  ## byte set decides it. Gives what [classAdvance] and [charTypeAdvance] give
+  ## on their ASCII fast paths, without the call. Nothing at or above 0x80 is
+  ## ever admitted, so the run loop can test membership alone.
+  case node.kind
+  of nkCharClass:
+    # [classBitmapAnswers]'s gate, minus the ``b < 0x80`` half the loop holds.
+    if not node.asciiSetOk or rfIgnoreCase in ctx.flags:
+      return false
+    accept =
+      if node.negated:
+        AllAsciiBytes - node.asciiSet
+      else:
+        node.asciiSet
+    true
+  of nkCharType:
+    # ``\X`` runs as a cluster and ``\R`` can take two bytes, so neither is
+    # one byte per repetition. Every other type reads the same below U+0080
+    # whatever the ASCII-restriction flags say -- see [buildAsciiCharTypeSets].
+    case node.charType
+    of ctGraphemeCluster, ctNewlineSeq:
+      false
+    of ctDot:
+      # ``.`` is a cluster in grapheme or word mode; outside them it is the
+      # byte set [charTypeAdvance]'s fast path reads ``rfMultiLine`` for. Both
+      # are fixed for the repeat -- only a node boundary moves them.
+      if ctx.graphemeMode != gmNone:
+        false
+      else:
+        accept =
+          if rfMultiLine in ctx.flags:
+            AllAsciiBytes
+          else:
+            AsciiCharTypeSets[ctDot]
+        true
+    else:
+      accept = AsciiCharTypeSets[node.charType]
+      true
+  else:
+    # A literal is single-way too, but a run of them is ``literalAdvance``'s
+    # business.
+    false
+
+proc leafRunEnd(ctx: MatchContext, accept: set[uint8], limit: int): int {.inline.} =
+  ## End of the run of bytes ``accept`` admits from ``ctx.pos``, stopping at
+  ## ``limit``. A byte outside the set ends the run, not the repeat: the
+  ## caller's per-repetition loop carries on from here.
+  var p = ctx.pos
+  while p < limit and ctx.subject[p].uint8 in accept:
+    inc p
+  p
+
+template leafRunSpan(ctx: MatchContext, node: Node, qmax: int): int =
+  ## Bytes of ``node``'s ASCII run from ``ctx.pos``, capped at ``qmax``
+  ## repetitions (``qmax < 0`` is unbounded), or 0 when no byte set decides
+  ## ``node``. ``ctx.pos`` is left to the caller; the steps are not -- one is
+  ## charged per repetition, as ``matchWithCont`` charges them, so the same
+  ## count raises on the same inputs.
+  ##
+  ## The scan stops one byte past what the budget can pay for, so the limit
+  ## bounds the work and not only the verdict.
+  ##
+  ## A template, not a proc: both repeat arms go through here on the hot path,
+  ## where a call costs more than a short run saves.
+  block:
+    var accept: set[uint8]
+    var span = 0
+    if leafRunAccepts(ctx, node, accept):
+      var limit =
+        if qmax < 0:
+          ctx.subjectEnd
+        else:
+          min(ctx.subjectEnd, ctx.pos + qmax)
+      # ``ctx.steps <= ctx.stepLimit`` on entry, so the budget is
+      # non-negative; comparing it against the room left keeps an unlimited
+      # limit from overflowing.
+      let budget = ctx.stepLimit - ctx.steps
+      if budget < limit - ctx.pos:
+        limit = ctx.pos + budget + 1
+      span = leafRunEnd(ctx, accept, limit) - ctx.pos
+      if span > 0:
+        ctx.steps += span
+        if ctx.steps > ctx.stepLimit:
+          raise newException(RegexLimitError, "match step limit exceeded")
+    span
 
 proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inline.} =
   ## ``literalAdvance`` / ``classAdvance`` behind one signature, so a caller
@@ -3018,7 +3109,13 @@ proc runMachine(
             # Single-way body: forward scan, one int per rep for backtracking.
             let scalars = saveScalars(ctx)
             let posOff = ctx.repLen.int32
-            var count = 0'i32
+            # A body that is one leaf over a byte set takes its ASCII run in
+            # a loop first and stores no position for it: the run is
+            # contiguous, so ``srRunCount`` alone hands back a repetition
+            # inside it. The loop below picks up where the run stopped.
+            let runCount = int32(ctx.leafRunSpan(body, qmax))
+            ctx.pos += runCount
+            var count = runCount
             while qmax < 0 or count < int32(qmax):
               let before = ctx.pos
               if not matchWithCont(ctx, body, TrueCont):
@@ -3043,6 +3140,7 @@ proc runMachine(
                 srMinRep: int32(qmin),
                 srCount: count,
                 srPosOff: posOff,
+                srRunCount: runCount,
                 srScalars: scalars,
               )
               mode = mCont
@@ -3129,6 +3227,12 @@ proc runMachine(
               mode = mFail
           else:
             # Pure body: scalar-only rollback, no side stack.
+            # Same run as above, with ``ctx.pos`` and ``count`` as the only
+            # outputs. No single-way gate is needed: ``nkCharType`` always is
+            # one, and [leafRunAccepts]'s class arm rules out ``(?i)``.
+            let runLen = ctx.leafRunSpan(body, qmax)
+            count += runLen
+            ctx.pos += runLen
             while qmax < 0 or count < qmax:
               let attemptPos = ctx.pos
               if not matchDiscardedBody(ctx, body, TrueCont):
@@ -3752,10 +3856,18 @@ proc runMachine(
         else:
           let back = count - 1
           let posOff = int(ctx.choices[top].srPosOff)
+          let runCount = ctx.choices[top].srRunCount
           ctx.choices[top].srCount = back
-          if back > 0:
-            ctx.pos = ctx.repPositions[posOff + int(back) - 1]
-          ctx.repLen = posOff + int(back)
+          if back <= runCount:
+            # Inside the run, where a repetition is one byte wide: its end is
+            # ``back`` bytes past the repeat's start, which ``restoreScalars``
+            # has just put back in ``ctx.pos``. The run stored no position.
+            ctx.pos += int(back)
+            ctx.repLen = posOff
+          else:
+            let tail = int(back - runCount)
+            ctx.pos = ctx.repPositions[posOff + tail - 1]
+            ctx.repLen = posOff + tail
           ctx.framesLen = ctx.choices[top].srFramesLen
           cont = ctx.choices[top].srCont
           mode = mCont
@@ -4002,6 +4114,11 @@ proc newMatchContext*(maxCapCount: int = 0): MatchContext =
 proc scratchCaps*(ctx: MatchContext): tuple[frames, choices, repPositions: int] =
   ## Buffer sizes (not live lengths); observe the release policy.
   (ctx.frames.len, ctx.choices.len, ctx.repPositions.len)
+
+proc stepsUsed*(ctx: MatchContext): int =
+  ## Steps charged by the last search, including the one that raised. For
+  ## tests reading how much work a limit let through; a reset clears it.
+  ctx.steps
 
 proc noteScratchUsage(ctx: MatchContext) =
   ## Release oversized scratch buffers after several small searches in a row.
