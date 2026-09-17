@@ -10,6 +10,8 @@ tests/test_*
 
 tools/port_*
 tools/diff_*
+tools/profile_item
+tools/probe_class_hints
 !tools/*.nim
 !tools/*.py
 !tools/*.c

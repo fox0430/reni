@@ -488,9 +488,16 @@ proc decodeChar(
   ## Decode char at ``p``; false if truncated (nothing consumes it).
   decodeCharUpTo(ctx, p, ctx.subjectEnd, code, next)
 
-proc nextScanPos(s: string, p: int): int {.inline.} =
-  ## Next scan start after ``p`` via lead-byte length, clamped to end. The end
-  ## itself is a start position (``\z``, ``$``, ``\b`` match there).
+proc nextScanPos*(s: string, p: int): int {.inline.} =
+  ## Next scan start after ``p`` via the lead byte's *declared* length, as
+  ## ``onig_search`` steps: a sequence truncated by the end of ``s`` is one
+  ## character to [nextCharAt] but a full step here, so the scan can step over
+  ## a tail the matcher would accept. Clamped to the end, which is itself a
+  ## start position (``\z``, ``$``, ``\b`` match there) with no lead byte to
+  ## step off, so ``p == s.len`` stays put. Exported so the first-byte-hint
+  ## test can sweep the positions the scan visits rather than restate the rule.
+  if p >= s.len:
+    return s.len
   min(p + encLen(s[p].uint8), s.len)
 
 proc leftAdjustCharHead(s: string, p: int): int {.inline.} =
