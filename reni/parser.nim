@@ -33,7 +33,10 @@ type Parser* = object
 
 const
   MaxNestingDepth = 256
-  MaxRepeat = 100_000
+  MaxRepeat* = 100_000
+    ## Largest count a quantifier may spell.  Exported because the compiler's
+    ## nested-repeat collapse multiplies two of them and has to refuse the
+    ## same overflow this parser does.
   FlagChars = {'i', 'm', 's', 'x', 'W', 'D', 'S', 'P', 'I', 'L'}
   LeadingOnlyFlags = {rfIgnoreCaseAscii, rfFindLongest}
     ## ``I`` and ``L``.  Oniguruma takes these in one group at the very start of
