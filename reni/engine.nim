@@ -536,6 +536,22 @@ proc advanceChainTo(s: string, start, target: int, byteScan: bool): int {.inline
   while result < target and result < s.len:
     result = nextScanPos(s, result)
 
+proc regionStopHolds(s: string, l: int, prefix: set[uint8]): bool {.inline.} =
+  ## Whether walk-back stop ``l`` holds. False inside a character or on a
+  ## consumed multi-byte tail; always true on well-formed UTF-8.
+  let lo = max(0, l - MaxCharByteLen)
+  for i in countdown(l - 1, lo):
+    let n = encLen(s[i].uint8)
+    if n == 1:
+      continue
+    if i + n > l:
+      return false # inside a character
+    if i + n == l and i < l - 1:
+      # Test the non-ASCII family; the decode skips checks and misreads overlongs.
+      if 0x80'u8 in prefix:
+        return false # a match consumes the character ending at ``l``
+  true
+
 proc semiEndScanStart(s: string, regex: Regex, start: int): int =
   ## Forward-scan start for ``\Z``-anchored patterns (Oniguruma window:
   ## ``min_semi_end - dmax``, adjusted to a char head).
@@ -1643,6 +1659,10 @@ const LeadLeafTrial = 32'i32 ## Positions answered before reading the refusal ra
 const LeadLeafPayoff = 8'i32
   ## Minimum refusal rate to stay on: one in eight. A refusal saves a whole
   ## attempt, worth well over eight character tests.
+
+const RegionTrial = 32 ## Occurrences answered before a useless region stands down.
+
+const RegionPayoff = 4 ## Average skipped bytes per occurrence for the region to pay off.
 
 const LeadLeafRetry = 4096'i32 ## Positions an off prefilter sits out before retry.
 
@@ -4310,8 +4330,10 @@ proc searchImplInto*(
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
   # occur literally for any match to exist.
-  let rb = regex.requiredByte
-  if rb.valid and indexOfByte(subject, start, rb.byte) < 0:
+  # Split scalars; the set is wide.
+  let rbValid = regex.requiredByte.valid
+  let rbByte = regex.requiredByte.byte
+  if rbValid and indexOfByte(subject, start, rbByte) < 0:
     noteScratchUsage(ctx)
     return
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
@@ -4326,6 +4348,17 @@ proc searchImplInto*(
     # ``onig_search`` resolves the anchors in one if/else chain, and ``\A``
     # wins over ``\Z``: an anchored pattern is only ever tried at ``start``.
     startPos = semiEndScanStart(subject, regex, start)
+  # Bound the loop by the next required byte; off when anchors or literal scan bound it.
+  let useRegion =
+    rbValid and regex.requiredByte.regionOk and fc.kind != fcAnchorStart and
+    not regex.semiEndAnchored and not byteScan
+  # Copy the set only when used.
+  var regionPrefix: set[uint8]
+  if useRegion:
+    regionPrefix = regex.requiredByte.prefix
+  var regionEnd = if useRegion: -1 else: int.high ## Region end; ``int.high`` means none.
+  var regionTried = 0
+  var regionSkipped = 0
   # ``exhausted`` means no candidate is left. ``leadLeafNode`` is resolved once:
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
@@ -4344,6 +4377,25 @@ proc searchImplInto*(
   while true:
     if startPos > subject.len:
       exhausted = true
+    if not exhausted and startPos > regionEnd:
+      # Walk back over the union, floored at the scan position.
+      let q = indexOfByte(subject, startPos, rbByte)
+      if q < 0:
+        exhausted = true
+      else:
+        var l = q
+        while l > startPos and subject[l - 1].uint8 in regionPrefix:
+          dec l
+        if l > startPos and not regionStopHolds(subject, l, regionPrefix):
+          # Invalid stop skips nothing.
+          l = startPos
+        inc regionTried
+        regionSkipped += l - startPos
+        regionEnd = q
+        startPos = l
+        # Stand down when occurrences skip too little.
+        if regionTried >= RegionTrial and regionSkipped < regionTried * RegionPayoff:
+          regionEnd = int.high
     # Fast skip based on first character optimization
     if not exhausted:
       case fc.kind
@@ -4401,6 +4453,9 @@ proc searchImplInto*(
         discard
     if exhausted:
       break
+    if startPos > regionEnd:
+      # First-byte skip left the region; rebind.
+      continue
 
     # Leading-prefix prefilter: a refused position cannot match. Restores the
     # inputs an attempt may have moved, as ``resetForPosition`` does.
@@ -4524,8 +4579,7 @@ proc searchBackwardImplInto*(
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
   # occur literally for any match to exist.
-  let rb = regex.requiredByte
-  if rb.valid and indexOfByte(subject, 0, rb.byte) < 0:
+  if regex.requiredByte.valid and indexOfByte(subject, 0, regex.requiredByte.byte) < 0:
     noteScratchUsage(ctx)
     return
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)

@@ -1375,6 +1375,158 @@ proc followFrom(
   result.accept.ascii = result.accept.ascii + outer.accept.ascii
   result.accept.nonAscii = result.accept.nonAscii + outer.accept.nonAscii
 
+type RegionStep = enum
+  ## Walk-back result on the mandatory path to the required byte.
+  rsNone ## no byte found; bytes seen joined the union
+  rsFound ## required byte found
+  rsRefuse ## unstated leaf; region stays off
+
+proc addAccept(s: var set[uint8], a: AcceptSet) =
+  s = s + a.ascii
+  if a.nonAscii != {}:
+    # Over-approximation only moves the region left.
+    s = s + {0x80'u8 .. 0xFF'u8}
+
+proc addRune(s: var set[uint8], cp: int32) =
+  if cp < 128:
+    s.incl uint8(cp)
+  else:
+    s = s + {0x80'u8 .. 0xFF'u8}
+
+proc consumable(node: Node, flags: RegexFlags, s: var set[uint8]): bool =
+  ## Every byte ``node`` can consume; false where a leaf cannot be stated exactly.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    true # zero-width
+  of nkLiteral:
+    addRune(s, int32(node.rune))
+    true
+  of nkEscapedLiteral:
+    addRune(s, int32(node.escapedRune))
+    true
+  of nkString:
+    for r in node.runes:
+      addRune(s, int32(r))
+    true
+  of nkCharClass, nkCharType:
+    var a: AcceptSet
+    if not leafAccept(node, flags, a):
+      return false
+    addAccept(s, a)
+    true
+  of nkConcat:
+    for child in node.children:
+      if not consumable(child, flags, s):
+        return false
+    true
+  of nkAlternation:
+    for alt in node.alternatives:
+      if not consumable(alt, flags, s):
+        return false
+    true
+  of nkGroup:
+    consumable(node.groupBody, flags, s)
+  of nkCapture:
+    consumable(node.captureBody, flags, s)
+  of nkNamedCapture:
+    consumable(node.namedCaptureBody, flags, s)
+  of nkAtomicGroup:
+    consumable(node.atomicBody, flags, s)
+  of nkQuantifier:
+    node.quantMax == 0 or consumable(node.quantBody, flags, s)
+  else:
+    # Anything else states no byte set.
+    false
+
+proc regionWalk(
+    node: Node, flags: RegexFlags, prefix: var set[uint8], found: var uint8
+): RegionStep =
+  ## Collect bytes before the required byte into ``prefix``; byte in ``found``.
+  if node == nil:
+    return rsRefuse
+  case node.kind
+  of nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    rsNone # zero-width
+  of nkLookaround:
+    # Positive look-ahead only; its body precedes the byte.
+    if node.lookKind == lkAhead and extractRequiredByte(node.lookBody, flags).valid:
+      if regionWalk(node.lookBody, flags, prefix, found) == rsFound:
+        rsFound
+      else:
+        rsRefuse
+    else:
+      rsNone
+  of nkLiteral, nkEscapedLiteral, nkString:
+    # Extraction source.
+    let rb = extractRequiredByte(node, flags)
+    if not rb.valid:
+      return rsRefuse
+    found = rb.byte
+    rsFound
+  of nkCharClass, nkCharType:
+    var a: AcceptSet
+    if not leafAccept(node, flags, a):
+      return rsRefuse
+    addAccept(prefix, a)
+    rsNone
+  of nkConcat:
+    for child in node.children:
+      case regionWalk(child, flags, prefix, found)
+      of rsFound:
+        return rsFound
+      of rsRefuse:
+        return rsRefuse
+      of rsNone:
+        discard
+    rsNone
+  of nkGroup:
+    regionWalk(node.groupBody, flags, prefix, found)
+  of nkCapture:
+    regionWalk(node.captureBody, flags, prefix, found)
+  of nkNamedCapture:
+    regionWalk(node.namedCaptureBody, flags, prefix, found)
+  of nkAtomicGroup:
+    regionWalk(node.atomicBody, flags, prefix, found)
+  of nkQuantifier:
+    if node.quantMax != 0 and node.quantMin >= 1:
+      # Mandatory: a byte inside is in the first iteration.
+      let step = regionWalk(node.quantBody, flags, prefix, found)
+      if step != rsNone:
+        return step
+      if not consumable(node.quantBody, flags, prefix):
+        return rsRefuse
+      rsNone
+    else:
+      # Optional: all may precede the byte.
+      if not consumable(node.quantBody, flags, prefix):
+        return rsRefuse
+      rsNone
+  of nkAlternation:
+    # Never the source; all of it is walk-back.
+    if not consumable(node, flags, prefix):
+      return rsRefuse
+    rsNone
+  else:
+    rsRefuse
+
+proc requiredByteRegion(
+    ast: Node, flags: RegexFlags, rb: RequiredByteInfo
+): RequiredByteInfo =
+  ## Attach the walk-back set; off under folding or ``\g<...>``.
+  result = rb
+  if not rb.valid:
+    return
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card != 0 or hasSubexpCall(ast):
+    return
+  var prefix: set[uint8]
+  var found = 0'u8
+  # Both walks must agree on the byte.
+  if regionWalk(ast, flags, prefix, found) == rsFound and found == rb.byte:
+    result.regionOk = true
+    result.prefix = prefix
+
 proc normaliseInvertedRanges(node: Node) =
   ## Rewrite an inverted range into what Oniguruma matches for it: ``{3,1}``
   ## is ``{1,3}`` possessive, whatever kind it was spelled with.  Doing it
@@ -1970,7 +2122,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     groupFlags = groupFlags,
     firstCharInfo = extractFirstChar(ast, finalFlags),
     literalScan = hasLiteralPrefix(ast, finalFlags),
-    requiredByte = extractRequiredByte(ast, finalFlags),
+    requiredByte =
+      requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags)),
     semiEndAnchored = semiEndAnchored(ast),
     semiEndDMax = maxByteLen(ast, finalFlags),
     levelBackrefs = levelBackrefs,
