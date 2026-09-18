@@ -1527,6 +1527,118 @@ proc requiredByteRegion(
     result.regionOk = true
     result.prefix = prefix
 
+type LeadBehindStep = enum
+  lbsNone ## Zero-width; the walk may look past it.
+  lbsFound
+  lbsRefuse
+
+proc behindLiteral(node: Node, lit: var string): bool =
+  ## Whether a look-behind body is one case-sensitive ASCII literal, appended
+  ## to ``lit``. ASCII only, so byte length equals its width behind the start;
+  ## flag groups are refused since folding is not a byte comparison.
+  if node == nil:
+    return false
+  case node.kind
+  of nkLiteral:
+    let cp = int32(node.rune)
+    if cp >= 128:
+      return false
+    lit.add char(cp)
+    true
+  of nkEscapedLiteral:
+    let cp = int32(node.escapedRune)
+    if cp >= 128:
+      return false
+    lit.add char(cp)
+    true
+  of nkString:
+    for r in node.runes:
+      let cp = int32(r)
+      if cp >= 128:
+        return false
+      lit.add char(cp)
+    true
+  of nkConcat:
+    for child in node.children:
+      if not behindLiteral(child, lit):
+        return false
+    true
+  of nkGroup:
+    behindLiteral(node.groupBody, lit)
+  of nkCapture:
+    behindLiteral(node.captureBody, lit)
+  of nkNamedCapture:
+    behindLiteral(node.namedCaptureBody, lit)
+  of nkAtomicGroup:
+    behindLiteral(node.atomicBody, lit)
+  else:
+    false
+
+proc leadBehindWalk(node: Node, info: var LeadBehindInfo): LeadBehindStep =
+  ## Leading ``(?<=lit)`` every match begins with. Stops at the first
+  ## consuming node, past which the assertion no longer stands at the start.
+  if node == nil:
+    return lbsRefuse
+  case node.kind
+  of nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    lbsNone # zero-width
+  of nkLookaround:
+    # Other lookarounds are zero-width.
+    if node.lookKind == lkBehind:
+      var lit = ""
+      if behindLiteral(node.lookBody, lit) and lit.len > 0:
+        info = LeadBehindInfo(valid: true, byte: uint8(lit[0]), offset: lit.len)
+        return lbsFound
+    lbsNone
+  of nkConcat:
+    for child in node.children:
+      case leadBehindWalk(child, info)
+      of lbsFound:
+        return lbsFound
+      of lbsRefuse:
+        return lbsRefuse
+      of lbsNone:
+        discard
+    lbsNone
+  of nkGroup:
+    leadBehindWalk(node.groupBody, info)
+  of nkCapture:
+    leadBehindWalk(node.captureBody, info)
+  of nkNamedCapture:
+    leadBehindWalk(node.namedCaptureBody, info)
+  of nkAtomicGroup:
+    leadBehindWalk(node.atomicBody, info)
+  of nkQuantifier:
+    # Mandatory repeats only.
+    if node.quantMax != 0 and node.quantMin >= 1:
+      leadBehindWalk(node.quantBody, info)
+    else:
+      lbsRefuse
+  of nkFlagGroup:
+    # Only folding can change what a case-sensitive ASCII byte compare
+    # matches, so the walk passes through every other flag.  The isolated
+    # ``(?x)`` form carries no body and its flags reach the siblings the
+    # concat walks next, which is what makes stepping over it right.
+    if (node.flagsOn + node.flagsOff) * {rfIgnoreCase, rfIgnoreCaseAscii} != {}:
+      lbsRefuse
+    elif node.flagBody == nil:
+      lbsNone
+    else:
+      leadBehindWalk(node.flagBody, info)
+  else:
+    lbsRefuse
+
+proc leadBehindLiteral(ast: Node, flags: RegexFlags): LeadBehindInfo =
+  ## Leading look-behind literal's first byte and offset behind the start,
+  ## or invalid. Off under folding and ``\g<...>``.
+  if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card != 0 or hasSubexpCall(ast):
+    return LeadBehindInfo(valid: false)
+  var info = LeadBehindInfo(valid: false)
+  if leadBehindWalk(ast, info) == lbsFound:
+    info
+  else:
+    LeadBehindInfo(valid: false)
+
 proc normaliseInvertedRanges(node: Node) =
   ## Rewrite an inverted range into what Oniguruma matches for it: ``{3,1}``
   ## is ``{1,3}`` possessive, whatever kind it was spelled with.  Doing it
@@ -2137,4 +2249,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     leadLeaf = leadLeaf,
     leadAnchors = leadAnchorSet(ast, finalFlags),
     leadRepeat = leadRepeat,
+    leadBehind = leadBehindLiteral(ast, finalFlags),
   )

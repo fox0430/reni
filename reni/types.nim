@@ -793,6 +793,13 @@ type
       ## Bytes consumable before ``byte``; a superset moves the bound left,
       ## a missing byte is unsound.
 
+  LeadBehindInfo* = object
+    ## Leading ``(?<=lit)`` over a case-sensitive ASCII literal: every match
+    ## starts ``offset`` bytes past ``byte``, the literal's first byte.
+    valid*: bool
+    byte*: uint8
+    offset*: int ## Byte length of the literal; positive whenever ``valid``.
+
   Regex* = object
     pattern: string
     ast: Node
@@ -838,6 +845,7 @@ type
     leadRepeat: Node
       ## Leaf every match starts with twice running (``(leaf)\1``), or nil.
       ## Replaces ``leadLeaf`` where set.
+    leadBehind: LeadBehindInfo ## Leading look-behind literal, or invalid.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -962,6 +970,10 @@ proc leadAnchors*(r: Regex): set[AnchorKind] {.inline.} =
 proc leadRepeat*(r: Regex): lent Node {.inline.} =
   ## Leaf every match starts with twice running, or nil.
   r.leadRepeat
+
+proc leadBehind*(r: Regex): lent LeadBehindInfo {.inline.} =
+  ## Leading look-behind literal, or invalid.
+  r.leadBehind
 
 proc span*(a, b: int): Span {.inline.} =
   Span(a: a, b: b)
@@ -1120,6 +1132,7 @@ proc initRegex*(
     leadLeaf: Node = nil,
     leadAnchors: set[AnchorKind] = {},
     leadRepeat: Node = nil,
+    leadBehind: LeadBehindInfo = LeadBehindInfo(valid: false),
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1149,6 +1162,7 @@ proc initRegex*(
     leadLeaf: leadLeaf,
     leadAnchors: leadAnchors,
     leadRepeat: leadRepeat,
+    leadBehind: leadBehind,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =

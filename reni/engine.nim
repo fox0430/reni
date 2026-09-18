@@ -552,6 +552,21 @@ proc regionStopHolds(s: string, l: int, prefix: set[uint8]): bool {.inline.} =
         return false # a match consumes the character ending at ``l``
   true
 
+proc lbHolds(s: string, p, offset: int, byte: uint8): bool {.inline.} =
+  ## Whether ``p`` is a start the leading look-behind allows.
+  p >= offset and s[p - offset].uint8 == byte
+
+proc charHeadAt(s: string, p: int): bool {.inline.} =
+  ## Whether the character walk can land on ``p``. On malformed input it may
+  ## refuse a position the forward chain reaches, so a refusal stands the
+  ## skip down rather than moving it.
+  let lo = max(0, p - MaxCharByteLen)
+  for i in countdown(p - 1, lo):
+    let n = encLen(s[i].uint8)
+    if n > 1 and i + n > p:
+      return false
+  true
+
 proc semiEndScanStart(s: string, regex: Regex, start: int): int =
   ## Forward-scan start for ``\Z``-anchored patterns (Oniguruma window:
   ## ``min_semi_end - dmax``, adjusted to a char head).
@@ -4359,6 +4374,18 @@ proc searchImplInto*(
   var regionEnd = if useRegion: -1 else: int.high ## Region end; ``int.high`` means none.
   var regionTried = 0
   var regionSkipped = 0
+  # Leading ``(?<=lit)`` fixes every start at ``offset`` past the literal's
+  # first byte, so one memchr positions the scan. Out under
+  # ``semiEndAnchored``, which moves ``startPos`` itself, and under
+  # ``fcAnchorStart``, whose only candidate is position 0.
+  var lbActive =
+    regex.leadBehind.valid and fc.kind != fcAnchorStart and not regex.semiEndAnchored
+  let lbByte = regex.leadBehind.byte
+  let lbOffset = regex.leadBehind.offset
+  var lbTried = 0
+  var lbSkipped = 0
+  ## Landing the scan may not jump onto; the skip resumes once the walk is past it.
+  var lbHeld = -1
   # ``exhausted`` means no candidate is left. ``leadLeafNode`` is resolved once:
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
@@ -4396,6 +4423,24 @@ proc searchImplInto*(
         # Stand down when occurrences skip too little.
         if regionTried >= RegionTrial and regionSkipped < regionTried * RegionPayoff:
           regionEnd = int.high
+    if lbActive and startPos > lbHeld and not exhausted and
+        not lbHolds(subject, startPos, lbOffset, lbByte):
+      let q = indexOfByte(subject, max(0, startPos - lbOffset), lbByte)
+      if q < 0 or q + lbOffset > subject.len:
+        exhausted = true
+      elif not byteScan and not charHeadAt(subject, q + lbOffset):
+        # [charHeadAt] refuses positions the forward chain still reaches, so
+        # the scan cannot jump onto this landing. Hold the skip until the walk
+        # has passed it rather than standing down for the rest of the search:
+        # with ``offset >= 2`` a multi-byte character after the literal makes
+        # a mid-character landing routine on well-formed input too.
+        lbHeld = q + lbOffset
+      else:
+        inc lbTried
+        lbSkipped += q + lbOffset - startPos
+        startPos = q + lbOffset
+        if lbTried >= RegionTrial and lbSkipped < lbTried * RegionPayoff:
+          lbActive = false
     # Fast skip based on first character optimization
     if not exhausted:
       case fc.kind
