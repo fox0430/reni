@@ -230,8 +230,9 @@ type
       ## Cached ``Regex.leadLeaf`` as an index, or ``NoNodeId``. Tested before
       ## each attempt unless the counters below turn it off.
     leadLeafFor: pointer
-      ## The ``Regex.ast`` the counters belong to. Identity-compared, never
-      ## dereferenced; a recycled address only mistunes the prefilter.
+      ## The ``Regex.ast`` all cached fields below belong to. Identity-compared,
+      ## never dereferenced. Load-bearing: it also gates ``captures`` sizing,
+      ## whose writes are unguarded, so ``boundAst`` must keep the address live.
     leadLeafTried: int32
       ## Positions answered and refusals for ``leadLeafFor``. Outlives one
       ## search since a ``findAll`` loop pays the cost a few positions at a time.
@@ -247,6 +248,8 @@ type
     leadRepeat: NodeId
       ## Cached ``Regex.leadRepeat``, or ``NoNodeId``. Replaces ``leadLeaf``
       ## on the same counters.
+    boundAst: Node
+      ## Holds the tree ``leadLeafFor`` names so its address cannot be recycled.
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -591,8 +594,9 @@ proc semiEndScanStart(s: string, regex: Regex, start: int): int =
 const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 
 proc enterLookaroundBody(ctx: MatchContext, limit: int) {.inline.} =
-  ## Set the window a lookaround body runs under -- the one place
-  ## ``lookLimit`` moves during a match:
+  ## Set the window a lookaround body runs under -- the general path's only
+  ## move of ``lookLimit`` during a match ([leafBodyMatchesHere] lifts it in
+  ## place for a leaf look-ahead):
   ##
   ## * ``lkAhead`` / ``lkNegAhead`` (and the ``(?(...)...)`` test): no window
   ##   (``NoLookLimit``). A look-ahead reads forward, outside the enclosing
@@ -4251,27 +4255,40 @@ proc resetForRegex(
   ## Reset per-regex buffers, reusing ``ctx``'s existing seq capacity.
   ## ``regex`` is borrowed, so every caller passes the address of its own
   ## parameter, never of a local that dies before the match runs.
+  ##
+  ## Called once per match; what the pattern alone decides is derived once per
+  ## pattern, when the tree changes.
   ctx.subject = toSubject(subject)
   ctx.flags = regex[].flags
   ctx.graphemeMode = gmNone
   ctx.regex = regex
-  ctx.trackCaptureStacks = regex[].levelBackrefs
-  ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
-  # Keyed on the owned tree, not on ``regex``: the caller passes its own
-  # parameter address, one stack slot shared by every pattern.
+  # Keyed on the owned tree, not on ``regex`` (one stack slot shared by all
+  # patterns); ``boundAst`` holds it against recycling.
   let leadLeafFor = cast[pointer](regex[].ast)
   if ctx.leadLeafFor != leadLeafFor:
+    ctx.boundAst = regex[].ast
     ctx.leadLeafFor = leadLeafFor
     ctx.leadLeafTried = 0
     ctx.leadLeafSkips = 0
     ctx.leadLeafOff = false
     ctx.leadLeafCool = 0
-  # Only single-way leaves qualify; pin the compile-time guarantee.
-  assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
-  ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
+    ctx.trackCaptureStacks = regex[].levelBackrefs
+    ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
+    # Only single-way leaves qualify; pin the compile-time guarantee.
+    assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
+    ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
+    assert regex[].leadRepeat == nil or isSingleWayLeaf(ctx, regex[].leadRepeat)
+    ctx.leadRepeat = if regex[].leadRepeat == nil: NoNodeId else: regex[].leadRepeat.id
+    let capCount = regex[].captureCount
+    # The internal buffers only grow, so their capacity survives a switch to
+    # a regex with fewer captures; ``resetForPosition`` clears stale state.
+    if capCount > ctx.groupRecursionDepth.len:
+      ctx.groupRecursionDepth.setLen(capCount)
+    if capCount > ctx.captureStacks.len:
+      ctx.captureStacks.setLen(capCount)
+  # Restored on every bind: ``leadAnchorsHold`` reads this set directly,
+  # not through ``ctx.regex``.
   ctx.leadAnchors = regex[].leadAnchors
-  assert regex[].leadRepeat == nil or isSingleWayLeaf(ctx, regex[].leadRepeat)
-  ctx.leadRepeat = if regex[].leadRepeat == nil: NoNodeId else: regex[].leadRepeat.id
   ctx.lookLimit = NoLookLimit
   ctx.anchorEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
@@ -4287,17 +4304,14 @@ proc resetForRegex(
   ctx.capUndosLen = 0
   ctx.stackBase = currentStackAddr()
   noteScratchUsage(ctx)
-  let capCount = regex[].captureCount
-  # ``captures`` is sized exactly (it is copied into ``Match.boundaries``).
-  # The internal buffers only grow, so their capacity survives a switch to
-  # a regex with fewer captures; ``resetForPosition`` clears stale state.
-  ctx.captures.setLen(capCount + 1)
-  # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
-  ctx.capturesDirty = true
-  if capCount > ctx.groupRecursionDepth.len:
-    ctx.groupRecursionDepth.setLen(capCount)
-  if capCount > ctx.captureStacks.len:
-    ctx.captureStacks.setLen(capCount)
+  # ``captures`` is sized exactly on every bind (copied into
+  # ``Match.boundaries``): the unguarded ``captures[capIdx]`` writes must
+  # survive ``-d:danger``, so no ``assert``. Re-sizing to the same length is free.
+  let capLen = regex[].captureCount + 1
+  if ctx.captures.len != capLen:
+    ctx.captures.setLen(capLen)
+    # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
+    ctx.capturesDirty = true
 
 proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ## Reset per-position state without reallocating.
@@ -4362,14 +4376,13 @@ proc writeNotFound(m: var Match) {.inline.} =
   m.boundaries.setLen(0)
 
 proc releaseBorrowed(ctx: MatchContext) {.inline.} =
-  ## Clear borrowed refs so stale reads fail loudly. Indices need clearing too;
-  ## frame buffers hold plain data only.
+  ## Clear borrowed refs so stale reads fail loudly; frame buffers hold plain
+  ## data only. Cached lead indices stay (resolved through ``ctx.regex``, nil
+  ## here); ``leadAnchors`` is read directly, so it is cleared here and
+  ## restored on every bind.
   ctx.regex = nil
-  ctx.subject = Subject(data: nil, size: 0)
-  ctx.leadRun = NoNodeId
-  ctx.leadLeaf = NoNodeId
-  ctx.leadRepeat = NoNodeId
   ctx.leadAnchors = {}
+  ctx.subject = Subject(data: nil, size: 0)
 
 proc searchImplInto*(
     ctx: MatchContext,
