@@ -1911,7 +1911,14 @@ proc matchWordBoundary(ctx: MatchContext): bool =
     return false
   let prevIsWord =
     if ctx.pos > 0:
-      isWordChar(Rune(prevCharCode(ctx.subject.oa, ctx.pos)), asciiOnly)
+      # UTF-8 is self-synchronising: a byte below 0x80 is a whole character
+      # that [isWordChar] answers from the ASCII table whatever
+      # ``asciiOnly`` says. The same answer, without the backward walk.
+      let prev = ctx.subject[ctx.pos - 1].uint8
+      if prev < 0x80:
+        asciiHas(int32(prev), acWord)
+      else:
+        isWordChar(Rune(prevCharCode(ctx.subject.oa, ctx.pos)), asciiOnly)
     else:
       false
   # ``\b`` is zero-width: the next character reads from ``anchorEnd``; the
@@ -1919,12 +1926,17 @@ proc matchWordBoundary(ctx: MatchContext): bool =
   let seen = ctx.anchorEnd
   let nextIsWord =
     if ctx.pos < seen:
-      var code: int32
-      var next: int
-      # ``\b`` reads the code point directly, like ``\w``: no class
-      # containers are involved, so a one-byte character above U+007F counts.
-      decodeCharUpTo(ctx, ctx.pos, seen, code, next) and
-        isWordChar(Rune(code), asciiOnly)
+      let lead = ctx.subject[ctx.pos].uint8
+      if lead < 0x80:
+        # As above, and a one-byte decode cannot be truncated.
+        asciiHas(int32(lead), acWord)
+      else:
+        var code: int32
+        var next: int
+        # ``\b`` reads the code point directly, like ``\w``: no class
+        # containers are involved, so a one-byte character above U+007F counts.
+        decodeCharUpTo(ctx, ctx.pos, seen, code, next) and
+          isWordChar(Rune(code), asciiOnly)
     else:
       false
   prevIsWord xor nextIsWord
