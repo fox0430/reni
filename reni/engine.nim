@@ -1765,6 +1765,49 @@ proc leafBodyEndsAt(ctx: MatchContext, body: Node, targetEnd: int, fbl: int): bo
   ctx.pos = entryPos
   matched
 
+proc isLeafLookaheadBody(node: Node): bool {.inline.} =
+  ## Whether a look-ahead body is a single leaf, and so answerable in place by
+  ## [leafBodyMatchesHere].  Wider than [isLeafLookbehindBody], which needs a
+  ## fixed width to compare an end offset against; a look-ahead has none.
+  node != nil and
+    node.kind in {nkString, nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType}
+
+proc leafBodyMatchesHere(ctx: MatchContext, body: Node): bool =
+  ## Whether leaf ``body`` matches at ``ctx.pos``.  The general path's frame,
+  ## re-entry and save/restore roll back what a leaf never writes: it holds no
+  ## capture, no ``\K``, no flag group and no absent operator -- the whole of
+  ## what ``markQuantBodyPure`` reads -- and the advances leave ``ctx.pos``
+  ## alone.  The caller must have checked [isLeafLookaheadBody].
+  inc ctx.steps
+  if ctx.steps > ctx.stepLimit:
+    raise newException(RegexLimitError, "match step limit exceeded")
+  # Lift the look-behind window as ``enterLookaroundBody`` does for the general
+  # path: ``subjectEnd`` reads it back through ``lookLimit``.
+  let savedLimit = ctx.lookLimit
+  ctx.lookLimit = NoLookLimit
+  case body.kind
+  of nkString:
+    result = stringAdvance(ctx, body) >= 0
+  of nkCharType:
+    result = charTypeAdvance(ctx, body.charType) >= 0
+  else:
+    # Every way, not just the first: [leafBodyEndsAt] may stop there because a
+    # multi-character fold carries no fixed width, and this has no width to
+    # gate on -- under ``(?i)``, ``(?=ß)`` has to reach "ss".
+    let lastVariant = if body.kind == nkCharClass: ClassVariants else: LiteralVariants
+    var v =
+      if body.kind == nkCharClass:
+        classFirstVariant(ctx, body)
+      else:
+        0
+    result = false
+    while v < lastVariant:
+      if leafVariantAdvance(ctx, body, v) >= 0:
+        result = true
+        break
+      inc v
+  ctx.lookLimit = savedLimit
+
 proc altBranchPossible(node: Node, i: int, b: uint8, hasByte: bool): bool {.inline.} =
   ## Whether alternative ``i`` can start on the byte in front of the matcher.
   ## ``altFirst`` is a superset of the bytes the branch can begin with, so a
@@ -3305,29 +3348,36 @@ proc runMachine(
         # rollback. Alternation lookbehind retries via ``chLookbehindAlt``.
         case node.lookKind
         of lkAhead:
-          let stackSnap = saveStackLens(ctx)
-          let saved = save(ctx)
-          # A look-ahead reads forward, outside the enclosing body's span, so
-          # a running look-behind window does not bound it. ``saved`` carries
-          # the window back on both exits.
-          ctx.enterLookaroundBody(NoLookLimit)
-          if matchDiscardedBody(ctx, node.lookBody, TrueCont):
-            # Keep the captures the lookahead body made.
-            keepLookCaptures(ctx, node, saved)
-            restoreStackLens(ctx, stackSnap)
-            mode = mCont
+          if isLeafLookaheadBody(node.lookBody):
+            # Leaf body: tested in place, without a frame or a re-entry.
+            mode = if leafBodyMatchesHere(ctx, node.lookBody): mCont else: mFail
           else:
+            let stackSnap = saveStackLens(ctx)
+            let saved = save(ctx)
+            # A look-ahead reads forward, outside the enclosing body's span, so
+            # a running look-behind window does not bound it. ``saved`` carries
+            # the window back on both exits.
+            ctx.enterLookaroundBody(NoLookLimit)
+            if matchDiscardedBody(ctx, node.lookBody, TrueCont):
+              # Keep the captures the lookahead body made.
+              keepLookCaptures(ctx, node, saved)
+              restoreStackLens(ctx, stackSnap)
+              mode = mCont
+            else:
+              restore(ctx, saved)
+              restoreStackLens(ctx, stackSnap)
+              mode = mFail
+        of lkNegAhead:
+          if isLeafLookaheadBody(node.lookBody):
+            mode = if leafBodyMatchesHere(ctx, node.lookBody): mFail else: mCont
+          else:
+            let stackSnap = saveStackLens(ctx)
+            let saved = save(ctx)
+            ctx.enterLookaroundBody(NoLookLimit) # as ``lkAhead``
+            let bodyMatch = matchDiscardedBody(ctx, node.lookBody, TrueCont)
             restore(ctx, saved)
             restoreStackLens(ctx, stackSnap)
-            mode = mFail
-        of lkNegAhead:
-          let stackSnap = saveStackLens(ctx)
-          let saved = save(ctx)
-          ctx.enterLookaroundBody(NoLookLimit) # as ``lkAhead``
-          let bodyMatch = matchDiscardedBody(ctx, node.lookBody, TrueCont)
-          restore(ctx, saved)
-          restoreStackLens(ctx, stackSnap)
-          mode = if bodyMatch: mFail else: mCont
+            mode = if bodyMatch: mFail else: mCont
         of lkBehind:
           # Alternation retries later fixed alternatives via heap entry; other
           # shapes commit to the first match.  Bare groups are transparent
