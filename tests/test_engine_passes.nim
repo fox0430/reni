@@ -853,3 +853,86 @@ suite "lead anchor prefilter":
       discard searchIntoCtx(ctx, "aaaa", re("(?y{w}:a+)"), m, stepLimit = 2)
     check searchIntoCtx(ctx, "aa", re("\\ya"), m, start = 1)
     check m.boundaries[0] == 1 .. 2
+
+suite "leading look-behind scan":
+  # The skip only removes start positions, so a wrong verdict drops matches:
+  # pin what the compiler extracted *and* the matches the scan still finds.
+  proc lb(pattern: string, flags: RegexFlags = {}): (bool, string, int) =
+    let info = re(pattern, flags).leadBehind
+    (info.valid, (if info.valid: $char(info.byte) else: ""), info.offset)
+
+  proc all(subject, pattern: string, flags: RegexFlags = {}): seq[string] =
+    for m in findAll(subject, re(pattern, flags)):
+      result.add captureText(m, 0, subject).get("")
+
+  test "a leading look-behind literal is taken, first byte and width":
+    check lb("(?<=\\.)\\w+") == (true, ".", 1)
+    check lb("(?<=ab)\\w+") == (true, "a", 2)
+    check lb("(?<=\\.\\.)\\w+") == (true, ".", 2)
+    check all("a.bc de.f", "(?<=\\.)\\w+") == @["bc", "f"]
+    check all("abcd xabz", "(?<=ab)\\w+") == @["cd", "z"]
+
+  test "zero-width company is walked past, a consumed byte is not":
+    check lb("\\b(?<=\\.)\\w+") == (true, ".", 1)
+    check lb("(?<!x)(?<=\\.)\\w") == (true, ".", 1)
+    check lb("\\K(?<=\\.)\\w") == (true, ".", 1)
+    check lb("(?=\\w)(?<=\\.)\\w+") == (true, ".", 1)
+    # Past a consuming node the assertion no longer stands at the start.
+    check lb("\\w(?<=\\.)\\w") == (false, "", 0)
+    check lb("a(?<=\\.)") == (false, "", 0)
+    check all("a.b", "\\w(?<=\\.)\\w").len == 0
+
+  test "wrappers are peeled, a mandatory repeat is looked through":
+    check lb("((?<=\\.)\\w)+") == (true, ".", 1)
+    check lb("(?:(?<=\\.)\\w){2,}") == (true, ".", 1)
+    check lb("(?>(?<=\\.)\\w)") == (true, ".", 1)
+    # Optional: the body need not stand at the start at all.
+    check lb("(?:(?<=\\.)\\w)?x") == (false, "", 0)
+    check lb("(?<=\\.)?\\w+") == (false, "", 0)
+    check all(".ab", "(?<=\\.)?\\w+") == @["ab"]
+
+  test "only the positive behind form states bytes, and only a literal one":
+    check lb("(?<!\\.)\\w+") == (false, "", 0)
+    check lb("(?=\\.)\\w+") == (false, "", 0)
+    check lb("(?<=\\w)\\d+") == (false, "", 0)
+    check lb("(?<=\\.|,)\\w+") == (false, "", 0)
+    check all(",ab .cd", "(?<=\\.|,)\\w+") == @["ab", "cd"]
+
+  test "folding and a non-ASCII literal are refused":
+    check lb("(?<=A)\\w", {rfIgnoreCase}) == (false, "", 0)
+    check lb("(?i)(?<=A)\\w") == (false, "", 0)
+    check lb("(?<=(?i:A))\\w") == (false, "", 0)
+    check lb("(?<=é)\\w+") == (false, "", 0)
+    check all("aB cb", "(?<=A)\\w", {rfIgnoreCase}) == @["B"]
+
+  test "a flag group that cannot fold is looked through":
+    check lb("(?x) (?<=\\.) \\w") == (true, ".", 1)
+    check lb("(?m)(?<=\\.)\\w") == (true, ".", 1)
+    check lb("(?s:(?<=\\.)\\w)") == (true, ".", 1)
+    check all("a.bc de.f", "(?x) (?<=\\.) \\w+") == @["bc", "f"]
+    # Folding stops the walk wherever it is spelled, either way round.
+    check lb("(?-i)(?<=A)\\w") == (false, "", 0)
+    check lb("(?x:(?i))(?<=A)\\w") == (false, "", 0)
+
+  test "an alternation at the top is not looked through":
+    check lb("(?<=\\.)a|b") == (false, "", 0)
+    check all("xb .a", "(?<=\\.)a|b") == @["b", "a"]
+
+  test "the literal may sit before the search start":
+    # The look-behind reads behind ``start``, so the memchr has to run from
+    # ``start - offset``, not from ``start``.
+    check search("a.bc", re("(?<=\\.)\\w+"), start = 2).matchSpan == 2 .. 4
+    check search("abcd", re("(?<=ab)\\w+"), start = 2).matchSpan == 2 .. 4
+
+  test "the skip composes with the required-byte region":
+    check lb("(?<=\\.)\\w+;") == (true, ".", 1)
+    check all("a.bc; .d; x;", "(?<=\\.)\\w+;") == @["bc;", "d;"]
+
+  test "a malformed subject answers what the plain scan answers":
+    # ``q + offset`` may land where the character walk does not: ``\xE0``
+    # declares three bytes, so the walk steps over the position after the
+    # ``.`` and no match is reported there -- with the skip as without it.
+    # Where the walk does land, the skip has to deliver the position.
+    check all("\xE0.a", "(?<=\\.)\\w+").len == 0
+    check all(".\xE0\xE0a", "(?<=\\.)\\w+").len == 1
+    check all("a\xC3.b", "(?<=\\.)\\w+") == @["b"]
