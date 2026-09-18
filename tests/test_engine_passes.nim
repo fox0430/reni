@@ -1,4 +1,4 @@
-import std/[unittest, options, unicode]
+import std/[unittest, options, strutils, unicode]
 
 import ../reni
 import ../reni/engine
@@ -328,6 +328,117 @@ suite "auto-possessification":
       for asciiOnly in [false, true]:
         check not (isWordChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
         check not (isDigitChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
+
+suite "required-byte region":
+  # Bound the scan by the next required byte; pin the set and the matches.
+  proc region(pattern: string, flags: RegexFlags = {}): RequiredByteInfo =
+    re(pattern, flags).requiredByte
+
+  proc asciiPrefix(pattern: string, flags: RegexFlags = {}): string =
+    let r = region(pattern, flags)
+    for b in 0'u8 .. 127'u8:
+      if b in r.prefix:
+        result.add char(b)
+
+  proc all(subject, pattern: string, flags: RegexFlags = {}): seq[string] =
+    for m in findAll(subject, re(pattern, flags)):
+      result.add captureText(m, 0, subject).get("")
+
+  test "the union holds everything a match consumes before the byte":
+    let r = region("(\\w+)\\s*=\\s*(\\w+)")
+    check r.valid and r.regionOk
+    check r.byte == uint8('=')
+    check uint8('a') in r.prefix and uint8('_') in r.prefix
+    check uint8(' ') in r.prefix and uint8('\t') in r.prefix
+    check uint8('=') notin r.prefix
+    # Over-approximation only moves the region left.
+    check 0xC3'u8 in r.prefix
+    check all("a = b, cc=dd", "(\\w+)\\s*=\\s*(\\w+)") == @["a = b", "cc=dd"]
+    check asciiPrefix("\\d+\\.\\d+") == "0123456789"
+    check all("1.5 x 22.75", "\\d+\\.\\d+") == @["1.5", "22.75"]
+
+  test "an optional or alternated prefix joins the union whole":
+    # Nothing required, so all may precede the byte.
+    check asciiPrefix("(?:ab)?c") == "ab"
+    check all("abc xc", "(?:ab)?c") == @["abc", "c"]
+    check asciiPrefix("(?:a|bc)+=") == "abc"
+    check all("abc= x", "(?:a|bc)+=") == @["abc="]
+    check uint8('.') in region("(?:\\w|\\.)+=").prefix
+
+  test "a positive look-ahead gives the byte, and its own walk-back with it":
+    # ``\s*`` lies between the look-ahead position and the ``=``.
+    let r = region("\\w+(?=\\s*=)")
+    check r.regionOk and r.byte == uint8('=')
+    check uint8(' ') in r.prefix
+    check all("key = value", "\\w+(?=\\s*=)") == @["key"]
+    check all("a = b, cc=dd", "\\w+(?=\\s*=)") == @["a", "cc"]
+    check region("\\w+(?=\\()").byte == uint8('(')
+    check all("f(x) g y(", "\\w+(?=\\()") == @["f", "y"]
+    # Negative forms and look-behinds state no byte.
+    check not region("\\w+(?!=)").valid
+    check not region("(?<==)\\w+").valid
+
+  test "a consuming child's byte wins over a look-ahead's":
+    # The look-ahead sits where the search already stands.
+    check region("(?=a)(\\w+)+b").byte == uint8('b')
+    check all("aaaaab x", "(?=a)(\\w+)+b") == @["aaaaab"]
+    check search(repeat("a", 30), re("(?=a)(\\w+)+b")).found == false
+    # Without one, the look-ahead's byte still stands.
+    check region("(?=ab)\\w+").byte == uint8('a')
+
+  test "a leaf the walk cannot state keeps the byte but not the region":
+    # The presence test still runs; only the walk-back stands down.
+    for p in ["[^a]+=", ".+=", "\\p{L}+=", "(\\w+=)\\g<1>"]:
+      let r = region(p)
+      check r.valid
+      check r.byte == uint8('=')
+      check not r.regionOk
+    check all("b=c", "[^a]+=") == @["b="]
+
+  test "case folding takes the byte itself off, region and all":
+    check not region("(?i)\\w+=").valid
+    check not region("\\w+=", {rfIgnoreCase}).valid
+
+  test "a zero-width node between the start and the byte is walked past":
+    check region("\\w+\\K=").regionOk
+    check all("aa=b", "\\w+\\K=") == @["="]
+    check region("x(?<=x)=").byte == uint8('x')
+    check all("x= y", "x(?<=x)=") == @["x="]
+
+  test "a stop the decode chain does not bear out skips nothing":
+    # Characters vs bytes: on malformed input the stop may fall inside a
+    # character or on a consumed tail; it skips nothing.
+    proc span(subject, pattern: string, start = 0): string =
+      let m = search(subject, re(pattern), start)
+      if m.found:
+        $m.matchSpan.a & "," & $m.matchSpan.b
+      else:
+        "-"
+
+    # ``F0`` declares four bytes, so the scan steps 0 -> 3 and never visits 2.
+    check span("\xF0\xA9=", "\\t*=") == "-"
+    check span("\xE0b=", "\\s*=") == "-"
+    check span("\xA9\xC3c=\x80", "(?:ab)?c") == "-"
+    # ``\w+`` consumes ``F0 A9 80 20`` whole, so refused ``20`` still precedes ``=``.
+    check span("\x80\xF0\xA9\x80 =\xC3\x80", "\\w+=") == "1,6"
+    check span("\xA9a=c\xC3 =", "\\w+\\K=", 2) == "6,7"
+    check span("\xE0 \x80AAA=\x80Aa", "^\\w+=") == "0,7"
+    check span("b\x80\xE0a=x=A \xE0", "(?:\\w(?=x))+") == "2,5"
+    # Overlong ``E0 80 0A`` never classifies as ``0A``; the union sees the non-ASCII family.
+    check span("\x80\xE0\x80\x0A=", "\\S=") == "1,5"
+    check span(
+      "\x3B\xF0\x9F\x98\x80 x\xE0\x80 \xC3\xA9=",
+      "\\S{1,3}={1,3}(;|([0-9=]|[0-9=])){0,2}",
+    ) == "6,13"
+
+  test "a dense byte stands the region down without changing the answer":
+    # Dense ``e``: the region stands down after ``RegionTrial``.
+    var subject = ""
+    for i in 1 .. 200:
+      subject.add "the eel eats every egg\n"
+    let got = all(subject, "\\w*e\\w*")
+    check got.len == 1000
+    check got[0 .. 4] == @["the", "eel", "eats", "every", "egg"]
 
 suite "inverted range normalisation":
   # ``{n,m}`` with ``n > m`` is Oniguruma's spelling for the swapped range

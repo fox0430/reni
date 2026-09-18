@@ -787,6 +787,11 @@ type
   RequiredByteInfo* = object
     valid*: bool
     byte*: uint8
+    regionOk*: bool
+      ## Whether ``prefix`` may bound the scan by an occurrence of ``byte``.
+    prefix*: set[uint8]
+      ## Bytes consumable before ``byte``; a superset moves the bound left,
+      ## a missing byte is unsound.
 
   Regex* = object
     pattern: string
@@ -923,7 +928,8 @@ proc groupFlags*(r: Regex): lent seq[RegexFlags] {.inline.} =
 proc firstCharInfo*(r: Regex): FirstCharInfo {.inline.} =
   r.firstCharInfo
 
-proc requiredByte*(r: Regex): RequiredByteInfo {.inline.} =
+proc requiredByte*(r: Regex): lent RequiredByteInfo {.inline.} =
+  ## Borrowed; the set is wide.
   r.requiredByte
 
 proc literalScan*(r: Regex): bool {.inline.} =
@@ -1792,16 +1798,22 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
         return RequiredByteInfo(valid: true, byte: uint8(cp))
     RequiredByteInfo(valid: false)
   of nkConcat:
+    # A look-ahead's byte sits where the search already stands; keep it as fallback.
+    var fromLook = RequiredByteInfo(valid: false)
     for child in node.children:
       if child.kind == nkFlagGroup and child.flagBody == nil:
         continue
-      if child.kind in
-          {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
+      if child.kind in {nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
         continue
       let rb = extractRequiredByte(child, flags)
-      if rb.valid:
-        return rb
-    RequiredByteInfo(valid: false)
+      if not rb.valid:
+        continue
+      if child.kind == nkLookaround:
+        if not fromLook.valid:
+          fromLook = rb
+        continue
+      return rb
+    fromLook
   of nkCapture:
     extractRequiredByte(node.captureBody, flags)
   of nkNamedCapture:
@@ -1820,6 +1832,12 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
       RequiredByteInfo(valid: false)
   of nkAtomicGroup:
     extractRequiredByte(node.atomicBody, flags)
+  of nkLookaround:
+    # Positive look-ahead only; its byte is reached by every match.
+    if node.lookKind == lkAhead:
+      extractRequiredByte(node.lookBody, flags)
+    else:
+      RequiredByteInfo(valid: false)
   of nkConditional:
     # Both branches must require the same byte — too complex, skip
     RequiredByteInfo(valid: false)
