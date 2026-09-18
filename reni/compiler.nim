@@ -1750,7 +1750,7 @@ proc reduceNestedQuantifier(node: Node) =
   ## the bare ``\b`` Oniguruma ends up with once this pass has flattened the
   ## pair first.  Oniguruma gets the ordering for free by doing this while
   ## parsing, long before any look-behind tuning runs; here it is the
-  ## ordering in ``compileRegex`` that has to hold it.
+  ## ordering in [re] that has to hold it.
   ##
   ## Bare groups are transparent, as in Oniguruma, where ``(?:...)`` leaves no
   ## node behind.  A capture stops the reduction -- ``(a*)*`` and ``a*`` do
