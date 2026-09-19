@@ -4504,6 +4504,16 @@ proc searchImplInto*(
   var lbSkipped = 0
   ## Landing the scan may not jump onto; the skip resumes once the walk is past it.
   var lbHeld = -1
+  # One memchr cursor per byte of a two-member lead set, each holding its next
+  # hit.  ``NoLeadHit`` never compares below ``startPos``, so it is sticky; -1
+  # always does, so the first candidate refreshes the cursor.  Both are valid
+  # only because ``startPos`` never decreases below its value at the last
+  # refresh: a hit cached as "first at/after ``startPos``" answers any later
+  # ``startPos`` too, but a rewind would read it stale and ``NoLeadHit`` would
+  # wrongly call the subject exhausted.
+  const NoLeadHit = high(int)
+  var hitA = -1
+  var hitB = -1
   # ``exhausted`` means no candidate is left. ``leadLeafNode`` is resolved once:
   # ``ctx.leadLeaf`` is fixed for the search.
   var exhausted = false
@@ -4594,20 +4604,49 @@ proc searchImplInto*(
         if not found:
           exhausted = true
       of fcByteSet:
-        # One load per byte: the lead byte decides both whether the position is
-        # a candidate and how far the next one is.
         var found = false
-        while startPos < subject.len:
-          let b = subject[startPos].uint8
-          if b in fc.bytes:
-            found = true
-            break
-          let step =
-            if byteScan or b < 0x80'u8:
-              1
-            else:
-              encLen(b)
-          startPos += step
+        if fc.pairOk:
+          let a = fc.pair[0]
+          let b = fc.pair[1]
+          while startPos < subject.len:
+            if hitA < startPos:
+              let q = indexOfByte(subject, startPos, a)
+              hitA = if q < 0: NoLeadHit else: q
+            if hitB < startPos:
+              let q = indexOfByte(subject, startPos, b)
+              hitB = if q < 0: NoLeadHit else: q
+            let hit = min(hitA, hitB)
+            if hit == NoLeadHit:
+              startPos = subject.len
+              break
+            # A byte inside a character is no start position. [charHeadAt]
+            # decides that in a bounded look-back; the walk, linear in the
+            # jump, answers what it cannot (malformed input).
+            startPos =
+              if byteScan or charHeadAt(subject, hit):
+                hit
+              else:
+                # ``byteScan`` is false here: the condition above ruled it out.
+                advanceChainTo(subject, startPos, hit, false)
+            if startPos >= subject.len:
+              break
+            if subject[startPos].uint8 in fc.bytes:
+              found = true
+              break
+        else:
+          # One load per byte: the lead byte decides both whether the position
+          # is a candidate and how far the next one is.
+          while startPos < subject.len:
+            let b = subject[startPos].uint8
+            if b in fc.bytes:
+              found = true
+              break
+            let step =
+              if byteScan or b < 0x80'u8:
+                1
+              else:
+                encLen(b)
+            startPos += step
         if startPos > subject.len:
           startPos = subject.len
         if not found:
