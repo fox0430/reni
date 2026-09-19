@@ -7,7 +7,7 @@ import std/[unicode, tables, macros, bitops]
 from std/strutils import find
 from std/typetraits import supportsCopyMem
 
-import types, unicode_utils, stackguard
+import types, unicode_utils, stackguard, leafgate
 
 # Re-exported so callers can read the compiled-in budget (used by tests).
 export stackguard.MaxStackBytes
@@ -250,6 +250,18 @@ type
       ## on the same counters.
     boundAst: Node
       ## Holds the tree ``leadLeafFor`` names so its address cannot be recycled.
+    gates: ptr UncheckedArray[LeafGate]
+      ## The bound pattern's [LeafGate] table, borrowed the way ``regex`` above
+      ## is, and retaken on every bind rather than with the per-tree
+      ## derivations: two ``Regex`` values can share one ``ast`` -- a copy does
+      ## -- and own a table each.  ``nil`` where the pattern carries no table.
+    gatesLen: int
+      ## Slots behind ``gates``, which as an unchecked array carries no bound
+      ## of its own; [gateAt] checks an id against this.
+    boundFlags: RegexFlags
+      ## The flags ``gates`` was derived under. A scoped ``(?i:...)`` moves
+      ## ``ctx.flags`` under a node the compiler already answered, so every
+      ## reader compares the two first.
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -514,6 +526,13 @@ template nodeAt(ctx: MatchContext, id: NodeId): Node =
   ## Only matching code may use it, and only past ``resetForRegex``, for the
   ## reason ``MatchContext.regex`` gives.
   ctx.regex[].nodes[id.int]
+
+proc gateAt(ctx: MatchContext, id: NodeId): ptr LeafGate {.inline.} =
+  ## The [LeafGate] ``id`` names, out of the bound table.  Checked the way
+  ## ``nodeAt``'s index is and for the same reason: an id numbered in another
+  ## tree should raise, not read past the table into a silent wrong answer.
+  rangeCheck id.int > 0 and id.int < ctx.gatesLen
+  addr ctx.gates[id.int]
 
 template len(s: Subject): int =
   s.size
@@ -1511,8 +1530,8 @@ proc classHasByte(node: Node, b: uint8, flags: RegexFlags): bool =
   false
 
 proc classFoldsApply(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether multi-char folds can apply: positive bracket class under ``(?i)``.
-  rfIgnoreCase in ctx.flags and node.bracketClass and not node.negated
+  ## [leafgate.classFoldsApply] under the flags in force.
+  classFoldsApply(node, ctx.flags)
 
 proc classFirstVariant(ctx: MatchContext, node: Node): int {.inline.} =
   ## First variant for ``classAdvance``: folds first, else plain match.
@@ -1602,70 +1621,27 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
       anyMatch
   if matched: next else: -1
 
-proc isSingleWayLeaf(ctx: MatchContext, node: Node): bool =
-  ## Whether ``node`` matches at most one way here. Single-way bodies allow
-  ## greedy repeats as a forward scan (one int per rep); they also leave
-  ## nothing behind but ``pos`` (no captures, ``\K``, or flags).
-  case node.kind
-  of nkCharType:
-    true
-  of nkString:
-    # An empty string would repeat zero-width, which the general path handles
-    # with a subloop of its own; every other string consumes what it matched.
-    node.runes.len > 0
-  of nkLiteral, nkEscapedLiteral:
-    # The second way a literal can match is the multi-character fold, which
-    # only exists under ``(?i)`` and only for a character that has one.
-    let r = if node.kind == nkLiteral: node.rune else: node.escapedRune
-    rfIgnoreCase notin ctx.flags or getMultiCharFold(r).len == 0
-  of nkCharClass:
-    not classFoldsApply(ctx, node)
-  else:
-    false
+proc isSingleWayLeaf(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## Whether ``node`` matches at most one way here; see [LeafGate].
+  if ctx.gates != nil and ctx.flags == ctx.boundFlags:
+    return ctx.gateAt(node.id).singleWay
+  singleWayLeaf(node, ctx.flags)
 
-proc leafRunAccepts(ctx: MatchContext, node: Node, accept: var set[uint8]): bool =
-  ## The ASCII bytes ``node`` accepts under ``ctx.flags``, or false when no
-  ## byte set decides it. Gives what [classAdvance] and [charTypeAdvance] give
-  ## on their ASCII fast paths, without the call. Nothing at or above 0x80 is
-  ## ever admitted, so the run loop can test membership alone.
-  case node.kind
-  of nkCharClass:
-    # [classBitmapAnswers]'s gate, minus the ``b < 0x80`` half the loop holds.
-    if not node.asciiSetOk or rfIgnoreCase in ctx.flags:
+proc leafRunAccepts(
+    ctx: MatchContext, node: Node, accept: var set[uint8]
+): bool {.inline.} =
+  ## The ASCII bytes ``node`` accepts here, or false when no byte set decides
+  ## it; see [LeafGate].
+  if ctx.gates != nil and ctx.flags == ctx.boundFlags:
+    let gate = ctx.gateAt(node.id)
+    # ``.`` is a cluster in grapheme mode, which the table is not derived under.
+    if not gate.runnable or (gate.graphemeDep and ctx.graphemeMode != gmNone):
       return false
-    accept =
-      if node.negated:
-        AllAsciiBytes - node.asciiSet
-      else:
-        node.asciiSet
-    true
-  of nkCharType:
-    # ``\X`` runs as a cluster and ``\R`` can take two bytes, so neither is
-    # one byte per repetition. Every other type reads the same below U+0080
-    # whatever the ASCII-restriction flags say -- see [buildAsciiCharTypeSets].
-    case node.charType
-    of ctGraphemeCluster, ctNewlineSeq:
-      false
-    of ctDot:
-      # ``.`` is a cluster in grapheme or word mode; outside them it is the
-      # byte set [charTypeAdvance]'s fast path reads ``rfMultiLine`` for. Both
-      # are fixed for the repeat -- only a node boundary moves them.
-      if ctx.graphemeMode != gmNone:
-        false
-      else:
-        accept =
-          if rfMultiLine in ctx.flags:
-            AllAsciiBytes
-          else:
-            AsciiCharTypeSets[ctDot]
-        true
-    else:
-      accept = AsciiCharTypeSets[node.charType]
-      true
-  else:
-    # A literal is single-way too, but a run of them is ``literalAdvance``'s
-    # business.
-    false
+    accept = gate.accept
+    return true
+  if leafRunGraphemeDep(node) and ctx.graphemeMode != gmNone:
+    return false
+  leafRunAccepts(node, ctx.flags, accept)
 
 proc leafRunEnd(ctx: MatchContext, accept: set[uint8], limit: int): int {.inline.} =
   ## End of the run of bytes ``accept`` admits from ``ctx.pos``, stopping at
@@ -4351,6 +4327,19 @@ proc noteScratchUsage(ctx: MatchContext) =
   ctx.choicesPeak = 0
   ctx.repPeak = 0
 
+proc bindLeafGates(ctx: MatchContext, regex: ptr Regex) {.inline.} =
+  ## Borrow the pattern's [LeafGate] table for the match about to run.
+  ## ``regex`` is a pointer, not a value: ``ctx.gates`` points into the
+  ## table's own buffer, which a copied parameter would not outlive.
+  assert regex[].leafGates.len == 0 or regex[].leafGates.len == regex[].nodes.len,
+    "leafGates must name every node of the tree or none of them"
+  ctx.gates =
+    if regex[].leafGates.len > 0:
+      cast[ptr UncheckedArray[LeafGate]](unsafeAddr regex[].leafGates[0])
+    else:
+      nil
+  ctx.gatesLen = regex[].leafGates.len
+
 proc resetForRegex(
     ctx: MatchContext,
     subject: string,
@@ -4366,6 +4355,10 @@ proc resetForRegex(
   ## pattern, when the tree changes.
   ctx.subject = toSubject(subject)
   ctx.flags = regex[].flags
+  bindLeafGates(ctx, regex) # Before the asserts below, which read it.
+  # Not in the tree-keyed block below: this is the validity check for
+  # ``ctx.gates``, which every bind retakes.
+  ctx.boundFlags = regex[].flags
   ctx.graphemeMode = gmNone
   ctx.regex = regex
   # Keyed on the owned tree, not on ``regex`` (one stack slot shared by all
@@ -4484,9 +4477,11 @@ proc writeNotFound(m: var Match) {.inline.} =
 proc releaseBorrowed(ctx: MatchContext) {.inline.} =
   ## Clear borrowed refs so stale reads fail loudly; frame buffers hold plain
   ## data only. Cached lead indices stay (resolved through ``ctx.regex``, nil
-  ## here); ``leadAnchors`` is read directly, so it is cleared here and
-  ## restored on every bind.
+  ## here); ``leadAnchors`` and ``gates`` are read directly, so they are
+  ## cleared here and restored on every bind.
   ctx.regex = nil
+  ctx.gates = nil
+  ctx.gatesLen = 0
   ctx.leadAnchors = {}
   ctx.subject = Subject(data: nil, size: 0)
 
