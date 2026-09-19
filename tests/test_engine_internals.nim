@@ -1211,13 +1211,14 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
     check search("áb", re("\\X*b")).found
 
 suite "a greedy repeat retreats to the byte its continuation requires":
-  # ``possessifyRepeats`` writes ``quantFollowByte`` where the continuation
-  # can begin with exactly one ASCII character, and ``retreatToFollowByte``
-  # then skips every give-back whose stop position does not hold it.  The
-  # failure mode is the one C24's rewrite has: a continuation that can begin
-  # with something the walk did not state, so a position that *could* have
-  # matched is skipped and the match is lost.  Every case below therefore
-  # names the answer the unfiltered give-back gives.
+  # ``annotateContinuations`` writes ``quantFollowByte`` where the
+  # continuation can begin with exactly one ASCII character, and
+  # ``retreatToFollowByte`` then skips every give-back whose stop position
+  # does not hold it.  The failure mode is the one C24's rewrite has: a
+  # continuation that can begin with something the walk did not state, so a
+  # position that *could* have matched is skipped and the match is lost.
+  # Every case below therefore names the answer the unfiltered give-back
+  # gives.
 
   test "it lands on the last position holding the byte":
     check search("x \"abc\" y", re("\".*\"")).boundaries[0] == 2 .. 7
@@ -1228,7 +1229,7 @@ suite "a greedy repeat retreats to the byte its continuation requires":
     check search("zaxxbxxbz", re("a.*b")).boundaries[0] == 1 .. 8
 
   test "the repeat's minimum still bounds the retreat":
-    # The body has to overlap the continuation, or ``possessifyRepeats``
+    # The body has to overlap the continuation, or ``annotateContinuations``
     # rewrites the repeat to possessive and no give-back is offered at all.
     check search("aaaab", re("[ab]{2,}b")).boundaries[0] == 0 .. 5
     check search("aab", re("[ab]{2,}b")).boundaries[0] == 0 .. 3
@@ -1274,9 +1275,10 @@ suite "a greedy repeat retreats to the byte its continuation requires":
     check search("abzbc", re(".*\\Kbc")).boundaries[0] == 3 .. 5
 
   test "folding turns the annotation off":
-    # ``possessifyRepeats`` does not run under case folding, and an inline
-    # ``(?i)`` is a flag group the walk refuses to look through, so ``a*A``
-    # keeps every give-back either way.
+    # ``annotateContinuations`` does not run at all under case folding, and
+    # below a flag group it descends with ``mayRewrite`` off, so neither the
+    # rewrite nor the follow byte is claimed there.  ``a*A`` keeps every
+    # give-back either way.
     check search("aaa", re("(?i)a*A")).boundaries[0] == 0 .. 3
     check search("aaa", re("(?i:a*A)")).boundaries[0] == 0 .. 3
     check search("aaa", re("a*A", {rfIgnoreCase})).boundaries[0] == 0 .. 3
@@ -1393,12 +1395,32 @@ suite "a lazy repeat of a single-way leaf is a scan, not a choice per rep":
     check lazyScanned("<!--.*?--\x3ex")
     check search("<!--a--\x3eb<!--c--\x3ex", re("<!--.*?--\x3ex")).boundaries[0] ==
       0 .. 18
+    # A positive look-ahead demands its own first character at the very
+    # position the scan would stop at, so its leaf is required there even
+    # though the assertion consumes nothing.
+    check lazyScanned("a*?(?=b)")
+    check search("aab", re("a*?(?=b)")).boundaries[0] == 0 .. 2
+    check lazyScanned("a*?(?=b)c")
+    check not search("aabc", re("a*?(?=b)c")).found # ``b`` and ``c`` at once
+    check lazyScanned("a*?(?=\\Kb)") # ``\\K`` rolls back with the failed position
+    check search("aab", re("a*?(?=\\Kb)")).boundaries[0] == 2 .. 2
+    # Anything zero-width that can hold at a position without fixing its
+    # character still claims nothing.
+    check not lazyScanned("a*?(?!b)")
+    check not lazyScanned("a*?(?<=a)")
+    check not lazyScanned("a*?(?=b|c)") # two ways in, so no one leaf
+    check not lazyScanned("a*?(?=b*)") # a body that need not consume
     check not lazyScanned("a*?") # nothing follows
     check not lazyScanned("a*?$") # nothing that consumes does
-    check not lazyScanned("a*?(?=b)") # nor here: the assertion is zero-width
     check not lazyScanned("a*?.") # ``.`` is no character test
     check not lazyScanned("a*?(?:b|c)") # an alternation is not one leaf either
     check not lazyScanned("a*?b*") # nor is a repeat that need not match
+    # Zero-width is read past, not stopped at: the leaf is what follows it.
+    # Only ``nkAnchor`` used to be, which left an empty group blocking.
+    check lazyScanned("a*?(?:)b")
+    check search("aab", re("a*?(?:)b")).boundaries[0] == 0 .. 3
+    check lazyScanned("a*?b{0,0}c")
+    check search("aac", re("a*?b{0,0}c")).boundaries[0] == 0 .. 3
 
   test "a construct that cuts the backtracking keeps the general path":
     # Inside ``(?>...)`` a repeat that stopped later than it does today could

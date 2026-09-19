@@ -295,9 +295,9 @@ type
         ## ``false`` is the safe value, so a node the pass never visits
         ## degrades to "always snapshot", never to "never".
       quantFollowByte*: int16 = -1
-        ## Set by ``possessifyRepeats``: the ASCII byte the continuation must
-        ## have where a give-back hands it the position, or -1 where it can
-        ## begin with more than one character.  A greedy repeat over a one-way
+        ## Set by ``annotateContinuations``: the ASCII byte the continuation
+        ## must have where a give-back hands it the position, or -1 where it
+        ## can begin with more than one character.  A greedy repeat over a one-way
         ## leaf then retreats straight to the positions holding that byte --
         ## see ``retreatToFollowByte``.
         ##
@@ -307,7 +307,7 @@ type
         ## would zero it into a node claiming byte 0.
       quantNextLeaf*: Node
         ## Lazy repeats only: leaf the continuation must match where the repeat
-        ## stops, or nil. Set by ``annotateLazyScanLeaf``; borrowed, not a
+        ## stops, or nil. Set by ``annotateContinuations``; borrowed, not a
         ## child, so ``childNodes`` skips it.
     of nkCharClass:
       # The widest branch in the variant, so its layout alone decides
