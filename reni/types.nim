@@ -433,6 +433,11 @@ type
       ## A run and not a single index because two branches may spell the same
       ## string, and the second is still a branch the matcher must offer.
     depth*: int32 ## bytes from the root, i.e. what a terminal here consumed
+    rowOff*: int32
+      ## Start of this state's 256-entry row in ``AltTrie.rows``, or -1 when
+      ## it has none and the step reads ``edges``. Rows go to the widest and
+      ## shallowest states, and only as many as the trie's size pays for (see
+      ## ``AltTrieRowMinEdges``, ``AltTrieStatesPerRow``, ``AltTrieMaxRows``).
 
   AltTrie* = ref object
     ## Byte trie over an alternation whose every branch is a plain literal.
@@ -452,6 +457,10 @@ type
       ## Bytes the root has an edge for. Most positions the alternation is
       ## reached from start no branch at all, so the common answer is one set
       ## test rather than an edge scan.
+    rows*: seq[int32]
+      ## Transition rows, 256 entries each: ``rows[st.rowOff + b]`` is the
+      ## state byte ``b`` leads to from ``st``, or -1 when it leads nowhere.
+      ## The state itself and not an edge index, so a step reads one array.
 
   FirstCharKind* = enum
     fcNone ## no optimization possible
