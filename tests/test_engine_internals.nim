@@ -2380,6 +2380,9 @@ suite "the first-byte hint is a superset of what can start a match":
     r"[[\h]]",
     r"[[\w]]",
     r"[[a-c]&&[b-z]]",
+    # A two-member lead set whose bytes are multi-byte leads: the only shape
+    # where the scan's ``charHeadAt`` shortcut stands in for the chain walk.
+    r"\x{e9}|\x{3042}",
     r"[[\x{100}]&&[a-z]]",
     r"[[a-z]&&[\x{100}]]",
     r"\p{Han}",

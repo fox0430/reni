@@ -466,6 +466,10 @@ type
       byte*: uint8
     of fcByteSet:
       bytes*: set[uint8]
+      pair*: array[2, uint8]
+        ## The two members when ``pairOk``: a set that small is scanned with
+        ## one memchr cursor per byte.
+      pairOk*: bool ## Whether ``bytes`` has exactly two members.
     of fcNone, fcAnchorStart, fcLineStart:
       discard
 
@@ -1192,6 +1196,17 @@ proc asciiFoldBytes(b: uint8): set[uint8] =
   else:
     {b}
 
+proc byteSetHint(bs: set[uint8]): FirstCharInfo =
+  ## A multi-byte lead hint.  Every ``fcByteSet`` is built through this, so the
+  ## search reads ``pair`` rather than walking the set per call.
+  result = FirstCharInfo(kind: fcByteSet, bytes: bs)
+  if bs.card == 2:
+    var i = 0
+    for v in bs:
+      result.pair[i] = v
+      inc i
+    result.pairOk = true
+
 proc toByteSet(info: FirstCharInfo): set[uint8] =
   ## Convert a FirstCharInfo to a byte set (for merging).
   case info.kind
@@ -1217,7 +1232,7 @@ proc mergeFirstChar(a, b: FirstCharInfo): FirstCharInfo =
   if merged.card == 1:
     for v in merged:
       return FirstCharInfo(kind: fcByte, byte: v)
-  FirstCharInfo(kind: fcByteSet, bytes: merged)
+  byteSetHint(merged)
 
 proc utf8LeadByte(cp: int32): uint8 =
   ## Return the UTF-8 lead byte for a code point.
@@ -1329,7 +1344,7 @@ proc byteSetInfo(bs: set[uint8]): FirstCharInfo =
       b = v
     FirstCharInfo(kind: fcByte, byte: b)
   else:
-    FirstCharInfo(kind: fcByteSet, bytes: bs)
+    byteSetHint(bs)
 
 proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
   ## Build a FirstCharInfo from a code point, handling both ASCII and non-ASCII.
