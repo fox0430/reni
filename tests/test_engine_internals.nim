@@ -2340,6 +2340,71 @@ suite "the leading-repeat prefilter refuses only what no match can start with":
     check leadRepeatOf("(\\w)\\1", {rfFindLongest})
     check search("abccd", re("(\\w)\\1", {rfFindLongest})).matchSpan == 2 .. 4
 
+  test "the pair scan finds the repeat at every alignment":
+    # The scan answers eight positions a word, so a pair may sit anywhere in
+    # a window, in its one-byte tail, or across the two.
+    for lead in 0 .. 24:
+      let subject = "ab".repeat(lead) & "cc" & "de"
+      check search(subject, re("(\\w)\\1")).matchSpan == 2 * lead .. 2 * lead + 2
+      check search(subject, re("(c)\\1")).matchSpan == 2 * lead .. 2 * lead + 2
+    for tail in 0 .. 24:
+      let subject = "abab" & "cc" & "ab".repeat(tail)
+      check search(subject, re("(\\w)\\1")).matchSpan == 4 .. 6
+
+  test "the pair scan hands a multibyte character back untested":
+    # A byte at or above 0x80 says nothing about the character's width, so it
+    # is a candidate the byte comparison may not refuse -- and 本 and 語 share
+    # a lead byte, which a one-byte answer would take for a pair.
+    for lead in 0 .. 24:
+      let ascii = "ab".repeat(lead)
+      check search(ascii & "語語x", re("(\\w)\\1")).matchSpan ==
+        2 * lead .. 2 * lead + 6
+      check not search(ascii & "本語", re("(\\w)\\1")).found
+      # A truncated sequence is a candidate too, and refused by the matcher.
+      check not search(ascii & "\xE6\x9C", re("(\\w)\\1")).found
+
+  test "the pair scan leaves nothing at the end of the subject":
+    # The second character needs room, so the last position never holds; the
+    # walk must still reach the pair that ends the subject.
+    for lead in 0 .. 24:
+      let ascii = "ab".repeat(lead)
+      check search(ascii & "cc", re("(\\w)\\1")).matchSpan == 2 * lead .. 2 * lead + 2
+      check not search(ascii & "c", re("(\\w)\\1")).found
+      check not search(ascii, re("(\\w)\\1")).found
+
+  test "the pair scan starts where the search does":
+    # A start offset is the scan's floor: a pair behind it is not an answer.
+    let subject = "aa bb cc"
+    check search(subject, re("(\\w)\\1"), start = 0).matchSpan == 0 .. 2
+    check search(subject, re("(\\w)\\1"), start = 1).matchSpan == 3 .. 5
+    check search(subject, re("(\\w)\\1"), start = 4).matchSpan == 6 .. 8
+    check not search(subject, re("(\\w)\\1"), start = 7).found
+
+  test "the pair scan refuses only what the leaf test refuses":
+    # A pair the leaf does not accept is no match, and a leaf that accepts a
+    # non-pair is no match either: the two answers must agree position by
+    # position with the matcher's own.
+    let subject = "  aa..11__\tzz日日%%\n  q"
+    for pat in ["(\\w)\\1", "(\\d)\\1", "([a-z])\\1", "([^ ])\\1", "([\\s\\S])\\1"]:
+      let r = re(pat)
+      var byScan: seq[int]
+      for m in findAll(subject, r):
+        byScan.add m.matchSpan.a
+      var byMatchAt: seq[int]
+      var p = 0
+      while p <= subject.len:
+        let m = matchAt(subject, r, p)
+        if m.found:
+          byMatchAt.add p
+          p = max(m.matchSpan.b, p + 1)
+        else:
+          p =
+            if p < subject.len:
+              nextRunePos(subject, p)
+            else:
+              p + 1
+      check byScan == byMatchAt
+
 suite "the first-byte hint is a superset of what can start a match":
   # A hint that is too narrow makes the scan step over a position the pattern
   # matches, and nothing else in the suite notices -- the match is simply never

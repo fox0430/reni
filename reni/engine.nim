@@ -3,7 +3,7 @@
 ## passing, giving correct backtracking through alternations,
 ## quantifiers, and flag groups without per-call closure allocations.
 
-import std/[unicode, tables, macros]
+import std/[unicode, tables, macros, bitops]
 from std/strutils import find
 from std/typetraits import supportsCopyMem
 
@@ -448,6 +448,52 @@ proc indexOfByte(s: string, start: int, b: uint8): int {.inline.} =
     -1
   else:
     find(s, char(b), start)
+
+const RepeatPairStride = 8
+  ## Positions a word step of [nextRepeatPairPos] answers at once.
+
+proc nextRepeatPairPos(s: string, start: int): int =
+  ## First position at or after ``start`` where a ``(leaf)\1`` prefilter can
+  ## still hold, or -1 when the subject holds none: an ASCII byte equal to the
+  ## byte after it, or a byte at or above 0x80, which [leadRepeatHolds] hands
+  ## back unanswered because the byte test cannot measure its width.
+  ##
+  ## An ASCII position holds a one-byte character, so the single-character leaf
+  ## [leadRepeatLeaf] matches one byte there and the backreference then needs
+  ## ``s[p] == s[p + 1]``: what this skips is refused, not merely prefiltered.
+  ## The last position is refused for want of room, so the walk stops one short.
+  var p = max(start, 0)
+  let n = s.len
+  # A non-ASCII candidate answers itself, so loading a window would be pure
+  # overhead on a subject that holds no ASCII to skip over.
+  if p + 1 < n and s[p].uint8 >= 0x80'u8:
+    return p
+  when cpuEndian == littleEndian:
+    # Eight positions a step: exclusive-or the window against itself shifted
+    # one byte, and a zero byte marks a pair; the unshifted window's high bits
+    # mark where the byte test stops.  Both masks set bit 8i+7 for position
+    # ``p + i``, so the lowest set bit names the first candidate -- and only
+    # that one may be read, because the borrow out of a zero byte propagates
+    # upward and can set the bit of a higher byte that is neither a pair nor
+    # high (window ``"aa\x60..."`` sets bit 15).  Such a false positive never
+    # sits below the zero byte that caused it.
+    const Ones = 0x0101010101010101'u64
+    const Highs = 0x8080808080808080'u64
+    while p + RepeatPairStride + 1 <= n:
+      var v, u: uint64
+      copyMem(addr v, unsafeAddr s[p], RepeatPairStride)
+      copyMem(addr u, unsafeAddr s[p + 1], RepeatPairStride)
+      let x = v xor u
+      let m = ((x - Ones) and not x and Highs) or (v and Highs)
+      if m != 0:
+        return p + (countTrailingZeroBits(m) shr 3)
+      p += RepeatPairStride
+  while p + 1 < n:
+    let b = s[p].uint8
+    if b >= 0x80'u8 or b == s[p + 1].uint8:
+      return p
+    inc p
+  -1
 
 var emptySubjectByte: char
   ## Target for the ``data`` pointer of an empty subject, so a ``Subject``
@@ -4523,6 +4569,14 @@ proc searchImplInto*(
   # still costs per candidate.
   let hasLeadAnchors = ctx.leadAnchors != {}
   let hasPrefilter = leadLeafNode != nil or leadRepeatNode != nil or hasLeadAnchors
+  # [nextRepeatPairPos] answers the same refusal [leadRepeatHolds] does, eight
+  # positions at a time, so it is on whenever that prefilter is.  Out under
+  # ``fcAnchorStart``, whose only candidate is position 0 and which the skip
+  # would walk away from.
+  var pairScan = leadRepeatNode != nil and fc.kind != fcAnchorStart
+  # Counters for the same stand-down the region skip uses.
+  var pairTried = 0
+  var pairSkipped = 0
   # ``\G``/``\y``/``\Y`` read this state, which ``resetForPosition`` otherwise
   # writes only after the prefilter runs.
   ctx.searchStart = start
@@ -4653,6 +4707,22 @@ proc searchImplInto*(
           exhausted = true
       of fcNone:
         discard
+      # ``(leaf)\1``: scan for the byte pair the backreference needs rather
+      # than testing one position at a time.  After the first-byte skip, so
+      # that skip walks only up to the position this one lands on, and out once
+      # ``exhausted`` is set, where it would walk the rest of the subject for
+      # an answer the break below throws away.
+      if pairScan and not exhausted:
+        let q = nextRepeatPairPos(subject, startPos)
+        if q < 0:
+          exhausted = true
+        else:
+          inc pairTried
+          pairSkipped += q - startPos
+          startPos = q
+          # Stand down when candidates skip too little.
+          if pairTried >= RegionTrial and pairSkipped < pairTried * RegionPayoff:
+            pairScan = false
     if exhausted:
       break
     if startPos > regionEnd:
