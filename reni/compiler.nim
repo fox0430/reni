@@ -711,6 +711,28 @@ const AltTrieMaxStates = 4096
   ## ``re()``.  Past it the alternation keeps the hints; refusing a trie only
   ## ever costs speed.
 
+const AltTrieRowMinEdges = 2
+  ## Edges a state must have before it earns a transition row.  A one-edge
+  ## state -- the inside of a word no other branch shares -- answers the walk
+  ## in the single compare the indexed load itself costs, so a row there
+  ## spends a kilobyte to tie.  From two edges up it is measured ahead (-0.5%
+  ## of ``alternation/large``).
+
+const AltTrieStatesPerRow = 8
+  ## States a trie must hold per row it is granted, so a table never dwarfs
+  ## the trie it accelerates: a row is a fixed kilobyte where a state is
+  ## twenty bytes and an edge eight.  Without a ratio every two-branch
+  ## alternation buys one -- 2000 copies of ``(?:a|b)`` cost 3.53 MB of
+  ## ``re()``, 1.45 MB at this ratio -- while the alternation benchmarks keep
+  ## every row they had (77.421M ``Ir`` either way).  One row per sixteen
+  ## states drops rows and costs +0.24% ``Ir``.
+
+const AltTrieMaxRows = 64
+  ## Ceiling on the rows one trie holds (64 KiB).  Past it the widest and
+  ## shallowest states take the budget -- a walk re-scans those at every
+  ## position reaching them -- and the rest keep the walk, which only ever
+  ## costs speed.
+
 const AltTrieMaxWordLen = 16
   ## Longest branch a trie will take, mirroring ``BulkCompareLen`` in the
   ## matcher: from that length a branch compares as one ``memcmp``, which a
@@ -788,22 +810,53 @@ proc buildAltTrie(alternatives: seq[Node]): AltTrie =
   result = AltTrie(states: newSeq[AltTrieState](build.len))
   for s in 0 ..< build.len:
     # Sorted, so a walk can stop at the first label past the byte it wants.
-    var kids = build[s].kids
-    kids.sort(
+    build[s].kids.sort(
       proc(a, b: tuple[label: uint8, next: int32]): int =
         cmp(a.label, b.label)
     )
     result.states[s] = AltTrieState(
       edgeOff: int32(result.edges.len),
-      edgeLen: int32(kids.len),
+      edgeLen: int32(build[s].kids.len),
       termOff: int32(result.terms.len),
       termLen: int32(build[s].terms.len),
       depth: build[s].depth,
+      rowOff: -1'i32,
     )
-    for k in kids:
+    for k in build[s].kids:
       result.edges.add AltTrieEdge(label: k.label, next: k.next)
     for t in build[s].terms:
       result.terms.add t
+  # Rows are granted by what they save and not in state order: the states are
+  # numbered by a walk over the branches in their own order, so spending the
+  # budget as the numbering hands it out would give every row to the first
+  # branches' subtrees and leave the widest later states -- the root's own
+  # children among them -- on the edge scan.
+  var rowed = newSeq[int32]()
+  for s in 0 ..< build.len:
+    if build[s].kids.len >= AltTrieRowMinEdges:
+      rowed.add int32(s)
+  rowed.sort(
+    proc(a, b: int32): int =
+      # Widest first, then shallowest: a shallow state is reached from more
+      # of the subject's positions, so its scan runs most often.
+      var c = cmp(build[b].kids.len, build[a].kids.len)
+      if c == 0:
+        c = cmp(build[a].depth, build[b].depth)
+      if c == 0:
+        c = cmp(a, b)
+      c
+  )
+  let budget = min(AltTrieMaxRows, build.len div AltTrieStatesPerRow)
+  if rowed.len > budget:
+    rowed.setLen(budget)
+  for s in rowed:
+    let rowOff = int32(result.rows.len)
+    result.states[s].rowOff = rowOff
+    result.rows.setLen(result.rows.len + 256)
+    for b in rowOff ..< rowOff + 256:
+      result.rows[b] = -1'i32 # no edge, which ``setLen``'s zero would name
+    for k in build[s].kids:
+      result.rows[rowOff + int32(k.label)] = k.next
   let root = result.states[0]
   for e in root.edgeOff ..< root.edgeOff + root.edgeLen:
     result.firstBytes.incl result.edges[e].label

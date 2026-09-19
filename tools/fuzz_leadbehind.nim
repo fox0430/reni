@@ -56,7 +56,7 @@ proc spans(m: Match): string =
   if not m.found:
     return "-"
   result = $m.matchSpan.a & "-" & $m.matchSpan.b & " sc=" & $m.startChar
-  for g in 1 ..< m.groupCount:
+  for g in 1 .. m.groupCount:
     result.add " " & $m.captureSpan(g).a & "-" & $m.captureSpan(g).b
 
 template answer(call: untyped): string =

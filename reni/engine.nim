@@ -1933,13 +1933,18 @@ proc nextTrieBranch(
     if p >= ctx.subjectEnd:
       return
     let b = uint8(ctx.subject[p])
+    # A wide state steps from its row in one load; a narrow one walks its
+    # ascending edges, which gives up in a compare or two.
     var nxt = -1'i32
-    for e in st.edgeOff ..< st.edgeOff + st.edgeLen:
-      if trie.edges[e].label == b:
-        nxt = trie.edges[e].next
-        break
-      if trie.edges[e].label > b:
-        break
+    if st.rowOff >= 0:
+      nxt = trie.rows[st.rowOff + int32(b)]
+    else:
+      for e in st.edgeOff ..< st.edgeOff + st.edgeLen:
+        if trie.edges[e].label == b:
+          nxt = trie.edges[e].next
+          break
+        if trie.edges[e].label > b:
+          break
     if nxt < 0:
       return
     state = nxt
