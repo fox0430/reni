@@ -1992,6 +1992,14 @@ proc possessifyRepeats(node: Node, flags: RegexFlags, after: Follow) =
       var body: AcceptSet
       if leafAccept(node.quantBody, flags, body) and disjointAccept(body, after.accept):
         node.quantKind = qkPossessive
+      elif after.accept.nonAscii == {} and after.accept.ascii.card == 1:
+        # Not disjoint, so the give-backs stay -- but the continuation can
+        # begin with one character only, so all but the positions holding it
+        # fail at their first leaf.  ``after`` is a *superset* of what the
+        # continuation can begin with, which is what makes a singleton a
+        # requirement (C27).
+        for b in after.accept.ascii:
+          node.quantFollowByte = int16(b)
   of nkAlternation:
     for alt in node.alternatives:
       possessifyRepeats(alt, flags, after)
