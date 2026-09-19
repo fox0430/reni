@@ -538,8 +538,9 @@ suite "inverted range normalisation":
     check shape("a{3,}?") == (3, -1, qkLazy)
 
   test "the rewrite runs where auto-possessification does not":
-    # ``possessifyRepeats`` bails on case folding and on ``\g<...>``; this
-    # pass is about what the range means, so it runs regardless.
+    # ``annotateContinuations`` does not run under case folding and does not
+    # rewrite under ``\g<...>``; this pass is about what the range means, so
+    # it runs regardless.
     check shape("a{3,1}", {rfIgnoreCase}) == (1, 3, qkPossessive)
     check shape("(?i)a{3,1}") == (1, 3, qkPossessive)
     check shape("(x{3,1})\\g<1>") == (1, 3, qkPossessive)
