@@ -1210,6 +1210,78 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
   test "grapheme repetition still steps by grapheme":
     check search("áb", re("\\X*b")).found
 
+suite "a greedy repeat retreats to the byte its continuation requires":
+  # ``possessifyRepeats`` writes ``quantFollowByte`` where the continuation
+  # can begin with exactly one ASCII character, and ``retreatToFollowByte``
+  # then skips every give-back whose stop position does not hold it.  The
+  # failure mode is the one C24's rewrite has: a continuation that can begin
+  # with something the walk did not state, so a position that *could* have
+  # matched is skipped and the match is lost.  Every case below therefore
+  # names the answer the unfiltered give-back gives.
+
+  test "it lands on the last position holding the byte":
+    check search("x \"abc\" y", re("\".*\"")).boundaries[0] == 2 .. 7
+    # Several occurrences: greedy still takes the furthest.
+    check search("x \"a\"b\"c\" y", re("\".*\"")).boundaries[0] == 2 .. 9
+    # None past the run's start: no give-back succeeds and the attempt fails.
+    check not search("x \"abc y", re("\".*\"")).found
+    check search("zaxxbxxbz", re("a.*b")).boundaries[0] == 1 .. 8
+
+  test "the repeat's minimum still bounds the retreat":
+    # The body has to overlap the continuation, or ``possessifyRepeats``
+    # rewrites the repeat to possessive and no give-back is offered at all.
+    check search("aaaab", re("[ab]{2,}b")).boundaries[0] == 0 .. 5
+    check search("aab", re("[ab]{2,}b")).boundaries[0] == 0 .. 3
+    check not search("aaab", re("[ab]{5,}b")).found
+    # The byte occurs below the minimum only: the retreat must not reach it.
+    check not search("baaa", re("[ab]{2,}b")).found
+
+  test "a multibyte tail is walked by its stored positions":
+    # Past the ASCII run each repetition has a position of its own, and a
+    # multibyte lead byte is never the ASCII byte the continuation wants.
+    check search("ab本cd本e", re("[^!]*e")).boundaries[0] == 0 .. 11
+    check search("本本x", re(".*x")).boundaries[0] == 0 .. 7
+    check search("a本b本b", re("a.*b")).boundaries[0] == 0 .. 9
+
+  test "the end of the subject is not a position the continuation can use":
+    # The retreat starts one repetition below the run's end, so the position
+    # past the last byte -- where the continuation has nothing to consume --
+    # is never a candidate.
+    check not search("aaa", re(".*b")).found
+    check search("aaab", re(".*b")).boundaries[0] == 0 .. 4
+    # Every give-back rejected but the first: the retreat lands on zero.
+    check search("ba", re(".*b")).boundaries[0] == 0 .. 1
+
+  test "a continuation with more than one first character keeps every give-back":
+    # ``\s*=`` can begin with a space or with ``=``, so no byte is written and
+    # the repeat gives back as it always did.
+    check search("ab  = ef", re("[a-z]*\\s*=")).boundaries[0] == 0 .. 5
+    # A singleton the body cannot match is the possessive rewrite's case, not
+    # this one: ``\w`` and ``=`` are disjoint, so no give-back is left to skip.
+    check search("ab cd=ef", re("\\w*=")).boundaries[0] == 3 .. 6
+    # A non-ASCII continuation states no byte either.
+    check search("ab本cd本", re(".*本")).boundaries[0] == 0 .. 10
+
+  test "what ran after the skipped give-backs is still undone":
+    # The retreat replaces dispatches that would have failed, so the scalars a
+    # continuation moved must roll back exactly as they did before.  ``\K`` is
+    # zero-width, so it leaves the follow byte in place and still moves the
+    # reported start.
+    check search("aaab", re(".*\\Kb")).boundaries[0] == 3 .. 4
+    # The retreat lands on the last ``b``, ``\K`` moves the start there, ``c``
+    # fails, and the next retreat has to report the earlier ``b``, not it.
+    check search("abcb", re(".*\\Kbc")).boundaries[0] == 1 .. 3
+    check search("abzbc", re(".*\\Kbc")).boundaries[0] == 3 .. 5
+
+  test "folding turns the annotation off":
+    # ``possessifyRepeats`` does not run under case folding, and an inline
+    # ``(?i)`` is a flag group the walk refuses to look through, so ``a*A``
+    # keeps every give-back either way.
+    check search("aaa", re("(?i)a*A")).boundaries[0] == 0 .. 3
+    check search("aaa", re("(?i:a*A)")).boundaries[0] == 0 .. 3
+    check search("aaa", re("a*A", {rfIgnoreCase})).boundaries[0] == 0 .. 3
+    check not search("aaa", re("(?:(?i)a*)A")).found
+
 suite "a lazy repeat of a single-way leaf is a scan, not a choice per rep":
   # The mirror image of the greedy scan above.  Greedy takes every repetition
   # it can and hands them back; lazy takes as few as it can and adds them, so

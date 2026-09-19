@@ -345,6 +345,10 @@ type
         ## Leading repetitions taken as one ASCII run, storing no position:
         ## each is one byte wide, so repetition ``k <= srRunCount`` ends ``k``
         ## bytes past ``srScalars.pos``. ``srPosOff`` indexes the rest.
+      srFollow: int16
+        ## ``Node.quantFollowByte``, or -1.  A give-back hands the continuation
+        ## the character at its stop position, so a position not holding this
+        ## byte is skipped rather than dispatched -- see [retreatToFollowByte].
       srScalars: ScalarState
         ## State at repeat start. Only ``pos`` comes from the body; the rest
         ## covers what the continuation changed (``\K``, flags). Captures need
@@ -2836,6 +2840,37 @@ proc lazyScanResume(ctx: MatchContext, top: int): bool {.noinline.} =
   restoreScalars(ctx, ctx.choices[top].lsScalars)
   false
 
+proc retreatToFollowByte(
+    ctx: MatchContext, top: int, back, minRep: int32
+): int32 {.noinline.} =
+  ## Last give-back at or below ``back`` the ``chSimpleRepeat`` continuation
+  ## can use.  It requires ``srFollow`` at the position it is handed, so every
+  ## other position fails at its first leaf and is skipped rather than
+  ## dispatched.  ``ctx.pos`` is the repeat's start, which ``restoreScalars``
+  ## has just put back.
+  ##
+  ## The caller passes ``back = count - 1``, so every position read below ends
+  ## a repetition the repeat already took and is inside the subject; the
+  ## position past the run, where the continuation would have nothing to
+  ## consume, is never a candidate.
+  ##
+  ## Out of line for the same reason [lazyScanResume] is: only an annotated
+  ## repeat calls it, and the arm stays the size the other items pay for.
+  let want = char(ctx.choices[top].srFollow)
+  let runCount = ctx.choices[top].srRunCount
+  let posOff = int(ctx.choices[top].srPosOff)
+  let start = ctx.pos
+  result = back
+  # The tail stores one position per repetition; a position past the run may
+  # be multibyte, and a multibyte lead never equals an ASCII ``want``.
+  while result > runCount and result >= minRep:
+    if ctx.subject[ctx.repPositions[posOff + int(result - runCount) - 1]] == want:
+      return
+    dec result
+  # The run is contiguous bytes, so this is a backward scan over one stretch.
+  while result >= minRep and ctx.subject[start + int(result)] != want:
+    dec result
+
 proc runMachine(
     ctx: MatchContext, startNode: Node, startCont: ContId, startMode = mMatch
 ): bool =
@@ -3199,6 +3234,9 @@ proc runMachine(
         case node.quantKind
         of qkGreedy:
           let body {.cursor.} = node.quantBody
+          # Read beside the body: the two reads of one variant share the
+          # kind check, which a call in between would cost the push again.
+          let followByte = node.quantFollowByte
           if ctx.isSingleWayLeaf(body):
             # Single-way body: forward scan, one int per rep for backtracking.
             let scalars = saveScalars(ctx)
@@ -3235,6 +3273,7 @@ proc runMachine(
                 srCount: count,
                 srPosOff: posOff,
                 srRunCount: runCount,
+                srFollow: followByte,
                 srScalars: scalars,
               )
               mode = mCont
@@ -3950,12 +3989,16 @@ proc runMachine(
         # Hand one repetition back; scalars first since downstream may change them.
         let count = ctx.choices[top].srCount
         restoreScalars(ctx, ctx.choices[top].srScalars)
-        if count <= ctx.choices[top].srMinRep:
+        let minRep = ctx.choices[top].srMinRep
+        var back = count - 1
+        if back >= minRep and ctx.choices[top].srFollow >= 0:
+          # Skip the give-backs the continuation's first byte rules out.
+          back = retreatToFollowByte(ctx, top, back, minRep)
+        if back < minRep:
           ctx.repLen = int(ctx.choices[top].srPosOff)
           ctx.choicesLen = top
           mode = mFail
         else:
-          let back = count - 1
           let posOff = int(ctx.choices[top].srPosOff)
           let runCount = ctx.choices[top].srRunCount
           ctx.choices[top].srCount = back
