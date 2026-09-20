@@ -306,6 +306,7 @@ type MatchScanner* = object
   outPos: int ## Where the subject text not yet written out begins.
   prevReported: Span ## Reported span of the last yielded match, or unset.
   finished: bool ## Whether the scan has run off the end of the subject.
+  started: bool ## Whether an attempt of this scan has already run.
   stepLimit: int ## Step limit every attempt of this scan runs under.
   maxRecursionDepth: int ## Recursion limit every attempt runs under.
 
@@ -392,7 +393,10 @@ proc scanNext*(
       start = sc.scanPos,
       stepLimit = sc.stepLimit,
       maxRecursionDepth = sc.maxRecursionDepth,
+      # Keep the region memo; the matcher still checks the buffer pointer.
+      sameSubject = sc.started,
     )
+    sc.started = true
     if not m.found:
       sc.finished = true
       return false

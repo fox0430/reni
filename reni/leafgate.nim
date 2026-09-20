@@ -99,3 +99,74 @@ proc buildLeafGates*(nodes: seq[Node], flags: RegexFlags): seq[LeafGate] =
     )
     gate.runnable = leafRunAccepts(node, flags, gate.accept)
     result[i] = gate
+
+const MaxSeqRunElems* = 8
+  ## Ceiling so the matcher copies elements onto its frame.  Eight covers
+  ## every shape the corpus holds (the widest is two).
+
+proc seqRunPassThrough*(node: Node): Node =
+  ## Groups the matcher steps straight into.  A capture is not one: it writes
+  ## a span per iteration, which a sequence of runs records nowhere.
+  result = node
+  while result != nil and result.kind == nkGroup and result.groupBodyKeepsFlags:
+    result = result.groupBody
+
+proc seqRunShape*(node: Node, elems: var array[MaxSeqRunElems, SeqRunElem]): int =
+  ## Elements of ``node``'s body as a sequence of leaf runs, or 0 where it
+  ## is not one in shape.  Structure only; what each leaf accepts is
+  ## ``Node.quantSeqOk``'s business.
+  let body {.cursor.} = seqRunPassThrough(node.quantBody)
+  if body == nil or body.kind != nkConcat:
+    return 0
+  let k = body.children.len
+  if k < 2 or k > MaxSeqRunElems:
+    return 0
+  for j in 0 ..< k:
+    let child {.cursor.} = seqRunPassThrough(body.children[j])
+    if child == nil:
+      return 0
+    var leaf {.cursor.} = child
+    var emin = 1
+    var emax = 1
+    var poss = false
+    if child.kind == nkQuantifier:
+      # Lazy hands repetitions back in the other order; the walk does not.
+      if child.quantKind notin {qkGreedy, qkPossessive}:
+        return 0
+      poss = child.quantKind == qkPossessive
+      emin = child.quantMin
+      emax = child.quantMax
+      leaf = seqRunPassThrough(child.quantBody)
+      if leaf == nil:
+        return 0
+    elems[j] = SeqRunElem(
+      elem: child.id, leaf: leaf.id, emin: int32(emin), emax: int32(emax), eposs: poss
+    )
+  k
+
+proc buildSeqRuns*(nodes: seq[Node], flags: RegexFlags) =
+  ## Raise ``Node.quantSeqOk`` on every greedy repeat whose body is a
+  ## sequence of leaf runs under ``flags``.  Needs the numbered tree:
+  ## [seqRunShape] names nodes by [NodeId].  At least two elements (one
+  ## is the leaf-run scan already), and one must consume so an iteration
+  ## moves.
+  var elems: array[MaxSeqRunElems, SeqRunElem]
+  for i in 1 ..< nodes.len:
+    let node {.cursor.} = nodes[i]
+    if node.kind != nkQuantifier or node.quantKind != qkGreedy:
+      continue
+    let k = seqRunShape(node, elems)
+    if k == 0:
+      continue
+    var ok = true
+    var consumes = false
+    for j in 0 ..< k:
+      let leaf {.cursor.} = nodes[elems[j].leaf.int]
+      var accept: set[uint8]
+      if elems[j].emin < 0 or not singleWayLeaf(leaf, flags) or leafRunGraphemeDep(leaf) or
+          not leafRunAccepts(leaf, flags, accept):
+        ok = false
+        break
+      if elems[j].emin >= 1:
+        consumes = true
+    node.quantSeqOk = ok and consumes
