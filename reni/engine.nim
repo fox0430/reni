@@ -241,9 +241,12 @@ type
       ## Whether the counters turned the prefilter off. Retried after
       ## ``leadLeafCool`` positions: a refusing-nothing prefix says nothing
       ## about what follows.
-    leadAnchors: set[AnchorKind]
-      ## Cached ``Regex.leadAnchors``. Shares the ``leadLeaf`` counters as one
-      ## prefilter. Placed here to fit the padding after the ``bool`` above.
+    leadAnchorsLen: int32 ## Filled entries in ``leadAnchors``.
+    leadAnchors: array[AnchorKind.high.ord + 1, AnchorKind]
+      ## ``Regex.leadAnchors`` unpacked, derived once per pattern beside the
+      ## lead indices. A ``set`` here cost ``leadAnchorsHold`` a walk of the
+      ## whole enum range per admitted position. Shares the ``leadLeaf``
+      ## counters as one prefilter.
     leadLeafCool: int32 ## Positions left before retrying an off prefilter.
     leadRepeat: NodeId
       ## Cached ``Regex.leadRepeat``, or ``NoNodeId``. Replaces ``leadLeaf``
@@ -1974,7 +1977,8 @@ proc matchWordBoundary(ctx: MatchContext): bool =
 
 proc leadAnchorsHold(ctx: MatchContext): bool {.inline.} =
   ## Whether every leading assertion holds at ``ctx.pos``.
-  for a in ctx.leadAnchors:
+  for i in 0 ..< ctx.leadAnchorsLen:
+    let a = ctx.leadAnchors[i]
     let holds =
       case a
       of akWordBoundary:
@@ -4378,6 +4382,11 @@ proc resetForRegex(
     ctx.leadLeaf = if regex[].leadLeaf == nil: NoNodeId else: regex[].leadLeaf.id
     assert regex[].leadRepeat == nil or isSingleWayLeaf(ctx, regex[].leadRepeat)
     ctx.leadRepeat = if regex[].leadRepeat == nil: NoNodeId else: regex[].leadRepeat.id
+    # Plain data keyed on the tree above, as the lead indices are.
+    ctx.leadAnchorsLen = 0
+    for a in regex[].leadAnchors:
+      ctx.leadAnchors[ctx.leadAnchorsLen] = a
+      inc ctx.leadAnchorsLen
     let capCount = regex[].captureCount
     # The internal buffers only grow, so their capacity survives a switch to
     # a regex with fewer captures; ``resetForPosition`` clears stale state.
@@ -4385,9 +4394,6 @@ proc resetForRegex(
       ctx.groupRecursionDepth.setLen(capCount)
     if capCount > ctx.captureStacks.len:
       ctx.captureStacks.setLen(capCount)
-  # Restored on every bind: ``leadAnchorsHold`` reads this set directly,
-  # not through ``ctx.regex``.
-  ctx.leadAnchors = regex[].leadAnchors
   ctx.lookLimit = NoLookLimit
   ctx.anchorEnd = subject.len
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
@@ -4477,12 +4483,12 @@ proc writeNotFound(m: var Match) {.inline.} =
 proc releaseBorrowed(ctx: MatchContext) {.inline.} =
   ## Clear borrowed refs so stale reads fail loudly; frame buffers hold plain
   ## data only. Cached lead indices stay (resolved through ``ctx.regex``, nil
-  ## here); ``leadAnchors`` and ``gates`` are read directly, so they are
-  ## cleared here and restored on every bind.
+  ## here), and so does ``leadAnchors``: plain data keyed on the bound tree,
+  ## which ``boundAst`` holds against recycling. ``gates`` is a borrow, so it
+  ## is cleared here and restored on every bind.
   ctx.regex = nil
   ctx.gates = nil
   ctx.gatesLen = 0
-  ctx.leadAnchors = {}
   ctx.subject = Subject(data: nil, size: 0)
 
 proc searchImplInto*(
@@ -4565,9 +4571,8 @@ proc searchImplInto*(
   var exhausted = false
   let leadLeafNode {.cursor.} = nodeAt(ctx, ctx.leadLeaf)
   let leadRepeatNode {.cursor.} = nodeAt(ctx, ctx.leadRepeat)
-  # Hoisted: iterating a Nim set walks the whole enum range, so an empty set
-  # still costs per candidate.
-  let hasLeadAnchors = ctx.leadAnchors != {}
+  # Hoisted: one load instead of a field read per candidate.
+  let hasLeadAnchors = ctx.leadAnchorsLen > 0
   let hasPrefilter = leadLeafNode != nil or leadRepeatNode != nil or hasLeadAnchors
   # [nextRepeatPairPos] answers the same refusal [leadRepeatHolds] does, eight
   # positions at a time, so it is on whenever that prefilter is.  Out under
