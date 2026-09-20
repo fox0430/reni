@@ -102,7 +102,12 @@ proc report(ctx: MatchContext, p, s: string, rx: Regex) =
   for start in 0 .. s.len:
     # Through the shared ``ctx``, not the public ``search``: the latter would
     # hand every call a context that has never seen another pattern.
-    echo p, " | ", s.toHex, " | ", start, " | ",
+    echo p,
+      " | ",
+      s.toHex,
+      " | ",
+      start,
+      " | ",
       answer(
         block:
           searchIntoCtx(ctx, s, rx, m, start)
