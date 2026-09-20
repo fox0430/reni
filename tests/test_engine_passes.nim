@@ -329,6 +329,116 @@ suite "auto-possessification":
         check not (isWordChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
         check not (isDigitChar(r, asciiOnly) and isSpaceChar(r, asciiOnly))
 
+suite "sequence-run scan":
+  # Pin the compiler bit and the matches.  A wrong fill consumes where
+  # ``{0}`` must not, a wrong give-back disagrees with the general path,
+  # and a stretch kept for the wrong buffer skips the 0x80 bail-out.
+  proc seqOkOn(rx: Regex): bool =
+    proc walk(node: Node): bool =
+      if node == nil:
+        return false
+      if node.kind == nkQuantifier and node.quantSeqOk:
+        return true
+      for child in node.childNodes:
+        if walk(child):
+          return true
+      false
+
+    walk(rx.ast)
+
+  proc seqOk(pattern: string): bool =
+    seqOkOn(re(pattern))
+
+  proc closeSeqRun(rx: Regex) =
+    ## Force the general path: the matcher reads ``quantSeqOk`` on entry.
+    proc walk(node: Node) =
+      if node == nil:
+        return
+      if node.kind == nkQuantifier:
+        node.quantSeqOk = false
+      for child in node.childNodes:
+        walk(child)
+
+    walk(rx.ast)
+
+  proc spans(subject: string, rx: Regex): seq[Span] =
+    for m in findAll(subject, rx):
+      result.add m.matchSpan
+
+  proc general(subject, pattern: string): seq[Span] =
+    let rx = re(pattern)
+    closeSeqRun(rx)
+    spans(subject, rx)
+
+  test "the benchmark shape and an overlapping pair raise the bit":
+    check seqOk("(?:\\w+\\s+){3,}")
+    check seqOk("(?:[ab]+[bc]+)+")
+    check seqOk("(?:\\w+\\s*){0}")
+    check seqOk("(?:[ab]+[bc]+){0}")
+    check not seqOk("\\w+")
+    check not seqOk("(?:ab)+")
+
+  test "a {0} sequence repeat matches empty, not one iteration":
+    # The seq-run fill completes iteration 0 before reading qmax, so {0}
+    # would consume a whole sequence where the general path leaves empty.
+    check search("hello", re("(?:\\w+\\s*){0}")).matchSpan == 0 .. 0
+    check not search("hello", re("^(?:\\w+\\s*){0}$")).found
+    check search("", re("^(?:\\w+\\s*){0}$")).matchSpan == 0 .. 0
+    check search("hello", re("(?:\\w+\\s*){0}hello")).matchSpan == 0 .. 5
+    check search("abbc", re("(?:[ab]+[bc]+){0}")).matchSpan == 0 .. 0
+    check not search("abbc", re("^(?:[ab]+[bc]+){0}$")).found
+
+  test "an overlapping pair's give-backs match the general path":
+    # ``[ab]`` and ``[bc]`` share ``b``, so markPossessive leaves both greedy.
+    # ``{2,}`` on "aabbcc" has to hand ``b``s from the first iteration to the
+    # second; ``(?=c)`` walks the same give-backs after the continuation
+    # refuses the greedy fill.  An odometer yields a different accept set.
+    check seqOk("(?:[ab]+[bc]+){2,}")
+    check seqOk("(?:[ab]+[bc]+){2,}(?=c)")
+    check seqOk("(?:[ab]+[bc]+)+c")
+    let closed = re("(?:[ab]+[bc]+){2,}")
+    check seqOkOn(closed)
+    closeSeqRun(closed)
+    check not seqOkOn(closed)
+    check spans("aabbcc", closed) == @[Span(a: 0, b: 6)]
+    check spans("aabbcc", re("(?:[ab]+[bc]+){2,}")) == @[Span(a: 0, b: 6)]
+    check spans("aabbcc", re("(?:[ab]+[bc]+){2,}(?=c)")) == @[Span(a: 0, b: 5)]
+    check spans("aabbcc", re("(?:[ab]+[bc]+)+c")) == @[Span(a: 0, b: 6)]
+    check spans("abcc", re("(?:[ab]+[bc]+){2,}")).len == 0
+    for (subject, pattern) in [
+      ("aabbcc", "(?:[ab]+[bc]+){2,}"),
+      ("aabbcc", "(?:[ab]+[bc]+){2,}(?=c)"),
+      ("aabbcc", "(?:[ab]+[bc]+)+c"),
+      ("aaabbbccc", "(?:[ab]+[bc]+){2,}"),
+      ("aaabbbccc", "(?:[ab]+[bc]+){2,}(?=c)"),
+      ("abbcabbc", "(?:[ab]+[bc]+[cd]+){2,}"),
+      ("ababcc", "(?:[ab]+[bc]+){2,}c"),
+    ]:
+      check seqOk(pattern)
+      check spans(subject, re(pattern)) == general(subject, pattern)
+
+  test "a scan's seq-region does not survive a search of another subject":
+    # A search of another subject on this ctx must drop the region, or the
+    # 0x80 in the first subject is never re-read.
+    let pattern = "(?:\\w+\\s+){3,}"
+    let a = "xx yy zz !aa bb " & "\u00e9" & "cc dd ee "
+    let b = "xx yy zz uu vv ww xx yy zz "
+    let expected = @[Span(a: 0, b: 9), Span(a: 10, b: 27)]
+    check seqOk(pattern)
+    check general(a, pattern) == expected
+    check spans(a, re(pattern)) == expected
+    let rx = re(pattern)
+    let ctx = newMatchContext()
+    var sc = initMatchScanner(a)
+    var m: Match
+    check scanNext(sc, ctx, a, rx, m)
+    var got = @[m.matchSpan]
+    var other: Match
+    check searchIntoCtx(ctx, b, rx, other)
+    while scanNext(sc, ctx, a, rx, m):
+      got.add m.matchSpan
+    check got == expected
+
 suite "required-byte region":
   # Bound the scan by the next required byte; pin the set and the matches.
   proc region(pattern: string, flags: RegexFlags = {}): RequiredByteInfo =

@@ -2368,3 +2368,5 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # under ``result.flags`` rather than ``finalFlags`` because the runtime
   # validity check is against the flags the ``Regex`` carries.
   result.setLeafGates(buildLeafGates(result.nodes, result.flags))
+  # Same numbering, same flags: an element names its leaf by ``NodeId``.
+  buildSeqRuns(result.nodes, result.flags)

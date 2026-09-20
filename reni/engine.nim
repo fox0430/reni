@@ -261,6 +261,31 @@ type
     gatesLen: int
       ## Slots behind ``gates``, which as an unchecked array carries no bound
       ## of its own; [gateAt] checks an id against this.
+    seqCacheNode: NodeId
+      ## The repeat ``seqCacheElems`` describes, or ``NoNodeId``.  One slot,
+      ## keyed on the node id: the bind that switches trees clears it.
+    seqCacheK: int32 ## Elements behind ``seqCacheElems``.
+    seqCacheElems: array[MaxSeqRunElems, SeqRunElem]
+    seqCacheAccept: array[MaxSeqRunElems, set[uint8]]
+      ## Accept sets under ``boundFlags``.
+    seqCacheUnion: set[uint8] ## Union of those sets; bounds a whole walk.
+    seqRegionFrom: int
+    seqRegionEnd: int
+      ## Stretch walked so far: every byte in ``[seqRegionFrom, seqRegionEnd)``
+      ## is in ``seqRegionUnion``.  ``seqRegionEnd < 0`` means nothing cached.
+      ## Grown across one scan (``sameSubject``); rebuilding per match is
+      ## quadratic on a long run.
+    seqRegionUnion: set[uint8]
+      ## Union the stretch was walked under.  Keyed on the set, not the node.
+    seqRegionDone: bool
+      ## Byte at ``seqRegionEnd`` is known and outside the union.  False when
+      ## the walk stopped at ``subjectEnd`` or ran out of budget.
+    seqRegionHigh: bool
+      ## Terminator is non-ASCII, so no accept set decides it.  Read only
+      ## under ``seqRegionDone``.
+    seqRegionData: pointer
+      ## Buffer the stretch was walked on.  ``releaseBorrowed`` clears
+      ## ``subject``, so ``sameSubject`` is checked against this pointer.
     boundFlags: RegexFlags
       ## The flags ``gates`` was derived under. A scoped ``(?i:...)`` moves
       ## ``ctx.flags`` under a node the compiler already answered, so every
@@ -295,6 +320,7 @@ type
     chSimpleRepeat ## greedy repetition of a single-way leaf: give one rep back
     chLazyScan
       ## lazy repetition of a single-way leaf: scan to the next admissible position
+    chSeqRun ## greedy sequence of leaf runs: hand the next split back
     chUndoState ## roll back to a snapshot, then keep failing
     chUndoSparse ## roll back the scalars and only the groups a body wrote
     chUndoScalars ## roll back everything but the captures, then keep failing
@@ -378,6 +404,16 @@ type
       lsMaxRep: int32
       lsPos: int ## stop position of those reps; the scan only moves forward
       lsScalars: ScalarState ## state at repeat start; see ``srScalars``
+    of chSeqRun:
+      qrNode: NodeId ## the repeat
+      qrCont: ContId
+      qrFramesLen: int32
+      qrIters: int32 ## iterations the current state holds
+      qrPosOff: int32
+        ## Start of this repeat's element ends in ``MatchContext.repPositions``:
+        ## one ``int`` per element per iteration.  A give-back is a decrement.
+      qrRegion: int ## First position no element accepts; carried from [seqRunRegion].
+      qrScalars: ScalarState ## state at repeat start; see ``srScalars``
     of chZeroWidthRep:
       zBody: NodeId
       zCont: ContId
@@ -2947,6 +2983,201 @@ proc retreatToFollowByte(
   while result >= minRep and ctx.subject[start + int(result)] != want:
     dec result
 
+proc ensureRepCap(ctx: MatchContext, n: int) {.inline.} =
+  ## Room for ``n`` entries in ``repPositions``.
+  if n > ctx.repPositions.len:
+    ctx.repPositions.setLen(max(16, max(n, ctx.repPositions.len * 2)))
+  if n > ctx.repPeak:
+    ctx.repPeak = n
+
+proc seqRunLoad(ctx: MatchContext, node: Node): int {.inline.} =
+  ## ``node``'s elements and accept sets, in the context's one slot.
+  if ctx.seqCacheNode != node.id:
+    ctx.seqCacheK = int32(seqRunShape(node, ctx.seqCacheElems))
+    # A shape of none would spin: ``j == k`` advances nothing.
+    doAssert ctx.seqCacheK >= 2, "quantSeqOk on a body of fewer than two leaf runs"
+    ctx.seqCacheUnion = {}
+    for j in 0 ..< int(ctx.seqCacheK):
+      ctx.seqCacheAccept[j] = ctx.gateAt(ctx.seqCacheElems[j].leaf).accept
+      ctx.seqCacheUnion = ctx.seqCacheUnion + ctx.seqCacheAccept[j]
+    ctx.seqCacheNode = node.id
+  int(ctx.seqCacheK)
+
+proc seqRunRegion(ctx: MatchContext, node: Node): int {.noinline.} =
+  ## First position at or after ``ctx.pos`` that no element of ``node``
+  ## accepts, or -1 when this cannot answer (non-ASCII terminator, or the
+  ## step budget ended the walk).  Grows [MatchContext.seqRegionEnd]
+  ## rather than rewalking; a give-back reuses the stretch on the ``Choice``.
+  discard ctx.seqRunLoad(node)
+  let start = ctx.pos
+  let stop = ctx.subjectEnd
+  if ctx.seqRegionEnd < 0 or ctx.seqCacheUnion != ctx.seqRegionUnion or
+      start > ctx.seqRegionEnd:
+    ctx.seqRegionUnion = ctx.seqCacheUnion
+    ctx.seqRegionFrom = start
+    ctx.seqRegionEnd = start
+    ctx.seqRegionDone = false
+  elif start < ctx.seqRegionFrom:
+    var p = start
+    while p < ctx.seqRegionFrom and ctx.subject[p].uint8 in ctx.seqRegionUnion:
+      inc p
+    if p < ctx.seqRegionFrom:
+      # A terminator between the two: this start reaches a shorter stretch.
+      ctx.seqRegionFrom = start
+      ctx.seqRegionEnd = p
+      ctx.seqRegionDone = true
+      ctx.seqRegionHigh = ctx.subject[p].uint8 >= 0x80'u8
+    else:
+      ctx.seqRegionFrom = start
+  if not ctx.seqRegionDone and ctx.seqRegionEnd < stop:
+    # Only as far as this attempt and the budget can pay for.  Stopping
+    # early leaves the memo short, never wrong.
+    var lim = stop
+    let budget = ctx.stepLimit - ctx.steps
+    if budget < stop - ctx.seqRegionEnd:
+      lim = ctx.seqRegionEnd + budget
+    var p = ctx.seqRegionEnd
+    while p < lim and ctx.subject[p].uint8 in ctx.seqRegionUnion:
+      inc p
+    ctx.seqRegionEnd = p
+    if p < lim:
+      ctx.seqRegionDone = true
+      ctx.seqRegionHigh = ctx.subject[p].uint8 >= 0x80'u8
+    elif p < stop:
+      # Budget ended the walk; the general path charges its own steps.
+      return -1
+  if ctx.seqRegionEnd >= stop:
+    # Window ended first; stopping there is right whatever the byte.
+    return stop
+  if ctx.seqRegionHigh:
+    return -1
+  ctx.seqRegionEnd
+
+template seqRunScan(
+    ctx: MatchContext, accept: set[uint8], pos, region, emax: untyped
+): int =
+  ## Repetitions of one element from ``pos``, capped by ``emax`` and the
+  ## region.  Charges one step each; may stop one byte past the budget, as
+  ## [leafRunSpan] does.  Step counts are not the general path's: a budget
+  ## bounds work, not the match, so this only ever relaxes it.
+  block:
+    var lim = region
+    if emax >= 0 and pos + emax < lim:
+      lim = pos + emax
+    let budget = ctx.stepLimit - ctx.steps
+    if budget < lim - pos:
+      lim = pos + budget + 1
+    var p = pos
+    while p < lim and ctx.subject[p].uint8 in accept:
+      inc p
+    let n = p - pos
+    if n > 0:
+      ctx.steps += n
+      if ctx.steps > ctx.stepLimit:
+        raise newException(RegexLimitError, "match step limit exceeded")
+    n
+
+proc seqRunAdvance(
+    ctx: MatchContext, node: Node, region, posOff: int, iters: var int, resume: bool
+): bool {.noinline.} =
+  ## Next state of a ``quantSeqOk`` repeat, or false when none remain.
+  ## ``ctx.pos`` is the repeat's start on entry (caller restored the snapshot)
+  ## and the state's end on exit; ``iters`` is the iteration count both ways.
+  ## ``resume`` asks for the state after the one ``iters`` holds.
+  ##
+  ## States match the general path's order: a depth-first walk, not an
+  ## odometer.  For ``(?:A+B+){n,}`` the general stack is, bottom to top,
+  ## ``Q(0) D(0,A) D(0,B) Q(1) ...``; popping from ``n`` iterations gives
+  ## back inside iteration ``n-1`` (rightmost first), then ``Q(n-1)``.  A
+  ## give-back re-runs everything to its right, so the next state can be
+  ## longer.  Each repetition is one ASCII byte, so a give-back decrements
+  ## the element end in ``repPositions`` from ``posOff``.
+  let k = ctx.seqRunLoad(node)
+  var emin: array[MaxSeqRunElems, int]
+  var emax: array[MaxSeqRunElems, int]
+  var eposs: array[MaxSeqRunElems, bool]
+  for j in 0 ..< k:
+    emin[j] = int(ctx.seqCacheElems[j].emin)
+    emax[j] = int(ctx.seqCacheElems[j].emax)
+    eposs[j] = ctx.seqCacheElems[j].eposs
+  let qmin = node.quantMin
+  let qmax = node.quantMax
+  let start = ctx.pos
+  let lead = ctx.leadRun
+  var i = 0
+  var j = 0
+  var pos = start
+  var back = resume
+  if resume:
+    if iters == 0:
+      # Nothing under a zero-iteration state to give back.
+      return false
+    i = iters - 1
+    j = k - 1
+  else:
+    iters = 0
+    if qmax == 0:
+      # ``{0}`` admits no iteration; filling 0 would consume one sequence.
+      ctx.repLen = posOff
+      return qmin <= 0
+    ensureRepCap(ctx, posOff + k)
+  while true:
+    if back:
+      if j < 0:
+        # Iteration ``i`` has nothing left: stop the repeat there (``Q(i)``).
+        if i >= qmin:
+          iters = i
+          ctx.pos =
+            if i == 0:
+              start
+            else:
+              ctx.repPositions[posOff + i * k - 1]
+          ctx.repLen = posOff + i * k
+          return true
+        # Below the minimum, ``Q(i)`` fails and the pop continues.  On
+        # ``(?:\w+\s*){2,}`` vs "aa", the second iteration exists only once
+        # the first gives a byte back.
+        if i == 0:
+          return false
+        dec i
+        j = k - 1
+      let idx = posOff + i * k + j
+      let lo =
+        if i == 0 and j == 0:
+          start
+        else:
+          ctx.repPositions[idx - 1]
+      if not eposs[j] and ctx.repPositions[idx] - lo > emin[j]:
+        dec ctx.repPositions[idx]
+        pos = ctx.repPositions[idx]
+        inc j
+        back = false
+      else:
+        dec j
+    elif j == k:
+      # Iteration complete; one element consumes, so it moved.
+      inc i
+      iters = i
+      if qmax >= 0 and i >= qmax:
+        ctx.pos = pos
+        ctx.repLen = posOff + i * k
+        return i >= qmin
+      j = 0
+      ensureRepCap(ctx, posOff + (i + 1) * k)
+    else:
+      let n = ctx.seqRunScan(ctx.seqCacheAccept[j], pos, region, emax[j])
+      if n < emin[j]:
+        # Nothing here: give back to the left, or drop the iteration.
+        back = true
+        dec j
+      else:
+        pos += n
+        ctx.repPositions[posOff + i * k + j] = pos
+        if i == 0 and j == 0 and ctx.leadRunEnd < 0 and ctx.seqCacheElems[0].elem == lead:
+          # First visit to the leading repeat; the skip reads this end.
+          ctx.leadRunEnd = pos
+        inc j
+
 proc runMachine(
     ctx: MatchContext, startNode: Node, startCont: ContId, startMode = mMatch
 ): bool =
@@ -3364,7 +3595,34 @@ proc runMachine(
               )
               mode = mCont
           else:
-            startGreedy(body, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure)
+            # Sequence of leaf runs: one choice of byte scans.  Off when
+            # flags have moved under the derivation.
+            var seqTaken = false
+            if node.quantSeqOk and ctx.gates != nil and ctx.flags == ctx.boundFlags:
+              let region = ctx.seqRunRegion(node)
+              if region >= 0:
+                seqTaken = true
+                let scalars = saveScalars(ctx)
+                let posOff = ctx.repLen
+                var iters = 0
+                if ctx.seqRunAdvance(node, region, posOff, iters, false):
+                  ctx.pushChoice Choice(
+                    kind: chSeqRun,
+                    qrNode: node.id,
+                    qrCont: cont,
+                    qrFramesLen: ctx.framesLen.int32,
+                    qrIters: int32(iters),
+                    qrPosOff: int32(posOff),
+                    qrRegion: region,
+                    qrScalars: scalars,
+                  )
+                  mode = mCont
+                else:
+                  restoreScalars(ctx, scalars)
+                  ctx.repLen = posOff
+                  mode = mFail
+            if not seqTaken:
+              startGreedy(body, int32(qmin), int32(qmax), 0, cont, node.quantBodyPure)
         of qkLazy:
           let body {.cursor.} = node.quantBody
           let nextLeaf {.cursor.} = node.quantNextLeaf
@@ -4108,6 +4366,21 @@ proc runMachine(
         else:
           ctx.choicesLen = top
           mode = mFail
+      of chSeqRun:
+        # Scalars first: the machine reads the repeat start from ``ctx.pos``.
+        restoreScalars(ctx, ctx.choices[top].qrScalars)
+        let seqNode {.cursor.} = ctx.nodeAt(ctx.choices[top].qrNode)
+        let posOff = int(ctx.choices[top].qrPosOff)
+        var iters = int(ctx.choices[top].qrIters)
+        if ctx.seqRunAdvance(seqNode, ctx.choices[top].qrRegion, posOff, iters, true):
+          ctx.choices[top].qrIters = int32(iters)
+          ctx.framesLen = ctx.choices[top].qrFramesLen
+          cont = ctx.choices[top].qrCont
+          mode = mCont
+        else:
+          ctx.repLen = posOff
+          ctx.choicesLen = top
+          mode = mFail
       of chQuantGreedy:
         rollBackQuant(top)
         ctx.framesLen = ctx.choices[top].qcFramesLen
@@ -4405,8 +4678,11 @@ proc resetForRegex(
     regex: ptr Regex,
     stepLimit: int,
     maxRecursionDepth: int,
+    sameSubject: bool = false,
 ) =
   ## Reset per-regex buffers, reusing ``ctx``'s existing seq capacity.
+  ## ``sameSubject`` keeps subject-keyed memos when ``subject`` is the string
+  ## the last search ran over; the buffer pointer is checked too.
   ## ``regex`` is borrowed, so every caller passes the address of its own
   ## parameter, never of a local that dies before the match runs.
   ##
@@ -4431,6 +4707,8 @@ proc resetForRegex(
     ctx.leadLeafOff = false
     ctx.leadLeafCool = 0
     ctx.trackCaptureStacks = regex[].levelBackrefs
+    # Node ids name slots in this tree only; so does the cache keyed on one.
+    ctx.seqCacheNode = NoNodeId
     ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
     # Only single-way leaves qualify; pin the compile-time guarantee.
     assert regex[].leadLeaf == nil or isSingleWayLeaf(ctx, regex[].leadLeaf)
@@ -4451,6 +4729,10 @@ proc resetForRegex(
       ctx.captureStacks.setLen(capCount)
   ctx.lookLimit = NoLookLimit
   ctx.anchorEnd = subject.len
+  # Subject-keyed: honour ``sameSubject`` only while the buffer pointer matches.
+  if not sameSubject or ctx.seqRegionData != cast[pointer](ctx.subject.data):
+    ctx.seqRegionEnd = -1
+  ctx.seqRegionData = cast[pointer](ctx.subject.data)
   ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
   ctx.maxRecursionDepth = maxRecursionDepth
   # Reset the per-search counters that used to be zero-initialized by
@@ -4554,10 +4836,13 @@ proc searchImplInto*(
     start: int = 0,
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    sameSubject: bool = false,
 ) =
   ## In-place variant of ``searchImpl``: writes into ``m``, reusing
   ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
-  ## ``ctx`` must be caller-owned and single-threaded.
+  ## ``ctx`` must be caller-owned and single-threaded.  ``sameSubject`` is
+  ## for a scan whose next attempt runs over the same string; it is passed
+  ## on to ``resetForRegex``.
   defer:
     releaseBorrowed(ctx)
   let findLongest = rfFindLongest in regex.flags
@@ -4576,7 +4861,9 @@ proc searchImplInto*(
   if rbValid and indexOfByte(subject, start, rbByte) < 0:
     noteScratchUsage(ctx)
     return
-  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
+  resetForRegex(
+    ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth, sameSubject
+  )
   let fc = regex.firstCharInfo
   # A case-sensitive literal prefix is looked for as raw bytes, the way
   # Oniguruma's exact-string optimization does, so every byte offset is a

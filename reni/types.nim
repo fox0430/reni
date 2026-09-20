@@ -235,6 +235,16 @@ type
     ##
     ## ``distinct`` for the reason [NameRefs] gives.
 
+  SeqRunElem* = object
+    ## **Internal API.** One element of a sequence-of-leaf-runs body; see
+    ## ``Node.quantSeqOk`` and [seqRunShape].  ``elem`` is as written (the
+    ## quantifier, or the leaf itself); ``leaf`` is the leaf under it.
+    elem*: NodeId
+    leaf*: NodeId
+    emin*: int32
+    emax*: int32 ## -1 = unbounded
+    eposs*: bool ## possessive: take the run, never give a byte back
+
   Node* {.acyclic.} = ref object
     ## **Internal API.** Fields are exported only so `compiler` and `engine`
     ## can walk the tree. The shape may change without notice, and mutating
@@ -304,6 +314,11 @@ type
         ## quantifier needs no per-iteration capture snapshot.  The default
         ## ``false`` is the safe value, so a node the pass never visits
         ## degrades to "always snapshot", never to "never".
+      quantSeqOk*: bool
+        ## Raised by ``buildSeqRuns``: the body is a sequence of leaf runs
+        ## that an ASCII byte set decides, so the matcher scans the whole
+        ## repeat as one choice.  Derived under ``Regex.flags``; a reader
+        ## checks those flags have not moved, as for a [LeafGate].
       quantFollowByte*: int16 = -1
         ## Set by ``annotateContinuations``: the ASCII byte the continuation
         ## must have where a give-back hands it the position, or -1 where it
