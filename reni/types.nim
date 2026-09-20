@@ -824,6 +824,17 @@ type
     byte*: uint8
     offset*: int ## Byte length of the literal; positive whenever ``valid``.
 
+  LeafGate* = object
+    ## What a repeat entry needs to know about its body: whether it matches at
+    ## most one way -- which lets a greedy repeat scan forward, one int a
+    ## repetition -- and which ASCII bytes a run of it consumes.  Neither asks
+    ## about the position, so both are derived once per pattern; a reader whose
+    ## flags have left ``Regex.flags`` answers the long way instead.
+    accept*: set[uint8] ## Bytes a run consumes, meaningful while ``runnable``.
+    singleWay*: bool
+    runnable*: bool
+    graphemeDep*: bool ## ``.`` alone: the answers hold while grapheme mode is off.
+
   Regex* = object
     pattern: string
     ast: Node
@@ -832,6 +843,10 @@ type
       ## ``nil``.  The matcher's stacks name a node by its index here rather
       ## than holding it, which is what keeps those entries plain data.  Built
       ## by ``initRegex``, so a ``Regex`` cannot exist with the two out of step.
+    leafGates: seq[LeafGate]
+      ## One entry per ``NodeId``, derived under ``flags`` when the pattern
+      ## compiled; see [LeafGate].  Empty on a ``Regex`` assembled without it,
+      ## which only costs the matcher the derivation it does anyway.
     flags: RegexFlags
       ## The flags the pattern was compiled under.  Read through the `flags`
       ## accessor, which carries the reason this is not a public field.
@@ -913,6 +928,16 @@ proc flags*(r: Regex): RegexFlags {.inline.} =
 proc nodes*(r: Regex): lent seq[Node] {.inline.} =
   ## **Internal API.** The node table [NodeId]s index; see ``Regex.nodes``.
   r.nodes
+
+proc leafGates*(r: Regex): lent seq[LeafGate] {.inline.} =
+  ## **Internal API.** Per-node repeat-entry answers; see ``Regex.leafGates``.
+  r.leafGates
+
+proc setLeafGates*(r: var Regex, gates: sink seq[LeafGate]) {.inline.} =
+  ## **Internal API.** Fill in [LeafGate]s.  Not ``initRegex``'s business: it
+  ## needs the node table that constructor builds, and fold tables it must not
+  ## depend on.
+  r.leafGates = gates
 
 proc nameRefCount*(r: Regex, refs: NameRefs): int32 {.inline.} =
   ## **Internal API.** How many capture groups ``refs`` names.

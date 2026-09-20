@@ -1,6 +1,6 @@
 import std/[algorithm, tables, sets, unicode]
 
-import types, unicode_utils, parser
+import types, unicode_utils, parser, leafgate
 
 proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
   ## When named captures exist, convert unnamed nkCapture to nkGroup
@@ -2310,7 +2310,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       nil
     else:
       leadFirstLeaf(ast, finalFlags)
-  initRegex(
+  result = initRegex(
     pattern = pattern,
     ast = ast,
     flags = finalFlags,
@@ -2337,3 +2337,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     leadRepeat = leadRepeat,
     leadBehind = leadBehindLiteral(ast, finalFlags),
   )
+  # After the constructor, which numbers the tree the table indexes.  Derived
+  # under ``result.flags`` rather than ``finalFlags`` because the runtime
+  # validity check is against the flags the ``Regex`` carries.
+  result.setLeafGates(buildLeafGates(result.nodes, result.flags))
