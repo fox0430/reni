@@ -271,12 +271,22 @@ type
     of nkCapture:
       captureIndex*: int
       captureBody*: Node
+      captureBodyKeepsFlags*: bool
+        ## ``groupBodyKeepsFlags`` for a capturing group: the matcher skips
+        ## only the ``chUndoFlags`` push, since the frame carries the span.
     of nkNamedCapture:
       captureName*: string
       namedCaptureIndex*: int
       namedCaptureBody*: Node
+      namedCaptureBodyKeepsFlags*: bool
+        ## ``captureBodyKeepsFlags`` for the named spelling.
     of nkGroup:
       groupBody*: Node
+      groupBodyKeepsFlags*: bool
+        ## Raised by ``markGroupBodyKeepsFlags``: nothing in ``groupBody`` can
+        ## write ``ctx.flags``, so the matcher steps straight into it instead
+        ## of saving them, pushing a ``ckGroup`` frame and restoring them on
+        ## the way out.  The default ``false`` is the safe value.
     of nkFlagGroup:
       flagsOn*: RegexFlags
       flagsOff*: RegexFlags
