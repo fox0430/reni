@@ -2491,6 +2491,43 @@ suite "the first-byte hint is a superset of what can start a match":
       checkpoint("pattern=" & pat & " dropped=" & report(bad))
       check bad.len == 0
 
+  test "skipping a one-byte stretch lands where the chain walk does":
+    # [advanceChainTo] skips ahead over bytes whose ``encLen`` is 1 instead of
+    # stepping them.  That is an equivalence, not a heuristic, so sweep every
+    # ``(start, target)`` pair of subjects drawn from every lead-byte class --
+    # lone continuations, overlongs and truncated sequences included -- against
+    # the byte-at-a-time walk.  ``tools/probe_c40_chain.nim`` runs the same
+    # sweep over far more random subjects.
+    const Pieces = [
+      "a", "\n", " ", "0", "\xC3\xA9", "\xE3\x81\x82", "\xF0\x9F\x98\x80", "\xC0",
+      "\x80", "\xF4", "\xE0\xA0", "\xFF",
+    ]
+    var subjects = @[
+      "", "abcdefghijklmnopqrstuvwxyz0123456789", "abc\xC3\xA9def\n",
+      "aaaaaaaaaaaa\xE3\x81\x82\naaaaaaaaaaaaaa", "abcdefghij\xF0\x9F\x98\x80\n",
+      "abcdefgh\xF0\x9F\n", "\xC0\x80abcdefghijkl", "abc\xF4\x8F\xBF\xBFxyz",
+      "\x80\x80\x80abcdefghijklmno",
+    ]
+    for head in Pieces:
+      for tail in Pieces:
+        subjects.add(head & "aaaaaaaa" & tail)
+        subjects.add(head & tail & "a")
+    var bad: seq[string]
+    for subject in subjects:
+      for start in 0 .. subject.len:
+        for target in -2 .. subject.len + 2:
+          var walked = start
+          while walked < target and walked < subject.len:
+            walked = nextScanPos(subject, walked)
+          let skipped = advanceChainTo(subject, start, target, false)
+          if skipped != walked:
+            bad.add(
+              escape(subject) & " start=" & $start & " target=" & $target & " walk=" &
+                $walked & " skip=" & $skipped
+            )
+    checkpoint("diverged=" & report(bad))
+    check bad.len == 0
+
   test "the scan reaches the same first position a sweep does":
     # End to end, so a hint wrong for a reason other than the class bitmap
     # shows up too.  The sweep steps with [nextScanPos] rather than a rule of
