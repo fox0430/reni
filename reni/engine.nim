@@ -602,14 +602,59 @@ proc rightAdjustCharHead(s: string, p: int): int {.inline.} =
   else:
     p
 
-proc advanceChainTo(s: string, start, target: int, byteScan: bool): int {.inline.} =
+proc isLeadByte(b: uint8): bool {.inline.} =
+  ## Whether ``b`` is at or above 0xC0, the boundary the chain walk has no
+  ## choice below: ``encLen`` answers 1 for every byte under it -- ASCII, but
+  ## stray continuation bytes too -- which is why it is not 0x80. A superset
+  ## of the true multi-byte leads: 0xF5..0xFF answer true here yet have
+  ## ``encLen`` 1, which only costs them the slow branch.
+  (b and 0xC0'u8) == 0xC0'u8
+
+proc firstLeadByte(s: string, first, last: int): int {.noinline.} =
+  ## Index of the first byte at or above 0xC0 in ``[first, last)``, or ``last``
+  ## when there is none. That index need not start a multi-byte character --
+  ## see ``isLeadByte``. A machine word at a time: shifting left by one lines
+  ## each byte's 0x40 bit up with its 0x80 bit, so a byte survives the mask
+  ## exactly when both are set. ``noinline`` is measured: inlined it shifts
+  ## gcc's inlining budget for the module and costs two items that never call
+  ## it +0.70% and +0.17% ``Ir``.
+  const HighBits = 0x8080808080808080'u64
+  var i = first
+  while i + 8 <= last:
+    var w: uint64
+    copyMem(addr w, unsafeAddr s[i], 8)
+    if (w and (w shl 1) and HighBits) != 0'u64:
+      break
+    i += 8
+  while i < last:
+    if isLeadByte(s[i].uint8):
+      return i
+    inc i
+  last
+
+proc advanceChainTo*(s: string, start, target: int, byteScan: bool): int {.inline.} =
   ## First scan position at/after ``target`` reachable from ``start``. Byte
-  ## scans jump directly; char scans walk the ``encLen`` chain.
+  ## scans jump directly; char scans walk the ``encLen`` chain, but skip the
+  ## stretches where it has no choice -- see ``isLeadByte`` -- because there
+  ## the walk lands on the stretch's end exactly. Malformed UTF-8 is untouched
+  ## -- a truncated or overlong sequence steps by its declared length, past
+  ## ``target`` if that is where it lands, and is still stepped one character
+  ## at a time. Exported so the equivalence probe and the internals test drive
+  ## this walk rather than a copy of it.
   if byteScan:
     return clamp(target, start, s.len)
   result = start
-  while result < target and result < s.len:
-    result = nextScanPos(s, result)
+  let stop = min(target, s.len)
+  while result < stop:
+    # A lead byte is its own answer; skipping only pays where ASCII runs, and
+    # calling out for it on every character costs a dense non-ASCII subject.
+    if isLeadByte(s[result].uint8):
+      result = nextScanPos(s, result)
+      continue
+    let h = firstLeadByte(s, result, stop)
+    if h >= stop:
+      return stop
+    result = nextScanPos(s, h)
 
 proc regionStopHolds(s: string, l: int, prefix: set[uint8]): bool {.inline.} =
   ## Whether walk-back stop ``l`` holds. False inside a character or on a
