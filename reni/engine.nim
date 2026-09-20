@@ -3243,10 +3243,13 @@ proc runMachine(
             node = node.alternatives[first]
             mode = mMatch
       of nkGroup:
-        # Groups save/restore flags — isolated flag groups inside don't leak out
-        ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
-        cont =
-          pushFrame(ctx, Frame(kind: ckGroup, parent: cont, grpSavedFlags: ctx.flags))
+        # Groups save/restore flags — isolated flag groups inside don't leak
+        # out.  A body with no writer of them makes all three a no-op, so the
+        # group is a pass-through (``groupBodyKeepsFlags``).
+        if not node.groupBodyKeepsFlags:
+          ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
+          cont =
+            pushFrame(ctx, Frame(kind: ckGroup, parent: cont, grpSavedFlags: ctx.flags))
         node = node.groupBody
         mode = mMatch
       of nkFlagGroup:
@@ -3278,7 +3281,14 @@ proc runMachine(
           if node.kind == nkCapture: node.captureIndex else: node.namedCaptureIndex
         let body {.cursor.} =
           if node.kind == nkCapture: node.captureBody else: node.namedCaptureBody
-        ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
+        let keepsFlags =
+          if node.kind == nkCapture:
+            node.captureBodyKeepsFlags
+          else:
+            node.namedCaptureBodyKeepsFlags
+        # As ``nkGroup`` above, but the frame carries the span and stays.
+        if not keepsFlags:
+          ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
         # Capture recursion depth at entry time (before continuations modify it)
         let myDepth =
           if index < ctx.groupRecursionDepth.len:

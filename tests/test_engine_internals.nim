@@ -2554,3 +2554,68 @@ suite "the first-byte hint is a superset of what can start a match":
           bad.add("0x" & toHex(b) & " sweep=" & $sweep & " scan=" & $scanned)
       checkpoint("pattern=" & pat & " diverged=" & report(bad))
       check bad.len == 0
+
+suite "a group whose body cannot change the flags":
+  # ``markGroupBodyKeepsFlags`` decides per group node whether the matcher may
+  # skip the flag save around the body.  The bit is wrong in one direction
+  # only: "keeps" where something below writes ``ctx.flags`` leaks a ``(?i)``
+  # past the group.
+  proc groupBits(pattern: string): seq[bool] =
+    ## Every group node's annotation, outermost first.  The compiler folds a
+    ## redundant nested ``(?:...)`` away before the pass runs, so the patterns
+    ## below are written to keep the groups they name.
+    proc walk(n: Node, acc: var seq[bool]) =
+      if n == nil:
+        return
+      case n.kind
+      of nkGroup:
+        acc.add(n.groupBodyKeepsFlags)
+      of nkCapture:
+        acc.add(n.captureBodyKeepsFlags)
+      of nkNamedCapture:
+        acc.add(n.namedCaptureBodyKeepsFlags)
+      else:
+        discard
+      for c in n.childNodes:
+        walk(c, acc)
+
+    walk(re(pattern).ast, result)
+
+  test "a body with no flag writer is annotated":
+    check groupBits(r"(?:\w+\s+)") == @[true]
+    check groupBits(r"(?:abc|def)+") == @[true]
+    check groupBits(r"(?:(a)\1)") == @[true, true]
+    check groupBits(r"(?:(?=a)a|\bb)") == @[true]
+    # Both capturing spellings carry the same bit.
+    check groupBits(r"(\w+)\s*=\s*(\w+)") == @[true, true]
+    check groupBits(r"(?<n>\w+)") == @[true]
+
+  test "a flag writer anywhere below clears the bit":
+    # Both spellings, at the top of the body and buried under a quantifier,
+    # an alternation and a lookaround.
+    check groupBits(r"(?:(?i)a)") == @[false]
+    check groupBits(r"(?:(?i:a))") == @[false]
+    check groupBits(r"(?:(a(?i)b)*)") == @[false, false]
+    check groupBits(r"(?:x|(?i)y)") == @[false]
+    check groupBits(r"(?:(?=(?i)a)b)") == @[false]
+    check groupBits(r"(?<n>(?i)\w+)") == @[false]
+
+  test "a subexp call clears the bit wherever it appears":
+    # The callee is never walked, so a call is taken to write the flags
+    # whatever it resolves to -- even where the callee plainly does not.
+    check groupBits(r"(a(?i)b)(?:\g<1>)") == @[false, false]
+    check groupBits(r"(ab)(?:\g<1>)") == @[true, false]
+
+  test "an isolated (?i) still stops at the group that holds it":
+    # What the annotation must not break: the ``(?i)`` reaches the rest of the
+    # body and nothing after it.
+    check search("aB", re(r"(?:a(?i)b)")).matchSpan == 0 .. 2
+    check search("ab", re(r"(?:a(?i))b")).matchSpan == 0 .. 2
+    check not search("ab", re(r"(?:a(?i))B")).found
+    check not search("aBb", re(r"(?:a(?i)b)B")).found
+
+  test "the group a backtrack re-enters restores the flags it began with":
+    # ``x`` fails and the alternation retries ``AB`` under the flags the group
+    # began with, not the ones its body switched on.
+    check search("aBAB", re(r"(?:(?i)ab)(?:x|AB)")).matchSpan == 0 .. 4
+    check not search("abab", re(r"(?:(?i)ab)(?:x|AB)")).found

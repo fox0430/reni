@@ -692,6 +692,31 @@ proc markQuantBodyPure(node: Node): bool =
   else:
     discard
 
+proc markGroupBodyKeepsFlags(node: Node): bool =
+  ## Records on every group node -- ``nkGroup`` and both capturing spellings --
+  ## whether anything below it can write ``ctx.flags``.  Returns that verdict
+  ## for ``node``'s own subtree; the flag on the node is its negation.
+  ##
+  ## Only ``nkFlagGroup`` writes them, and ``nkSubexpCall``, which enters a
+  ## body this walk never sees and so counts conservatively.
+  if node == nil:
+    return false
+  result = node.kind in {nkFlagGroup, nkSubexpCall}
+  for child in node.childNodes:
+    if markGroupBodyKeepsFlags(child):
+      result = true
+  # A group node writes nothing itself, so the OR over its children is its
+  # body's verdict.
+  case node.kind
+  of nkGroup:
+    node.groupBodyKeepsFlags = not result
+  of nkCapture:
+    node.captureBodyKeepsFlags = not result
+  of nkNamedCapture:
+    node.namedCaptureBodyKeepsFlags = not result
+  else:
+    discard
+
 proc sameFirstChar(a, b: FirstCharInfo): bool =
   ## Structural equality for two hints.  Spelled out because ``FirstCharInfo``
   ## is a case object, for which Nim generates no ``==``.
@@ -2271,6 +2296,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
   discard markQuantBodyPure(ast)
+  # Same rule: a node this pass never reaches keeps the flag save.
+  discard markGroupBodyKeepsFlags(ast)
   # ``p.currentFlags`` only carries the isolated ``(?L)`` spelling: scoped
   # groups restore ``p.flags`` on exit. A scoped ``(?L:...)`` that spans the
   # whole pattern is the same global option, so lift it from the AST.
