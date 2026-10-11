@@ -1106,6 +1106,9 @@ proc validateLeadingOnlyPosition*(p: Parser, root: Node) =
 proc parseNamedCapture(p: var Parser, closeChar: char): Node =
   ## Parse a named capture group. `closeChar` is '>' for (?<name>...) and
   ## '\'' for (?'name'...) and '>' for (?P<name>...).
+  ##
+  ## As in Oniguruma, a name starts with a word character other than an ASCII
+  ## digit, so a reference to it is never taken for a group number.
   var name = ""
   while p.peek != closeChar and not p.atEnd:
     name.add(p.peek)
@@ -1113,6 +1116,10 @@ proc parseNamedCapture(p: var Parser, closeChar: char): Node =
   if name.len == 0:
     p.error("empty group name")
   p.expect(closeChar)
+  if name[0] in {'0' .. '9', '-', '+'}:
+    p.error("invalid group name <" & name & ">")
+  if not isWordChar(name.runeAt(0), asciiOnly = false):
+    p.error("invalid char in group name <" & name & ">")
   let idx = p.captureCount
   inc p.captureCount
   inc p.captureDepth

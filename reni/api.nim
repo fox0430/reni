@@ -469,6 +469,79 @@ iterator findAll*(
   while scanNext(sc, ctx, subject, regex, m):
     yield m
 
+func groupNumber(s: string, a, b: int, captureCount: int): int =
+  ## The group the digits ``s[a ..< b]`` number, or -1 past the last group or
+  ## when a non-digit is among them.  Once past the last group the reference is
+  ## invalid whatever digits follow, so stop accumulating there: a long run of
+  ## digits would overflow.
+  result = 0
+  for i in a ..< b:
+    if s[i] notin {'0' .. '9'}:
+      return -1
+    if result <= captureCount:
+      result = result * 10 + ord(s[i]) - ord('0')
+  if result > captureCount:
+    result = -1
+
+type TemplatePart = object
+  ## Literal text, then the group to write after it, or -1 for none.
+  text: string
+  group: int
+
+proc parseTemplate(repl: string, regex: Regex): seq[TemplatePart] =
+  ## Split a ``replace`` template into literal text and group references once,
+  ## before the scan, so an invalid reference raises whether or not the subject
+  ## matches.
+  var text = ""
+  var i = 0
+  while i < repl.len:
+    if repl[i] == '$' and i + 1 < repl.len:
+      i += 1
+      if repl[i] == '$':
+        text.add '$'
+        i += 1
+      elif repl[i] in {'0' .. '9'}:
+        # Support multi-digit: $12 etc.
+        let start = i
+        while i < repl.len and repl[i] in {'0' .. '9'}:
+          i += 1
+        let n = groupNumber(repl, start, i, regex.captureCount)
+        if n < 0:
+          raise newException(
+            RegexError, "invalid replacement reference '$" & repl[start ..< i] & "'"
+          )
+        result.add TemplatePart(text: text, group: n)
+        text = ""
+      elif repl[i] == '{':
+        i += 1
+        var name = ""
+        while i < repl.len and repl[i] != '}':
+          name.add repl[i]
+          i += 1
+        if i >= repl.len:
+          raise newException(RegexError, "unterminated ${...} in replacement string")
+        i += 1 # skip }
+        # A group name cannot start with a digit, so a digit starts a number.
+        let idx =
+          if name.len > 0 and name[0] in {'0' .. '9'}:
+            groupNumber(name, 0, name.len, regex.captureCount)
+          else:
+            captureIndex(regex, name)
+        if idx < 0:
+          raise
+            newException(RegexError, "invalid replacement reference '${" & name & "}'")
+        result.add TemplatePart(text: text, group: idx)
+        text = ""
+      else:
+        text.add '$'
+        text.add repl[i]
+        i += 1
+    else:
+      text.add repl[i]
+      i += 1
+  if text.len > 0:
+    result.add TemplatePart(text: text, group: -1)
+
 proc replace*(
     subject: string,
     regex: Regex,
@@ -477,9 +550,13 @@ proc replace*(
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
 ): string =
-  ## Replace matches with `repl`. Supports $0, $1...$99+, ${name}, $$.
+  ## Replace matches with `repl`. Supports $0, $1...$99+, ${1}, ${name}, $$.
   ## Multi-digit group refs are greedy: $12 means group 12, not group 1 + "2".
   ## Use ${1}2 for group 1 followed by literal "2". count=0 means replace all.
+  ##
+  ## ``$N`` and ``${N}`` number named groups too, though a pattern with named
+  ## groups forbids ``\k<N>``.  An invalid reference raises ``RegexError`` even
+  ## when nothing matches.
   ##
   ## A match replaces what it *reports*, so a ``\K`` leaves what it dropped in
   ## the output.  Where two reports overlap, subject text still passes into the
@@ -495,6 +572,7 @@ proc replace*(
   ## ``replace("aa", re("a\\K"), "-")`` answers ``"a-a-"`` where ``gsub``
   ## answers ``"a-a"``.  See ``MatchScanner``.
   result = ""
+  let parts = parseTemplate(repl, regex)
   var sc = initMatchScanner(
     subject, stepLimit = stepLimit, maxRecursionDepth = maxRecursionDepth
   )
@@ -504,48 +582,11 @@ proc replace*(
   while scanNext(sc, ctx, subject, regex, m):
     let gap = sc.takeGap(m)
     result.add subject[gap.a ..< gap.b]
-    # Process replacement string
-    var i = 0
-    while i < repl.len:
-      if repl[i] == '$' and i + 1 < repl.len:
-        i += 1
-        if repl[i] == '$':
-          result.add '$'
-          i += 1
-        elif repl[i] in {'0' .. '9'}:
-          var n = ord(repl[i]) - ord('0')
-          i += 1
-          # Support multi-digit: $12 etc.
-          while i < repl.len and repl[i] in {'0' .. '9'}:
-            n = n * 10 + ord(repl[i]) - ord('0')
-            i += 1
-          if n > regex.captureCount:
-            raise
-              newException(RegexError, "invalid replacement reference '$" & $n & "'")
-          # Group exists but may not have participated — empty string is correct.
-          result.add captureText(m, n, subject).get("")
-        elif repl[i] == '{':
-          i += 1
-          var name = ""
-          while i < repl.len and repl[i] != '}':
-            name.add repl[i]
-            i += 1
-          if i >= repl.len:
-            raise newException(ValueError, "unterminated ${...} in replacement string")
-          i += 1 # skip }
-          let idx = captureIndex(regex, name)
-          if idx < 0:
-            raise newException(
-              RegexError, "invalid replacement reference '${" & name & "}'"
-            )
-          result.add captureText(m, idx, subject).get("")
-        else:
-          result.add '$'
-          result.add repl[i]
-          i += 1
-      else:
-        result.add repl[i]
-        i += 1
+    for part in parts:
+      result.add part.text
+      if part.group >= 0:
+        # Group exists but may not have participated — empty string is correct.
+        result.add captureText(m, part.group, subject).get("")
     inc replaced
     if count > 0 and replaced >= count:
       break

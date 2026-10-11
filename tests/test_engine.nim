@@ -2599,7 +2599,7 @@ suite "Error handling":
 
 suite "replace edge cases":
   test "replace ${name with missing closing brace":
-    expect ValueError:
+    expect RegexError:
       discard replace("abc", re("(\\w+)"), "${1")
 
   test "replace ${} empty name raises":
@@ -3061,6 +3061,63 @@ suite "replace invalid reference":
   test "numeric reference beyond captureCount raises":
     expect RegexError:
       discard replace("abc", re("(\\w+)"), "$2")
+
+  test "numeric reference too long for an int raises":
+    # Past high(int): accumulating every digit would overflow.
+    expect RegexError:
+      discard replace("a", re("(a)"), "[$" & "9".repeat(19) & "]")
+    expect RegexError:
+      discard replace("a", re("(a)"), "[$" & "1".repeat(40) & "]")
+
+  test "invalid numeric reference is reported as written":
+    try:
+      discard replace("a", re("(a)"), "$" & "9".repeat(19))
+      fail()
+    except RegexError as e:
+      check ("'$" & "9".repeat(19) & "'") in e.msg
+
+  test "leading zeros in a numeric reference":
+    check replace("a", re("(a)"), "[$0001]") == "[a]"
+    check replace("a", re("(a)"), "[$" & "0".repeat(30) & "1]") == "[a]"
+
+  test "braced numeric reference":
+    check replace("a", re("(a)"), "${1}2") == "a2"
+    check replace("a", re("(a)"), "[${0}]") == "[a]"
+    check replace("a", re("(a)"), "[${01}]") == "[a]"
+    # Named groups are numbered too.
+    check replace("ab", re("(?<x>a)(?<y>b)"), "${2}${1}") == "ba"
+
+  test "braced numeric reference out of range raises":
+    expect RegexError:
+      discard replace("a", re("(a)"), "${2}")
+    expect RegexError:
+      discard replace("a", re("(a)"), "${" & "9".repeat(19) & "}")
+
+  test "invalid braced numeric reference is reported as written":
+    try:
+      discard replace("a", re("(a)"), "${" & "9".repeat(19) & "}")
+      fail()
+    except RegexError as e:
+      check ("'${" & "9".repeat(19) & "}'") in e.msg
+
+  test "braced reference starting with a digit is a number":
+    # No group name starts with a digit, so this is a malformed number.
+    expect RegexError:
+      discard replace("a", re("(a)"), "${1a}")
+    expect RegexError:
+      discard replace("a", re("(?<a>a)"), "${0a}")
+
+  test "invalid reference raises when nothing matches":
+    expect RegexError:
+      discard replace("xyz", re("(a)"), "$2")
+    expect RegexError:
+      discard replace("xyz", re("(a)"), "$" & "9".repeat(30))
+    expect RegexError:
+      discard replace("xyz", re("(a)"), "${2}")
+    expect RegexError:
+      discard replace("xyz", re("(?<n>a)"), "${unknown}")
+    expect RegexError:
+      discard replace("xyz", re("(a)"), "${1")
 
   test "unknown named reference raises":
     expect RegexError:

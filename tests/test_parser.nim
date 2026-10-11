@@ -448,6 +448,29 @@ suite "Step 7: Named captures and backreferences":
   test "named conditional with named capture still works":
     discard re("(a)(?<x>b)(?(<x>)c|d)")
 
+  test "group name starting with a digit or sign raises":
+    # Oniguruma: "invalid group name <2>"
+    for pat in [
+      "(?<2>a)", "(?<01>a)", "(?<1a>a)", "(?<-a>a)", "(?<+a>a)", "(?<-1>a)", "(?'2'a)",
+      "(?P<2>a)",
+    ]:
+      expect RegexError:
+        discard re(pat)
+
+  test "group name starting with a non-word character raises":
+    # Oniguruma: "invalid char in group name <.a>"
+    for pat in ["(?<.a>a)", "(?< a>a)", "(?<·a>a)"]:
+      expect RegexError:
+        discard re(pat)
+
+  test "group name starting with any other word character is accepted":
+    # Only the first character is checked, as in Oniguruma.
+    for pat in [
+      "(?<a1>a)", "(?<_>a)", "(?<_1>a)", "(?<é>a)", "(?<あ>a)", "(?<٣>a)",
+      "(?<²a>a)", "(?<a b>a)", "(?<a-b>a)", "(?<a >a)",
+    ]:
+      discard re(pat)
+
 suite "Step 8: Lookaround":
   test "positive lookahead (?=...)":
     let r = re("a(?=b)")
