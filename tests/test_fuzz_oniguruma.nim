@@ -16,6 +16,19 @@
 ## (``(?=(a)?x*?x).+`` on "qxbxq" is a live example: Oniguruma reports no
 ## match, reni and PCRE2 both report 1..5.)
 ##
+## An engine that gives up has not answered, and casts no vote.  Oniguruma
+## stops at its retry limit (``ONIGERR_RETRY_LIMIT_IN_MATCH_OVER``), PCRE2 at
+## its match, depth and heap limits, and the generator does reach Oniguruma's.
+## Read as "no match", that error would be a vote nobody cast: against reni it
+## would make a quorum with PCRE2, and with reni it would count as an
+## agreement.  So when Oniguruma gives up and reni answers, the case is put to
+## PCRE2 alone.  It is counted apart from ``compared``, and a disagreement is
+## printed in a list of its own, where ordinary disputes cannot crowd it out.
+## One that is only the iteration split described next is counted and not
+## printed, so it cannot either.  Nothing fails on one oracle's word.  When
+## reni's step limit stops it too, the case is skipped, like any other that
+## reni does not answer.
+##
 ## One class is disputed even when PCRE2 sides with Oniguruma: the span a
 ## group is left holding after a repetition, when the engines split the same
 ## text into iterations differently.  On ``x(?:(q|\w*?)){0,2}a`` against
@@ -66,37 +79,44 @@
 ## on Nim ``stable`` deliberately, and a corpus that moves with the compiler
 ## would turn a required job red on a release with no change under test.
 ##
-## The default seed is clean; other seeds are not.  At least four shapes are
-## open, all of them older than this file.  A seed named beside a shape is a
-## sweep that prints an instance of it under the corpus described above; where
-## the quoted pattern is not the one that sweep prints, it is a hand-reduced
-## case that still diverges on its own.
+## The default seed is clean; other seeds are not.  Two shapes are open, both
+## older than this file.  Each case quoted for them diverges on its own, with
+## Oniguruma 6.9.10 and PCRE2 10.49 giving the same answer against reni:
 ##
 ## * an atomic group over a possessive body, where reni gives up a match the
 ##   other two engines find -- ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on
-##   "abqq" answers 0..1 here and 0..4 there; ``RENI_FUZZ_SEED=424242
-##   RENI_FUZZ_SEEDS=24`` reaches the shape as
+##   "abqq" answers 0..1 here and 0..4 there, and
 ##   ``b((([ab])a*+|a*?)(\3.*?(?>ab*q)|a\w(?>x\w++x))*?|a*?\2\w+){0,2}a`` on
-##   "bxbaba", 2..4 here and 0..6 there;
-## * a conditional or backreference naming a group that the repetition around
-##   it writes, where reni matches and both oracles do not -- the generator
-##   avoids this deliberately (see ``Gen.closed``) but a nested quantifier can
-##   still reach it (``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax", from
-##   ``RENI_FUZZ_SEED=20250101 RENI_FUZZ_SEEDS=24``);
-## * the same disagreement with the backreference standing *after* the
-##   repetition that writes the group rather than inside it -- the case
-##   ``Gen.closed`` permits on purpose -- ``(a{0,2}+.*(?:a*?){0,2})*\1a`` on
-##   "aqbbxqx" answers 0..1 here and no match there (the 20250101 sweep
-##   prints this one too);
+##   "bxbaba" 2..4 here and 0..6 there;
 ## * an alternation lookbehind, which reni retries once the continuation after
 ##   it fails where both oracles read the assertion as atomic --
-##   ``(?>baa|b(?<=b|(.))\1)`` on "bbabaa" answers 0..2 here and 3..6 there
-##   (printed by the 20250101 sweep as well; ``RENI_FUZZ_SEED=99991
-##   RENI_FUZZ_SEEDS=24`` reaches the shape as ``((?<=a|(.))\2{0,2}+\w)\2b``
-##   on "aaab", 1..4 here and no match there).
+##   ``(?>baa|b(?<=b|(.))\1)`` on "bbabaa" answers 0..2 here and 3..6 there,
+##   and ``((?<=a|(.))\2{0,2}+\w)\2b`` on "aaab" 1..4 here and no match there.
+##
+## No sweep is named for either: the corpus of none of the ones this list used
+## to name (seeds 424242, 20250101 and 99991, 24 each) holds any of the four
+## patterns.  It also named two more shapes, a backreference to a group that a
+## repetition writes: ``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax" and
+## ``(a{0,2}+.*(?:a*?){0,2})*\1a`` on "aqbbxqx".  Neither is a divergence.
+## Oniguruma gives up on both, and PCRE2 was asked ``{0,2}+`` as a possessive
+## interval; asked what Oniguruma reads, it answers as reni does.
+##
+## A wider sweep also prints cases where PCRE2 sides with Oniguruma and Perl
+## 5.42 with reni.  Sweeping 128 seeds from the default prints three.
+## ``RENI_FUZZ_SEED=20260978 RENI_FUZZ_SEEDS=1`` prints ``(.*?x?){0,2}x\1`` on
+## "axa": 0..2 here and 0..3 there, the iteration split above carried into the
+## match span by a backreference, past what ``onlyIterationSplitSpans``
+## excuses.  ``RENI_FUZZ_SEED=20260960 RENI_FUZZ_SEEDS=1`` prints the same
+## split carried into the group, with
+## ``(?:(b|q*?+){0,2}\1*+a|(?:\w{1,3}(?:b{0,2}qb)?)b*?+\Kx)\K`` on "qqqqaaq";
+## it reduces to ``(q*?){0,2}\1*a`` on "qqqqa", where group 1 holds 1..2 here,
+## in Perl and in Python, and 0..1 there.
+## ``RENI_FUZZ_SEED=20261033 RENI_FUZZ_SEEDS=1`` prints
+## ``^((?:(?!bxx)(?=ba\w)\Kb+\K|q)*(a{0,2})\K(?:(\2?)|(\3\K\3\Kb)){0,2}\K)q``
+## on "bq": no match here and 1..2 there.  It has not been reduced.
 ##
 ## So a red run is not automatically a new bug: read the divergence it prints
-## against the four above before suspecting the change under test.
+## against the cases above before suspecting the change under test.
 
 ## Building this links against Oniguruma and PCRE2, which the rest of
 ## ``tests/`` does not, so it is opt-in: without ``-d:reniFuzzDiff`` the file
@@ -179,6 +199,30 @@ else:
           fallback
       )
 
+  type Spelling = object
+    ## A generated pattern as each engine is asked it.  reni and Oniguruma
+    ## read ``onig``; PCRE2 gets the same pattern spelled the way its own
+    ## syntax reads what Oniguruma reads, which differs only where
+    ## ``quantified`` says.  The generator writes both as it goes, since it is
+    ## the one place that knows where each quantifier and its operand are.
+    onig, pcre2: string
+
+  proc both(s: string): Spelling =
+    ## ``s``, which the two syntaxes read alike.
+    Spelling(onig: s, pcre2: s)
+
+  proc `&`(a, b: Spelling): Spelling =
+    Spelling(onig: a.onig & b.onig, pcre2: a.pcre2 & b.pcre2)
+
+  proc `&`(a: Spelling, b: string): Spelling =
+    a & both(b)
+
+  proc `&`(a: string, b: Spelling): Spelling =
+    both(a) & b
+
+  proc `&=`(a: var Spelling, b: Spelling | string) =
+    a = a & b
+
   type Gen = object
     r: Rand
     groups: int ## Capture groups opened so far, i.e. the numbering counter.
@@ -210,7 +254,7 @@ else:
     else:
       $g.r.sample(Alphabet)
 
-  proc expr(g: var Gen, depth: int): string
+  proc expr(g: var Gen, depth: int): Spelling
 
   proc lookPiece(g: var Gen): string =
     ## One element of a lookbehind body: a bare atom, or a capturing group
@@ -249,7 +293,7 @@ else:
     if keepAt == pieces.len:
       result &= r"\K"
 
-  proc group(g: var Gen, depth: int): string =
+  proc group(g: var Gen, depth: int): Spelling =
     ## A bracketing construct.  Each arm that captures bumps ``groups`` before
     ## generating its body, so a backreference inside can see itself.
     case g.r.rand(9)
@@ -293,7 +337,7 @@ else:
         # not about rollback at all.  The groups stay numbered; they just stop
         # being nameable from outside.
         g.closed.setLen(closedBefore)
-      "(?<" & (if neg: "!" else: "=") & first & second & ")"
+      both("(?<" & (if neg: "!" else: "=") & first & second & ")")
     of 8:
       # Conditional.  Both the backreference and the consuming/lookahead
       # condition forms, since they take different paths through ``condHolds``.
@@ -320,20 +364,41 @@ else:
     of 5: "*?"
     else: "+?"
 
-  proc piece(g: var Gen, depth: int): string =
+  proc quantified(operand: Spelling, q: string, plus: bool): Spelling =
+    ## ``operand`` repeated by the quantifier ``q``, followed by a ``+`` when
+    ## ``plus`` is set.  The two syntaxes read that ``+`` alike only after a
+    ## greedy ``*``, ``+`` or ``?``, where it makes the repeat possessive.
+    ## Anywhere else Oniguruma reads a second, greedy ``+`` over the whole
+    ## repeat, and PCRE2 does not:
+    ##
+    ## * after an interval PCRE2 and Perl read a possessive interval, so
+    ##   ``a{0,2}+a`` matches "aa" in Oniguruma and reni, not in PCRE2;
+    ## * after a lazy ``*?`` or ``+?`` PCRE2 refuses the pattern outright.
+    ##
+    ## So PCRE2 gets the nested repeat spelled out, as ``(?:X{n,m})+`` or
+    ## ``(?:X*?)+``.  Oniguruma does not reduce that repeat away: it answers
+    ## ``((a)|b)+?+\2`` as PCRE2 answers ``(?:((a)|b)+?)+\2``, which is not how
+    ## it answers ``((a)|b)+?\2``.
+    result = operand & q
+    if plus:
+      if q in ["*", "+", "?"]:
+        result &= "+"
+      else:
+        result = Spelling(onig: result.onig & "+", pcre2: "(?:" & result.pcre2 & ")+")
+
+  proc piece(g: var Gen, depth: int): Spelling =
     result =
       if depth > 0 and g.r.rand(2) == 0:
         group(g, depth)
       else:
-        atom(g)
+        both(atom(g))
     if g.r.rand(2) == 0:
-      result &= quantifier(g)
-      # Possessive and lazy spellings both matter; ``+`` after a quantifier is
-      # possessive in Oniguruma syntax.
-      if g.r.rand(5) == 0:
-        result &= "+"
+      # Possessive and lazy spellings both matter, and what the ``+`` means
+      # depends on what it follows.
+      let q = quantifier(g)
+      result = quantified(result, q, plus = g.r.rand(5) == 0)
 
-  proc branch(g: var Gen, depth: int): string =
+  proc branch(g: var Gen, depth: int): Spelling =
     for _ in 0 .. g.r.rand(2):
       result &= piece(g, depth)
       # ``\K`` parts the span a match reports from the one its attempt ran
@@ -347,15 +412,14 @@ else:
       if g.r.rand(9) == 0:
         result &= r"\K"
 
-  proc expr(g: var Gen, depth: int): string =
+  proc expr(g: var Gen, depth: int): Spelling =
     result = branch(g, depth)
     if depth > 0 and g.r.rand(3) == 0:
       result &= "|" & branch(g, depth)
 
-  proc pattern(g: var Gen): string =
+  proc pattern(g: var Gen): Spelling =
     g.groups = 0
     g.closed.setLen(0)
-    result = ""
     if g.r.rand(2) == 0:
       result &= "^"
     result &= expr(g, 3)
@@ -367,9 +431,14 @@ else:
   proc onigSpans(
       reg: OnigRegex, subj: string, region: ptr OnigRegion
   ): seq[(int, int)] =
-    ## ``search`` fills ``region``; a mismatch leaves the result empty.
-    if search(reg, subj, region) < 0:
+    ## ``search`` fills ``region``; a mismatch leaves the result empty.  Raises
+    ## ``OnigError`` when Oniguruma gives up instead of answering: any code
+    ## below ``OnigMismatch`` is an error, not "no match".
+    let rc = search(reg, subj, region)
+    if rc == OnigMismatch:
       return @[]
+    if rc < 0:
+      raise newException(OnigError, &"onig_search failed with code {rc}")
     for i in 0 ..< region.numRegs.int:
       result.add (region.beg[i].int, region.ends[i].int)
 
@@ -418,22 +487,41 @@ else:
         return false
     true
 
-  proc pcre2Spans(pat, subj: string, want: int): seq[(int, int)] =
+  proc padded(spans: seq[(int, int)], width: int): seq[(int, int)] =
+    ## ``spans`` widened to ``width`` with unset groups, so that two answers
+    ## of different widths line up.  "No match" stays empty.
+    result = spans
+    while result.len > 0 and result.len < width:
+      result.add (-1, -1)
+
+  proc pcre2Asked(pat: Spelling): string =
+    ## How PCRE2 was asked ``pat``, for a report, when that is not how the
+    ## other two were: an answer reproduced from the other spelling differs.
+    if pat.pcre2 == pat.onig:
+      ""
+    else:
+      &" (asked /{pat.pcre2}/)"
+
+  proc pcre2Spans(pat: Spelling, subj: string, want: int): seq[(int, int)] =
     ## PCRE2's answer in the same shape, or ``@[]`` for no match.  ``want`` is
     ## how many spans the comparison is about -- it has to be the wider of the
     ## two answers being compared, since a zero would make "matched" and "did
     ## not match" print the same.  Groups PCRE2 left unset come back as
     ## ``(-1, -1)``, as the other two engines spell them.  Raises ``Pcre2Error``
-    ## when PCRE2 will not take the pattern.
-    let code = pcre2.compile(pat, jit = false)
+    ## when PCRE2 will not take the pattern, or gives up on the subject.
+    let code = pcre2.compile(pat.pcre2, jit = false)
     defer:
       pcre2.free(code)
     let data = pcre2.newMatchData(code)
     defer:
       pcre2.free(data)
     let rc = pcre2.match(code, subj, data, 0)
-    if rc <= 0:
+    if rc == Pcre2ErrorNoMatch:
       return @[]
+    if rc <= 0:
+      # A match, depth or heap limit, or 0 for an ovector too small to hold
+      # the groups: no answer either way.
+      raise newException(Pcre2Error, &"pcre2_match failed with code {rc}")
     let ov = pcre2.ovector(data)
     let unset = high(typeof(ov[0])) # PCRE2_UNSET; the size type is bench-private
     for i in 0 ..< want:
@@ -450,6 +538,24 @@ else:
       result.add (b.a, b.b)
 
   suite "reni agrees with Oniguruma on generated patterns":
+    test "PCRE2 is asked the pattern Oniguruma reads":
+      proc spelled(operand: Spelling, q: string, plus: bool): (string, string) =
+        let s = quantified(operand, q, plus)
+        (s.onig, s.pcre2)
+
+      check spelled(both("a"), "{0,2}", true) == ("a{0,2}+", "(?:a{0,2})+")
+      check spelled(both("(a|b)"), "{1,3}", true) == ("(a|b){1,3}+", "(?:(a|b){1,3})+")
+      check spelled(both("a"), "*?", true) == ("a*?+", "(?:a*?)+")
+      check spelled(both("(a|b)"), "+?", true) == ("(a|b)+?+", "(?:(a|b)+?)+")
+      # A wrapper inside the operand stays inside the outer one.
+      let inner = "(" & quantified(both("x"), "*?", true) & ")"
+      check spelled(inner, "{0,2}", true) == ("(x*?+){0,2}+", "(?:((?:x*?)+){0,2})+")
+      # Possessive, or no ``+`` at all, reads alike.
+      for q in ["*", "+", "?"]:
+        check spelled(both("a"), q, true) == ("a" & q & "+", "a" & q & "+")
+      for q in ["*", "+", "?", "{0,2}", "{1,3}", "*?", "+?"]:
+        check spelled(both("a"), q, false) == ("a" & q, "a" & q)
+
     test "random patterns over a small alphabet":
       initOniguruma()
       defer:
@@ -462,7 +568,9 @@ else:
         free(region)
 
       var compared, skipped, disputed = 0
-      var failures, disputes: seq[string]
+      var bothGaveUp, gaveUpRaised, gaveUpAgreed, gaveUpSplit = 0
+      var gaveUpDisputed, gaveUpUnanswered = 0
+      var failures, disputes, gaveUpDisputes: seq[string]
       var g: Gen
       block sweep:
         for s in 0 ..< seeds:
@@ -474,7 +582,7 @@ else:
 
               var reg: OnigRegex
               try:
-                reg = compile(pat)
+                reg = compile(pat.onig)
               except OnigError:
                 skipped += 1 # Oniguruma rejects it; nothing to compare against.
                 break one
@@ -483,59 +591,99 @@ else:
 
               var rx: Regex
               try:
-                rx = re(pat)
+                rx = re(pat.onig)
               except CatchableError:
                 # reni rejecting a pattern Oniguruma accepts is worth knowing about,
                 # but it is a parser gap, not a rollback bug; keep them apart.
                 skipped += 1
                 break one
 
-              let want = onigSpans(reg, subj, region)
+              var want: seq[(int, int)]
+              var onigGaveUp = "" # Oniguruma's error, when it did not answer
+              try:
+                want = onigSpans(reg, subj, region)
+              except OnigError as e:
+                onigGaveUp = e.msg
               var got: seq[(int, int)]
               try:
                 got = reniSpans(rx, subj)
               except RegexLimitError:
                 # The generator does produce catastrophic backtrackers, and the step
-                # limit stopping one is the engine working as designed.  Oniguruma
-                # has no such budget and answers, so there is nothing to compare.
+                # limit stopping one is the engine working as designed.  reni gave
+                # no answer, so there is nothing to compare, whatever the oracles
+                # said.
                 skipped += 1
+                if onigGaveUp.len > 0:
+                  bothGaveUp += 1
                 break one
               except CatchableError as e:
-                failures.add &"/{pat}/ on \"{subj}\": reni raised {e.name}: {e.msg}"
+                if onigGaveUp.len > 0:
+                  gaveUpRaised += 1
+                failures.add &"/{pat.onig}/ on \"{subj}\": reni raised {e.name}: {e.msg}"
+                break one
+              if onigGaveUp.len > 0:
+                # One oracle is no quorum (see the header): PCRE2 only decides
+                # whether the case is worth printing.
+                var third: seq[(int, int)]
+                try:
+                  third = pcre2Spans(pat, subj, max(got.len, rx.captureCount + 1))
+                except Pcre2Error:
+                  gaveUpUnanswered += 1
+                  break one
+                let gotPadded = padded(got, third.len)
+                if gotPadded == third:
+                  gaveUpAgreed += 1
+                elif onlyIterationSplitSpans(gotPadded, third):
+                  gaveUpSplit += 1
+                else:
+                  gaveUpDisputed += 1
+                  if gaveUpDisputes.len < 10:
+                    gaveUpDisputes.add &"/{pat.onig}/ on \"{subj}\":\n    onig gave up " &
+                      &"({onigGaveUp})\n    reni {got}\n    pcre2 {third}{pat.pcre2Asked}"
                 break one
               compared += 1
               if got != want:
                 # Ask the third engine before blaming reni.
                 var third: seq[(int, int)]
-                var haveThird = true
+                var thirdError = "" # why PCRE2 gave no answer, when it did not
                 try:
                   third = pcre2Spans(pat, subj, max(want.len, got.len))
-                except Pcre2Error:
-                  haveThird = false
-                let detail = &"/{pat}/ on \"{subj}\":\n    onig {want}\n    reni {got}"
+                except Pcre2Error as e:
+                  thirdError = e.msg
+                let detail =
+                  &"/{pat.onig}/ on \"{subj}\":\n    onig {want}\n    reni {got}"
                 # ``want`` is padded to the same width so the three shapes line up.
-                let wantPadded = block:
-                  var w = want
-                  while w.len > 0 and w.len < third.len:
-                    w.add (-1, -1)
-                  w
-                if haveThird and third == wantPadded and
+                let wantPadded = padded(want, third.len)
+                if thirdError.len == 0 and third == wantPadded and
                     not onlyIterationSplitSpans(got, want):
-                  failures.add detail & &"\n    pcre2 {third} (agrees with onig)"
+                  failures.add detail &
+                    &"\n    pcre2 {third}{pat.pcre2Asked} (agrees with onig)"
                 else:
                   disputed += 1
                   if disputes.len < 5:
                     disputes.add detail & (
-                      if haveThird: &"\n    pcre2 {third}"
-                      else: "\n    pcre2 rejected it"
+                      if thirdError.len == 0: &"\n    pcre2 {third}{pat.pcre2Asked}"
+                      else: &"\n    pcre2 gave no answer: {thirdError}"
                     )
               if failures.len >= 10:
                 break sweep
 
       echo &"  compared {compared}, skipped {skipped}, disputed {disputed} " &
         &"(seeds {baseSeed} .. {baseSeed + seeds - 1}, {iters} each)"
+      let gaveUp =
+        bothGaveUp + gaveUpRaised + gaveUpAgreed + gaveUpSplit + gaveUpDisputed +
+        gaveUpUnanswered
+      if gaveUp > 0:
+        # Only the first count is in ``skipped``, and only the second in the
+        # failures; the rest are in none of the counts above.
+        echo &"  onig gave up on {gaveUp}: reni stopped too on {bothGaveUp}, " &
+          &"raised on {gaveUpRaised}; pcre2 agrees with reni on {gaveUpAgreed}, " &
+          &"splits the iterations differently on {gaveUpSplit}, disagrees on " &
+          &"{gaveUpDisputed}, gives no answer on {gaveUpUnanswered}"
       for d in disputes:
         echo "  DISPUTED (reni and pcre2 against onig, or no quorum) ", d
+      for d in gaveUpDisputes:
+        echo "  DISPUTED (onig gave up, pcre2 against reni) ", d
       if failures.len > 0:
         for f in failures:
           echo "  DIVERGENCE ", f
