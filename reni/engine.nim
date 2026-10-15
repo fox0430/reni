@@ -2351,7 +2351,7 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
   let body = peelBareGroups(node.lookBody)
   if body != nil and body.kind == nkAlternation:
     # Try each alternative independently — if ANY matches, negative fails
-    for i, alt in body.alternatives:
+    for i, alt in body.alternatives.view:
       let altLen = ctx.altBounds(node, i, alt)
       let altFbl = altLen.fixedLen
       if altFbl >= 0:

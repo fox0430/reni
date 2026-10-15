@@ -30,6 +30,9 @@ type Parser* = object
   sawPlainGroup*: bool
     ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
     ## skip [flattenLiteralGroups] when there is nothing to find.
+  sawAbsent*: bool
+    ## True once a ``(?~...)`` has been parsed, so the compiler can skip the
+    ## passes that only look for absent operators.
 
 const
   MaxNestingDepth = 256
@@ -1343,6 +1346,7 @@ proc parseGroup(p: var Parser): Node =
     of '~':
       # (?~...) absent operator
       p.advance() # skip '~'
+      p.sawAbsent = true
       if p.peek == '|':
         # (?~|...) forms. All three are rejected in a look-behind, unlike the
         # absent function below.

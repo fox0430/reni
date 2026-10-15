@@ -21,12 +21,12 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     )
   of nkConcat:
     var children = newSeq[Node](node.children.len)
-    for i, child in node.children:
+    for i, child in node.children.view:
       children[i] = demoteUnnamedCaptures(child, indexMap)
     Node(kind: nkConcat, children: children)
   of nkAlternation:
     var alts = newSeq[Node](node.alternatives.len)
-    for i, alt in node.alternatives:
+    for i, alt in node.alternatives.view:
       alts[i] = demoteUnnamedCaptures(alt, indexMap)
     Node(kind: nkAlternation, alternatives: alts)
   of nkGroup:
@@ -195,12 +195,12 @@ proc canMatchEmpty(node: Node): bool =
       nkNamedBackref:
     false
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       if not canMatchEmpty(child):
         return false
     true
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if canMatchEmpty(alt):
         return true
     false
@@ -270,14 +270,14 @@ proc hasRecursiveCycle(
     visiting.excl(callIdx)
     hit
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       if hasRecursiveCycle(startIdx, child, bodies, namedCaptures, visiting):
         return true
       if not canMatchEmpty(child):
         return false
     false
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if not hasRecursiveCycle(startIdx, alt, bodies, namedCaptures, visiting):
         return false
     node.alternatives.len > 0
@@ -487,7 +487,7 @@ proc collectLiteralNodes(node: Node, into: var seq[Node]): bool =
   of nkConcat:
     if node.children.len == 0:
       return false
-    for child in node.children:
+    for child in node.children.view:
       if not collectLiteralNodes(child, into):
         return false
     true
@@ -507,11 +507,11 @@ proc flattenLiteralGroups(node: Node) =
     return
   case node.kind
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       flattenLiteralGroups(child)
     var spliced: seq[Node]
     var changed = false
-    for child in node.children:
+    for child in node.children.view:
       var inner: seq[Node]
       if child.kind == nkGroup and collectLiteralNodes(child, inner):
         spliced.add inner
@@ -521,7 +521,7 @@ proc flattenLiteralGroups(node: Node) =
     if changed:
       node.children = spliced
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       flattenLiteralGroups(alt)
   of nkCapture:
     flattenLiteralGroups(node.captureBody)
@@ -569,7 +569,7 @@ proc mergeLiterals(node: Node): Node =
   of nkConcat:
     var merged: seq[Node]
     var run: seq[Rune]
-    for child in node.children:
+    for child in node.children.view:
       let mc = mergeLiterals(child)
       if mc.kind == nkLiteral:
         run.add mc.rune
@@ -594,7 +594,7 @@ proc mergeLiterals(node: Node): Node =
     Node(kind: nkConcat, children: merged)
   of nkAlternation:
     var alts = newSeq[Node](node.alternatives.len)
-    for i, alt in node.alternatives:
+    for i, alt in node.alternatives.view:
       alts[i] = mergeLiterals(alt)
     Node(kind: nkAlternation, alternatives: alts)
   of nkCapture:
@@ -960,7 +960,7 @@ proc annotateTree(
       cache = newTable[(uint, RegexFlags), FirstCharInfo]()
     var hints = newSeq[FirstCharInfo](node.alternatives.len)
     var discriminates = false
-    for i, alt in node.alternatives:
+    for i, alt in node.alternatives.view:
       hints[i] = extractFirstChar(alt, hintFlags, cache)
       if i > 0 and not sameFirstChar(hints[i], hints[0]):
         discriminates = true
@@ -1054,7 +1054,7 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   case node.kind
   of nkConcat:
     # Zero-width nodes consume nothing; look past them.
-    for child in node.children:
+    for child in node.children.view:
       if child.kind in LeadZeroWidth:
         continue
       return leadFirstLeaf(child, flags)
@@ -1089,7 +1089,7 @@ proc soleLeafBody(node: Node, flags: RegexFlags): Node =
   case node.kind
   of nkConcat:
     var leaf: Node = nil
-    for child in node.children:
+    for child in node.children.view:
       if child.kind == nkAnchor:
         continue
       if leaf != nil:
@@ -1167,7 +1167,7 @@ proc leadAnchorSet(node: Node, flags: RegexFlags): set[AnchorKind] =
     return {}
   case node.kind
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       case child.kind
       of nkAnchor:
         if child.anchor != akKeep:
@@ -1380,7 +1380,7 @@ proc addReq(node: Node, flags: RegexFlags, f: var ContinuationReq): FollowStep =
       # A negative look-ahead and both look-behinds only refuse positions.
       fsPass
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       case addReq(child, flags, f)
       of fsStop:
         return fsStop
@@ -1402,7 +1402,7 @@ proc addReq(node: Node, flags: RegexFlags, f: var ContinuationReq): FollowStep =
     # Every branch can consume first, so two that state a leaf leave none
     # required -- which [noteLeaf] already says.
     var mayPass = false
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       case addReq(alt, flags, f)
       of fsUnknown:
         return fsUnknown
@@ -1500,12 +1500,12 @@ proc consumable(node: Node, flags: RegexFlags, s: var set[uint8]): bool =
     addAccept(s, a)
     true
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       if not consumable(child, flags, s):
         return false
     true
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if not consumable(alt, flags, s):
         return false
     true
@@ -1555,7 +1555,7 @@ proc regionWalk(
     addAccept(prefix, a)
     rsNone
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       case regionWalk(child, flags, prefix, found)
       of rsFound:
         return rsFound
@@ -1642,7 +1642,7 @@ proc behindLiteral(node: Node, lit: var string): bool =
       lit.add char(cp)
     true
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       if not behindLiteral(child, lit):
         return false
     true
@@ -1674,7 +1674,7 @@ proc leadBehindWalk(node: Node, info: var LeadBehindInfo): LeadBehindStep =
         return lbsFound
     lbsNone
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       case leadBehindWalk(child, info)
       of lbsFound:
         return lbsFound
@@ -2014,7 +2014,7 @@ proc reduceLeadingElement(node: Node): bool =
   if peeled == nil:
     return true
   if peeled.kind == nkConcat:
-    for child in peeled.children:
+    for child in peeled.children.view:
       if not reduceLeadingElement(child):
         return false
     return true
@@ -2028,10 +2028,10 @@ proc reduceLookBehindBody(node: Node) =
     return
   case peeled.kind
   of nkAlternation:
-    for alt in peeled.alternatives:
+    for alt in peeled.alternatives.view:
       reduceLookBehindBody(alt)
   of nkConcat:
-    for child in peeled.children:
+    for child in peeled.children.view:
       if not reduceLeadingElement(child):
         break
   else:
@@ -2101,7 +2101,7 @@ proc annotateContinuations(
     of qkPossessive:
       discard
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       annotateContinuations(alt, flags, after, calls, mayRewrite)
   of nkCapture:
     annotateContinuations(
@@ -2156,7 +2156,7 @@ proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
     if (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card > 0:
       return nil
     var prefix: set[uint8]
-    for child in node.children:
+    for child in node.children.view:
       var leaf: set[uint8]
       if exactAsciiLeaf(child, leaf):
         prefix = prefix + leaf
@@ -2311,8 +2311,10 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # Same rule: a node this pass never reaches keeps the flag save.
   discard markGroupBodyKeepsFlags(ast)
   # Same rule, and before ``annotateLookaroundBounds``: ``lengthBounds``
-  # reads the flag.  A node this pass never reaches just scans.
-  markEmptyAbsentFuncs(ast)
+  # reads the flag.  A node this pass never reaches just scans.  Skipped when
+  # the pattern has no ``(?~...)`` at all.
+  if p.sawAbsent:
+    markEmptyAbsentFuncs(ast)
   # ``p.currentFlags`` only carries the isolated ``(?L)`` spelling: scoped
   # groups restore ``p.flags`` on exit. A scoped ``(?L:...)`` that spans the
   # whole pattern is the same global option, so lift it from the AST.
@@ -2365,7 +2367,12 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredByte =
       requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags)),
     semiEndAnchored = semiEndAnchored(ast),
-    semiEndDMax = anchorDMax(ast, finalFlags),
+    # [anchorDMax] parts from [maxByteLen] only over an absent operator.
+    semiEndDMax =
+      if p.sawAbsent:
+        anchorDMax(ast, finalFlags)
+      else:
+        maxByteLen(ast, finalFlags),
     levelBackrefs = levelBackrefs,
     leadRun =
       if rfFindLongest in finalFlags:

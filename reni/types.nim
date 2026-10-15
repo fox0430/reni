@@ -1072,14 +1072,23 @@ proc `==`*(sl: Slice[int], s: Span): bool {.inline.} =
 proc `$`*(s: Span): string =
   $s.a & " .. " & $s.b
 
+template view*(nodes: seq[Node]): untyped =
+  ## ``nodes`` as an ``openArray``, for ``for child in node.children.view``.
+  ## A plain ``for`` over a seq field of a ``Node`` copies the whole seq under
+  ## ORC first -- cursor inference does not borrow it -- and every AST pass
+  ## walks children, so that copy was a large share of compiling a pattern.
+  ## ``items`` and ``pairs`` read an ``openArray`` in place.  The loop body
+  ## must not replace the seq it walks; no pass does.
+  toOpenArray(nodes, 0, nodes.high)
+
 iterator childNodes*(node: Node): Node =
   ## Yield all direct child nodes (skips nil).
   case node.kind
   of nkConcat:
-    for c in node.children:
+    for c in node.children.view:
       yield c
   of nkAlternation:
-    for a in node.alternatives:
+    for a in node.alternatives.view:
       yield a
   of nkCapture:
     yield node.captureBody
@@ -1756,7 +1765,7 @@ proc extractFirstCharUncached(
   of nkConcat:
     var currentFlags = flags
     var lineStart = false
-    for child in node.children:
+    for child in node.children.view:
       # Accumulate flags from bare flag groups (e.g., (?i) sets case-insensitive)
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
@@ -1853,7 +1862,7 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
     node.quantMin >= 1 and hasLiteralPrefix(node.quantBody, flags)
   of nkConcat:
     var currentFlags = flags
-    for child in node.children:
+    for child in node.children.view:
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
         continue
@@ -1867,7 +1876,7 @@ proc hasLiteralPrefix*(node: Node, flags: RegexFlags): bool =
     # Oniguruma reduce the alternation to one exact string.
     if node.alternatives.len == 0:
       return false
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if not hasLiteralPrefix(alt, flags):
         return false
     let first = extractFirstChar(node.alternatives[0], flags)
@@ -1909,7 +1918,7 @@ proc extractRequiredByte*(node: Node, flags: RegexFlags): RequiredByteInfo =
   of nkConcat:
     # A look-ahead's byte sits where the search already stands; keep it as fallback.
     var fromLook = RequiredByteInfo(valid: false)
-    for child in node.children:
+    for child in node.children.view:
       if child.kind == nkFlagGroup and child.flagBody == nil:
         continue
       if child.kind in {nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
@@ -2026,12 +2035,12 @@ proc matchesEverywhere(node: Node): bool =
   of nkLookaround:
     node.lookKind in {lkAhead, lkBehind} and matchesEverywhere(node.lookBody)
   of nkConcat:
-    for child in node.children:
+    for child in node.children.view:
       if not matchesEverywhere(child):
         return false
     true
   of nkAlternation:
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if matchesEverywhere(alt):
         return true
     false
@@ -2118,7 +2127,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     var fixed = 0
     var currentFlags = flags
     var currentGm = gm
-    for child in node.children:
+    for child in node.children.view:
       # A bare flag group — (?i), (?y{g}) — applies to the rest of the concat
       # rather than to a body of its own.
       if child.kind == nkFlagGroup and child.flagBody == nil:
@@ -2148,7 +2157,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     # walk: a second walk would be exponential in the alternation depth.
     var best = 0
     var fixed = 0
-    for i, alt in node.alternatives:
+    for i, alt in node.alternatives.view:
       let ab = lengthBounds(alt, flags, gm)
       if ab.maxLen < 0:
         best = -1
@@ -2259,7 +2268,7 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
     node.lookAlts = @[]
     let peeled = peelBareGroups(node.lookBody)
     if peeled != nil and peeled.kind == nkAlternation:
-      for alt in peeled.alternatives:
+      for alt in peeled.alternatives.view:
         node.lookAlts.add(lengthBounds(alt, flags, gm))
     node.lookBoundsFlags = flags
     node.lookBoundsGm = gm
@@ -2268,7 +2277,7 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
   of nkConcat:
     var currentFlags = flags
     var currentGm = gm
-    for child in node.children:
+    for child in node.children.view:
       # A bare flag group applies to the rest of the concat, as in
       # [lengthBounds].
       if child.kind == nkFlagGroup and child.flagBody == nil:
@@ -2356,7 +2365,7 @@ proc semiEndAnchored*(node: Node): bool =
   of nkAlternation:
     if node.alternatives.len == 0:
       return false
-    for alt in node.alternatives:
+    for alt in node.alternatives.view:
       if not semiEndAnchored(alt):
         return false
     true
