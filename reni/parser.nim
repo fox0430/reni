@@ -1343,11 +1343,9 @@ proc parseGroup(p: var Parser): Node =
     of '~':
       # (?~...) absent operator
       p.advance() # skip '~'
-      if p.peek == ')':
-        # (?~) - range clear / empty match
-        result = Node(kind: nkAbsent, absentKind: abClear)
-      elif p.peek == '|':
-        # (?~|...) forms
+      if p.peek == '|':
+        # (?~|...) forms. All three are rejected in a look-behind, unlike the
+        # absent function below.
         if p.inLookbehind:
           p.error("invalid pattern in look-behind")
         p.advance() # skip '|'
@@ -1359,8 +1357,6 @@ proc parseGroup(p: var Parser): Node =
           let absentBody = p.parseConcat()
           if p.peek == '|':
             # (?~|absent|expr) - absent expression
-            if p.inLookbehind:
-              p.error("invalid pattern in look-behind")
             p.advance() # skip '|'
             let expr = p.parseRegex()
             result = Node(
@@ -1371,11 +1367,11 @@ proc parseGroup(p: var Parser): Node =
             )
           else:
             # (?~|absent) - range marker
-            if p.inLookbehind:
-              p.error("invalid pattern in look-behind")
             result = Node(kind: nkAbsent, absentKind: abRange, absentBody: absentBody)
       else:
-        # (?~pattern) - absent function
+        # (?~pattern) - absent function. ``(?~)`` is one with an empty
+        # pattern, as in Oniguruma: it matches empty and leaves the range
+        # alone. The range clear is ``(?~|)``.
         let body = p.parseRegex()
         result = Node(kind: nkAbsent, absentKind: abFunction, absentBody: body)
     of '<':

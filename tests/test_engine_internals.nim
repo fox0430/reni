@@ -158,6 +158,19 @@ suite "the \\Z anchor is reached the way Oniguruma reaches it":
     check search("\xC0\x0A", re("\\Z")).matchSpan == 1 .. 1
     check not search("\xC0\x0A", re("\\s\\Z")).found
 
+  test "an absent operator takes the window away, as in Oniguruma":
+    # Oniguruma compiles every absent operator but the range clear to a loop
+    # and so counts it as unbounded, even ``(?~)`` and ``(?~|b)``, which
+    # consume nothing.  With no window its scan walks the chain from 0 and
+    # never lands on the ``\n`` at 1.
+    for pattern in ["(?~)\\Z", "(?~a*)\\Z", "(?~|b)\\Z", "(?:(?~))+\\Z", "((?~))\\Z"]:
+      check re(pattern).semiEndDMax == -1
+      check search("\xC0\x0A", re(pattern)).matchSpan == 2 .. 2
+    # Where the operator cannot consume at all, the window stays.
+    for pattern in ["(?~|)\\Z", "(?=(?~))\\Z", "(?~){0}\\Z", "(?<=(?~))\\Z"]:
+      check re(pattern).semiEndDMax == 0
+      check search("\xC0\x0A", re(pattern)).matchSpan == 1 .. 1
+
   test "the jump leaves room for what the pattern consumes":
     check search("\xC2a\x0A", re("a\\Z")).matchSpan == 1 .. 2
     check search("\xC2a\x0A", re(".\\Z")).matchSpan == 0 .. 2
@@ -1855,8 +1868,8 @@ suite "an alternation passes over branches whose first byte cannot match":
     check search("b", re("(?~|b)(?:|b)(?~|)\\z")).matchSpan == 0 .. 1
     # The passed-over branch need not be the one right after the first.
     check search("b", re("(?~|b)(?:|b|b)(?~|)\\z")).matchSpan == 0 .. 1
-    # ``(?~)`` clears the limit the same way.
-    check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 0 .. 1
+    # ``(?~)`` is not a clear: the limit stays narrow and the branch out.
+    check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 1 .. 1
 
 suite "a positive lookaround's captures are rolled back like any other":
   # A positive lookaround keeps what its (zero-width) body captured.  Those

@@ -78,7 +78,7 @@ type
     gmWord ## (?y{w}) - word mode
 
   AbsentKind* = enum
-    abClear ## (?~) - matches empty
+    abClear ## (?~|) - range clear: matches empty, widens the range back out
     abFunction ## (?~pattern) - longest match not containing pattern
     abExpression ## (?~|absent|expr) - match expr without absent
     abRange ## (?~|absent) - range marker (zero-width, sets constraint)
@@ -178,12 +178,12 @@ type
     ## from one walk of [lengthBounds] so they cannot disagree about the same
     ## facts — a case fold spanning two pattern characters, above all.
     maxLen*: int ## Upper bound on the bytes consumed; -1 when unbounded or unknown.
-    fixedLen*: int ## The single length every match consumes; -1 when it varies.
-
-  LookAltInfo* = object
-    ## What a lookaround records about one alternative of an alternation body.
-    bounds*: LenBounds ## [lengthBounds] of the alternative.
-    needsWindow*: bool ## Whether the alternative needs a window.
+    fixedLen*: int
+      ## The single length every match consumes; -1 when it varies.  Also -1
+      ## for ``(?~)`` and the other empty absent functions, which consume
+      ## nothing: Oniguruma counts them as variable-length, and a look-behind
+      ## body holding one runs under a window for that.  See ``nkAbsent`` in
+      ## [lengthBounds].
 
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
@@ -391,16 +391,13 @@ type
         ## at every position.  Filled in by ``annotateLookaroundBounds``; only
         ## usable while ``lookBoundsFlags`` matches the flags in force, since a
         ## subexpression call can reach the same lookaround under others.
-      lookAlts*: seq[LookAltInfo]
-        ## Per-alternative annotation when ``lookBody`` is an alternation,
-        ## empty otherwise. Cached because ``altWindow`` runs per attempt.
+      lookAlts*: seq[LenBounds]
+        ## [lengthBounds] of each alternative when ``lookBody`` is an
+        ## alternation, empty otherwise. Cached because ``altWindow`` runs per
+        ## attempt.
       lookBoundsFlags*: RegexFlags
       lookBoundsGm*: GraphemeMode
       lookBoundsValid*: bool
-      lookNeedsWindow*: bool
-        ## Whether ``lookBody`` needs a window although its length is fixed:
-        ## [containsAbsentOp]. Asked only for fixed-length bodies; see
-        ## ``bodyWindow`` in ``engine``, which has the reason.
       lookBodyPure*: bool
         ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
         ## has to leave a rollback behind for the captures a positive
@@ -428,6 +425,11 @@ type
       callRefs*: NameRefs ## groups ``callName`` resolves to
     of nkAbsent:
       absentKind*: AbsentKind
+      absentEmpty*: bool
+        ## [isEmptyAbsentFunc]'s answer, filled in by [markEmptyAbsentFuncs]
+        ## on the compiled tree so the matcher need not walk the pattern each
+        ## time it enters the function.  False on a node the pass never
+        ## reached, which only costs the scan the flag lets the matcher skip.
       absentBody*: Node ## absent pattern (nil for abClear)
       absentExpr*: Node ## expression to match (for abExpression only)
     of nkCalloutMax:
@@ -898,9 +900,9 @@ type
     semiEndAnchored: bool
       ## Every match ends at ``\Z``, so the scan may jump straight to it.
     semiEndDMax: int
-      ## Upper bound on the bytes a match consumes, or -1 when unbounded.
-      ## Oniguruma's ``anchor_dmax``: how far left of the anchor a match may
-      ## still start.
+      ## Upper bound on the bytes a match consumes, as Oniguruma counts them,
+      ## or -1 when unbounded.  Oniguruma's ``anchor_dmax``: how far left of
+      ## the anchor a match may still start.  See [anchorDMax].
     levelBackrefs: bool
       ## The pattern uses a recursion-level backreference, so the matcher has
       ## to maintain the per-group capture history.
@@ -2004,21 +2006,72 @@ proc peelBareGroups*(node: Node): Node {.inline.} =
   while result != nil and result.kind == nkGroup:
     result = result.groupBody
 
-proc containsAbsentOp*(node: Node): bool =
-  ## Whether ``node`` holds an absent operator outside any nested lookaround.
+proc matchesEverywhere(node: Node): bool =
+  ## Whether ``node`` has a match starting at every position, whatever the
+  ## subject and the state it runs in.  Conservative: anything that might fail
+  ## counts as failing.  So does an absent operator, which fails outright on
+  ## the path of an absent pattern's scan (``absentScan`` in ``engine``).
+  ##
+  ## Every shape that answers true by itself is zero-width, so a window that
+  ## ends where the match starts leaves one in place, an empty one.  A
+  ## look-behind runs its body under such a window unless the body is
+  ## fixed-length, and its length is then 0: either way a positive
+  ## look-behind holds wherever its body matches everywhere.
   if node == nil:
     return false
   case node.kind
-  of nkAbsent:
-    return true
+  of nkAnchor:
+    # The start ``\K`` records is the scan's to discard.
+    node.anchor == akKeep
   of nkLookaround:
-    return false
+    node.lookKind in {lkAhead, lkBehind} and matchesEverywhere(node.lookBody)
+  of nkConcat:
+    for child in node.children:
+      if not matchesEverywhere(child):
+        return false
+    true
+  of nkAlternation:
+    for alt in node.alternatives:
+      if matchesEverywhere(alt):
+        return true
+    false
+  of nkQuantifier:
+    effectiveQuantBounds(node.quantMin, node.quantMax).lo == 0 or
+      matchesEverywhere(node.quantBody)
+  of nkGroup:
+    matchesEverywhere(node.groupBody)
+  of nkCapture:
+    matchesEverywhere(node.captureBody)
+  of nkNamedCapture:
+    matchesEverywhere(node.namedCaptureBody)
+  of nkAtomicGroup:
+    matchesEverywhere(node.atomicBody)
+  of nkFlagGroup:
+    node.flagBody == nil or matchesEverywhere(node.flagBody)
   else:
-    discard
+    false
+
+proc markEmptyAbsentFuncs*(node: Node) =
+  ## Fill in ``absentEmpty`` on every absent function under ``node``.  Must
+  ## run on the final tree, before anything reads [lengthBounds]: the
+  ## compiler's rewrites rebuild nodes and would drop the flag.
+  if node == nil:
+    return
+  if node.kind == nkAbsent and node.absentKind == abFunction:
+    node.absentEmpty = matchesEverywhere(node.absentBody)
   for child in node.childNodes:
-    if containsAbsentOp(child):
-      return true
-  false
+    markEmptyAbsentFuncs(child)
+
+proc isEmptyAbsentFunc*(node: Node): bool {.inline.} =
+  ## Whether ``node`` is an absent function whose pattern matches wherever the
+  ## function starts -- ``(?~)``, ``(?~a*)``, ``(?~(?:))``.  The longest text
+  ## without the pattern is then the empty one, so the function matches
+  ## empty, only empty, and leaves the absent range as it found it.  The
+  ## pattern is judged by what it matches rather than how it is spelt
+  ## ([matchesEverywhere]): any spelling left out would walk a look-behind
+  ## back to 0 again (see ``nkAbsent`` in [lengthBounds]).  The verdict is
+  ## the one [markEmptyAbsentFuncs] cached at compile time.
+  node.kind == nkAbsent and node.absentEmpty
 
 proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   ## Bound what ``node`` consumes.  See [LenBounds].
@@ -2110,9 +2163,12 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     let bb = lengthBounds(node.quantBody, flags, gm)
     # Inverted range: use the swapped bounds.
     let (qlo, qhi) = effectiveQuantBounds(node.quantMin, node.quantMax)
-    # ``{0,0}`` and repeats of zero-width bodies consume nothing.
-    if qhi == 0 or bb.maxLen == 0:
+    # ``{0,0}`` and repeats of zero-width bodies consume nothing.  A repeat
+    # of ``(?~)`` stays variable-length, as the body is (see ``nkAbsent``).
+    if qhi == 0:
       return LenBounds(maxLen: 0, fixedLen: 0)
+    if bb.maxLen == 0:
+      return LenBounds(maxLen: 0, fixedLen: if bb.fixedLen == 0: 0 else: -1)
     var total = -1
     if qhi >= 0 and bb.maxLen >= 0:
       if qhi == 0 or bb.maxLen <= int.high div qhi:
@@ -2179,7 +2235,13 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     )
   of nkAbsent:
     # ``abClear`` and ``abRange`` are zero-width; the other two consume subject
-    # and stay unbounded. The window decision lives in [containsAbsentOp].
+    # and stay unbounded.  ``(?~)`` and the other empty absent functions
+    # ([isEmptyAbsentFunc]) consume nothing, but do not count as fixed-length:
+    # Oniguruma compiles them like any absent function, so a look-behind body
+    # holding one runs under a window.  Their ``maxLen`` is still 0, which
+    # keeps such a body from trying every start position back to 0.
+    if node.isEmptyAbsentFunc:
+      return LenBounds(maxLen: 0, fixedLen: -1)
     case node.absentKind
     of abClear, abRange:
       LenBounds(maxLen: 0, fixedLen: 0)
@@ -2198,14 +2260,9 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
     let peeled = peelBareGroups(node.lookBody)
     if peeled != nil and peeled.kind == nkAlternation:
       for alt in peeled.alternatives:
-        node.lookAlts.add(
-          LookAltInfo(
-            bounds: lengthBounds(alt, flags, gm), needsWindow: containsAbsentOp(alt)
-          )
-        )
+        node.lookAlts.add(lengthBounds(alt, flags, gm))
     node.lookBoundsFlags = flags
     node.lookBoundsGm = gm
-    node.lookNeedsWindow = containsAbsentOp(node.lookBody)
     node.lookBoundsValid = true
     annotateLookaroundBounds(node.lookBody, flags, gm)
   of nkConcat:
@@ -2240,6 +2297,44 @@ proc fixedByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
   ## The one length every match of ``node`` consumes, or -1 when it varies.
   ## See [lengthBounds].
   lengthBounds(node, flags, gm).fixedLen
+
+proc holdsAbsentLoop(node: Node): bool =
+  ## Whether ``node`` holds an absent operator other than the range clear
+  ## ``(?~|)`` where [lengthBounds] counts what it consumes: outside every
+  ## lookaround, conditional test and repeat that runs zero times.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAbsent:
+    return node.absentKind != abClear
+  of nkLookaround:
+    return false
+  of nkQuantifier:
+    if effectiveQuantBounds(node.quantMin, node.quantMax).hi == 0:
+      return false
+  of nkConditional:
+    return holdsAbsentLoop(node.condYes) or holdsAbsentLoop(node.condNo)
+  else:
+    discard
+  for child in node.childNodes:
+    if holdsAbsentLoop(child):
+      return true
+  false
+
+proc anchorDMax*(node: Node, flags: RegexFlags): int =
+  ## How far left of the ``\Z`` anchor a match of ``node`` may start, as
+  ## Oniguruma's ``anchor_dmax`` counts it, or -1 when unbounded.  That is
+  ## [maxByteLen] except for the absent operators: Oniguruma compiles every
+  ## one but the range clear to a loop, so it counts a pattern holding one as
+  ## unbounded even where the operator consumes nothing, as ``(?~)`` and
+  ## ``(?~|a)`` do.  The bound decides where the scan jumps to (see
+  ## ``semiEndScanStart`` in ``engine``), and on malformed UTF-8 a jump can
+  ## land where ``onig_search``'s walk does not: ``(?~)\Z`` on ``"\xC0\n"``
+  ## is 2..2 in Oniguruma, and was 1..1 here under a bound of 0.
+  if holdsAbsentLoop(node):
+    -1
+  else:
+    maxByteLen(node, flags)
 
 proc semiEndAnchored*(node: Node): bool =
   ## Whether every match of ``node`` has to end at ``\Z`` — the end of the

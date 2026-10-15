@@ -323,12 +323,20 @@ proc containsAbsent(
     namedCaptures: seq[(string, int)],
     visited: var HashSet[int],
 ): bool =
-  ## Check if a node transitively contains non-clear absent expressions.
+  ## Check if a node transitively contains a ``(?~|...)`` form, which the
+  ## parser already rejects when written in a look-behind directly.  The
+  ## absent function ``(?~pattern)`` -- ``(?~)`` included -- is allowed
+  ## there, as in Oniguruma.
+  ##
+  ## Calls are followed to any depth.  Oniguruma follows only the first
+  ## (``check_called_node_in_look_behind`` has no case for a call), so it
+  ## compiles ``(?<=\g<1>)(\g<2>)((?~|))``, and the range clear then escapes
+  ## the look-behind.  reni rejects that on purpose.
   if node == nil:
     return false
   case node.kind
   of nkAbsent:
-    return node.absentKind != abClear
+    return node.absentKind != abFunction
   of nkSubexpCall:
     # Resolve the call target and check its body
     var idx = -1
@@ -2302,6 +2310,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   discard markQuantBodyPure(ast)
   # Same rule: a node this pass never reaches keeps the flag save.
   discard markGroupBodyKeepsFlags(ast)
+  # Same rule, and before ``annotateLookaroundBounds``: ``lengthBounds``
+  # reads the flag.  A node this pass never reaches just scans.
+  markEmptyAbsentFuncs(ast)
   # ``p.currentFlags`` only carries the isolated ``(?L)`` spelling: scoped
   # groups restore ``p.flags`` on exit. A scoped ``(?L:...)`` that spans the
   # whole pattern is the same global option, so lift it from the AST.
@@ -2354,7 +2365,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredByte =
       requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags)),
     semiEndAnchored = semiEndAnchored(ast),
-    semiEndDMax = maxByteLen(ast, finalFlags),
+    semiEndDMax = anchorDMax(ast, finalFlags),
     levelBackrefs = levelBackrefs,
     leadRun =
       if rfFindLongest in finalFlags:

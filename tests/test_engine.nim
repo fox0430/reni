@@ -1249,7 +1249,7 @@ suite "Subroutine calls and recursion":
     check m.matchSpan == Span(a: 0, b: 40)
 
 suite "Absent operator":
-  test "abClear (?~) matches empty":
+  test "abFunction (?~) has an empty pattern and matches empty":
     let m = search("ab", re("a(?~)b"))
     check m.found
     check m.boundaries[0] == 0 .. 2
@@ -1320,6 +1320,73 @@ suite "Absent operator":
     let m = search("abc", re("(?~|b|(a|ab))b"))
     check m.found
     check m.boundaries[0] == 0 .. 2
+
+suite "absent range and zero-width assertions":
+  # An absent range bounds what the match may consume, not what the zero-width
+  # shapes see: ``$``, ``\z``, ``\Z``, ``\b`` and ``\B`` answer from the real
+  # subject.  The one exception is ``\b`` at position 0, where an empty range
+  # is an empty string and has no boundary.  Each row is forward search /
+  # backward search / match at 0, all libonig 6.9.10's.  Forward search
+  # alone hides the ``\Z`` rows: its start-position skip steps over the
+  # positions a wrong answer would show at.
+  proc spans(subject, pattern: string): string =
+    let r = re(pattern)
+    var parts: seq[string]
+    for m in [search(subject, r), searchBackward(subject, r), matchAt(subject, r)]:
+      if m.found:
+        parts.add $m.matchSpan.a & ".." & $m.matchSpan.b
+      else:
+        parts.add "none"
+    parts.join(" / ")
+
+  test "the end anchors read past the range":
+    check spans("ab", "(?~|b)a$") == "none / none / none"
+    check spans("ab", "(?~|b|a$)") == "none / none / none"
+    check spans("b", "(?~|b)$") == "1..1 / 1..1 / none"
+    check spans("ab", "(?~|b)a(?=$)") == "none / none / none"
+    check spans("ab", "(?~|b)a\\z") == "none / none / none"
+    check spans("ab", "(?~|b|a\\z)") == "none / none / none"
+    check spans("ab", "(?~|b)\\z") == "2..2 / 2..2 / none"
+    check spans("ab", "(?~|b)a\\Z") == "none / none / none"
+    check spans("ab", "(?~|b|a\\Z)") == "none / none / none"
+    check spans("a\nb", "(?~|b)a\\Z") == "none / none / none"
+    check spans("a\nb", "(?~|b|a\\Z)") == "none / none / none"
+
+  test "a word boundary reads the character past the range":
+    check spans("ab", "(?~|b)a\\b") == "none / none / none"
+    check spans("ab", "(?~|b|a\\b)") == "none / none / none"
+    check spans("ab", "(?~|b)a\\B") == "0..1 / 0..1 / 0..1"
+    check spans("ab", "(?~|b|a\\B)") == "0..1 / 0..1 / 0..1"
+
+  test "except at the start of the subject":
+    check spans("a", "(?~|a)\\b") == "1..1 / 1..1 / none"
+    check spans("a", "(?~|a)\\B") == "0..0 / 0..0 / 0..0"
+    # A look-behind window is the same kind of range.
+    check spans("a", "(?<=(?~)\\b)") == "1..1 / 1..1 / none"
+    check spans("a b", "(?<=(?~)\\b)") == "1..1 / 3..3 / none"
+
+  test "consumption still stops at the range":
+    check spans("ab", "(?~|b)ab") == "none / none / none"
+    check spans("ab", "(?~|b)a(?=b)") == "none / none / none"
+    check spans("ab", "(?~|b)a(?~)$") == "none / none / none"
+    check spans("a\nb", "(?~|b)a$") == "0..1 / 0..1 / 0..1"
+    check spans("a\n", "(?~|\\n)a$") == "0..1 / 0..1 / 0..1"
+    check spans("a\nb", "(?~|b)a\\n^") == "0..2 / 0..2 / 0..2"
+
+  test "(?~) leaves the range alone; (?~|) clears it":
+    # ``(?~)`` is the absent function with an empty pattern, not a range
+    # clear: what follows it still stops where the range does.
+    check spans("a", "(?~|a)(?~)a") == "none / none / none"
+    check spans("ab", "(?~|b)a(?~)b") == "none / none / none"
+    check spans("abc", "(?~|b)(?~).*") == "0..1 / 3..3 / 0..1"
+    check spans("abc", "(?~|b)(?~|).*") == "0..3 / 3..3 / 0..3"
+    # So the empty range at position 0 is still there for ``\b``...
+    check spans("a", "(?~|a)(?~)\\b") == "1..1 / 1..1 / none"
+    check spans("a", "(?~|a)(?~)\\B") == "0..0 / 0..0 / 0..0"
+    check spans("a", "(?~|a)(?=(?~)\\b)") == "1..1 / 1..1 / none"
+    check spans("ab", "(?~|a)(?~)a(?~|b|\\B)") == "none / none / none"
+    # ...and gone once ``(?~|)`` clears it.
+    check spans("a", "(?~|a)(?~|)\\b") == "0..0 / 1..1 / 0..0"
 
 suite "Callout verbs":
   test "MAX basic limits repetitions":
@@ -2161,13 +2228,30 @@ suite "Lookbehind edge cases":
     let m = search("zb", re("(?<=x)b|(?<=y)b"))
     check not m.found
 
-  test "lookbehind with subroutine call containing absent raises":
-    expect(RegexError):
-      discard re("(?<=(?1))((?~abc))")
+  test "lookbehind with subroutine call containing an absent function is ok":
+    # The rule a call reaches is the one written in place: the absent
+    # function is allowed in a look-behind body, as in Oniguruma.
+    check search("xabc", re("(?<=\\g<1>)((?~abc))")).matchSpan == 0 .. 1
+    check search("xabc", re("(?<=\\g<g>)(?<g>(?~abc))")).matchSpan == 0 .. 1
+    check search("ab", re("(?<=\\g<1>)((?~))")).matchSpan == 0 .. 0
 
-  test "lookbehind with named subroutine call containing absent raises":
-    expect(RegexError):
-      discard re("(?<=(?&g))(?<g>(?~abc))")
+  test "lookbehind with subroutine call containing a (?~|...) form raises":
+    for pattern in ["(?<=(?1))((?~|))", "(?<=(?1))((?~|a))", "(?<=(?&g))(?<g>(?~|a))"]:
+      expect(RegexError):
+        discard re(pattern)
+
+  test "so does one reached through two calls or more, unlike in Oniguruma":
+    # Oniguruma checks only the first call level (``check_called_node_in_look_behind``
+    # has no case for a call), so it compiles these, and the range clear
+    # then escapes the look-behind and stays widened after it.  That reads
+    # as an oversight rather than a rule, so reni keeps rejecting them,
+    # however deep the call.
+    for pattern in [
+      "(?<=\\g<1>)(\\g<2>)((?~|))", "(?<=\\g<1>)(\\g<2>)((?~|a))",
+      "(?<=\\g<1>)(\\g<2>)(\\g<3>)((?~|a))", "(?~|b)a(?:(\\g<2>)((?~|))){0}(?<=\\g<1>)b",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
 
   test "lookahead with subroutine call containing absent is ok":
     discard re("(?=(?1))((?~x))")
@@ -2288,10 +2372,10 @@ suite "look-behind body window":
       check b.boundaries[0] == 0 .. 0
 
   test "the absent operator does not widen the window away":
-    # ``(?~)`` clears the absent range by putting the subject end back, and
-    # the window used to *be* that end, so a no-op assertion silently undid
-    # the whole window.  They are separate now: ``(?~)`` moves what the
-    # zero-width shapes answer against, the window bounds consumption.
+    # The window used to be the same end the absent range narrows, and
+    # ``(?~)`` was parsed as the range clear, so an empty match silently
+    # undid the whole window.  It is the absent function now, and the window
+    # is kept apart from the range anyway.
     for pattern in ["(?<=(?~)(?>\\w{2,3}))c", "(?<=(?~)\\w{3,2})c"]:
       let m = search("abc", re(pattern))
       check m.found
@@ -2498,10 +2582,12 @@ suite "look-behind body window":
   test "a body that needs no window keeps the real subject's boundaries":
     # A fixed-length body that backtracks gets no window at all, so ``\b``
     # answers from the subject and holds at ``0`` -- where a window would
-    # have denied it.  Oniguruma agrees on every one of these.
+    # have denied it.  Oniguruma agrees on every one of these, the last three
+    # included: an absent operator repeated away leaves no length behind.
     for pattern in [
       "(?<=\\b)", "(?<=^\\b)", "(?<=\\b\\b)", "(?<=(?:)\\b)", "(?<=a{0}\\b)",
-      "(?<=\\b|zz)", "(?<=zz|\\b)",
+      "(?<=\\b|zz)", "(?<=zz|\\b)", "(?<=(?~){0}\\b)", "(?<=(?:(?~a)){0}\\b)",
+      "(?<=\\b(?:(?~)){0})",
     ]:
       let m = search("ab", re(pattern))
       check m.found
@@ -2521,6 +2607,64 @@ suite "look-behind body window":
     check search("a", re("(?<=(?~)\\b)")).boundaries[0] == 1 .. 1
     check search("ab", re("(?<=(?~)\\b)")).boundaries[0] == 2 .. 2
     check search("a", re("(?<=\\b(?~))")).boundaries[0] == 1 .. 1
+    # Repeated, it is still not fixed-length, unless repeated away.
+    check search("a", re("(?<=(?~)+\\b)")).boundaries[0] == 1 .. 1
+    check search("a", re("(?<=(?~)*\\b)")).boundaries[0] == 1 .. 1
+
+  test "(?~) does not send a body back to the start of the subject":
+    # ``(?~)`` consumes nothing, so it adds nothing to how far back a body may
+    # start, even though the body keeps its window.  Counted as unbounded, it
+    # had every attempt walk back to 0, and a few thousand characters ran into
+    # the step limit.
+    check lengthBounds(re("(?~)").ast, {}) == LenBounds(maxLen: 0, fixedLen: -1)
+    check lengthBounds(re("(?:(?~))+").ast, {}) == LenBounds(maxLen: 0, fixedLen: -1)
+    let s = "cb".repeat(2000)
+    for pattern in ["(?<=(?~)a)b", "(?<=(?~)a|zz)b", "(?<=(?~)+a)b"]:
+      check not search(s, re(pattern)).found
+      check search(s & "ab", re(pattern)).boundaries[0] == 4001 .. 4002
+
+  test "nor does any other absent function that only matches empty":
+    # What makes ``(?~)`` match only empty is that its pattern matches
+    # wherever it starts, and so does any pattern that cannot fail.  Judged by
+    # spelling, these were counted as unbounded and ran into the step limit.
+    for pattern in ["(?~(?:))", "(?~a*)", "(?~a?|x)", "(?~(a*))", "(?~(?>a*)b*)"]:
+      check lengthBounds(re(pattern).ast, {}) == LenBounds(maxLen: 0, fixedLen: -1)
+    let s = "cb".repeat(2000)
+    for pattern in ["(?<=(?~(?:))a)b", "(?<=(?~a*)a)b", "(?<=(?~a?|x)a)b"]:
+      check not search(s, re(pattern)).found
+      check search(s & "ab", re(pattern)).boundaries[0] == 4001 .. 4002
+    # A pattern that only might match empty still bounds nothing: the
+    # function scans for it like any other.  Spans are libonig 6.9.10's.
+    for pattern in ["(?~a*b)", "(?~(?=b))", "(?~\\b)", "(?~a+)"]:
+      check lengthBounds(re(pattern).ast, {}) == LenBounds(maxLen: -1, fixedLen: -1)
+    check search("aab", re("(?~(?=b))")).boundaries[0] == 0 .. 2
+    check search("aab", re("(?~a*b)")).boundaries[0] == 0 .. 0
+    # An absent operator in the pattern fails on the scan's path, so
+    # ``(?~(?~))`` never finds its pattern and runs to the end, while a repeat
+    # can still skip it and match empty.
+    check search("ab", re("(?~(?~))")).boundaries[0] == 0 .. 2
+    check search("ab", re("(?~(?~)*)")).boundaries[0] == 0 .. 0
+
+  test "nor does one whose pattern is an assertion that always holds":
+    # ``\K`` holds wherever it is tried, and so does a positive lookaround
+    # whose body matches everywhere -- a look-behind's too, its body being
+    # clipped where it has to end.  Left out, these ran into the step limit
+    # as ``(?~)`` did.  Spans are libonig 6.9.10's.
+    for pattern in [
+      "(?~\\K)", "(?~(?=))", "(?~(?<=))", "(?~(?=a*))", "(?~(?<=a*))",
+      "(?~(?<=(?>a|)))", "(?~(?=\\K)a*)",
+    ]:
+      check lengthBounds(re(pattern).ast, {}) == LenBounds(maxLen: 0, fixedLen: -1)
+      check search("ab", re(pattern)).boundaries[0] == 0 .. 0
+    let s = "cb".repeat(2000)
+    for pattern in ["(?<=(?~\\K)a)b", "(?<=(?~(?<=))a)b", "(?<=(?~(?<=a*))a)b"]:
+      check not search(s, re(pattern)).found
+      check search(s & "ab", re(pattern)).boundaries[0] == 4001 .. 4002
+    # One that might fail still scans.
+    for pattern in ["(?~(?<=a))", "(?~(?!a))", "(?~(?<!a))", "(?~(?=a+))"]:
+      check lengthBounds(re(pattern).ast, {}) == LenBounds(maxLen: -1, fixedLen: -1)
+    check search("ab", re("(?~(?<=a))")).boundaries[0] == 0 .. 1
+    check search("ab", re("(?~(?!a))")).boundaries[0] == 0 .. 1
 
   test "a nested look-ahead reads past the clip":
     # The clip bounds what the body may consume, not what an assertion inside

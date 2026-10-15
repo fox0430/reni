@@ -32,7 +32,7 @@ type
     ckFlagGroup ## After flag group body, restore flags / grapheme mode.
     ckQuantGreedyMore ## Greedy quantifier: try one more rep, then fall back.
     ckQuantLazyMore ## Lazy quantifier: try one more rep, then fall back.
-    ckRestoreSubjectEnd ## Absent abRange/abExpression: restore subjectEnd.
+    ckRestoreAbsentEnd ## Absent abRange/abExpression: restore ``absentEnd``.
     ckEndCheckPos ## Lookbehind: succeed iff ctx.pos == targetPos.
     ckCapturesChanged ## Quantifier zero-width subloop: succeed iff captures differ.
     ckFindLongestRec ## findLongest top level: record longest, return false.
@@ -68,7 +68,7 @@ type
         ## verdict travels along. Sits in ``qCount``'s padding, so ``Frame``
         ## does not grow.
       qSavedPos: int
-    of ckRestoreSubjectEnd:
+    of ckRestoreAbsentEnd:
       reSavedEnd: int
       reAbsentPos: int
     of ckEndCheckPos:
@@ -116,16 +116,20 @@ type
       ## skip the per-group history entirely.  The two have to stay in step:
       ## each records ``-1`` for the stack depth so ``chUndoCapture`` skips
       ## the matching restore.
-    anchorEnd: int
-      ## What the *zero-width* shapes answer against -- ``$``, ``\z``,
-      ## ``\Z``, ``\b`` -- and the end the absent operator narrows.  A
-      ## look-behind window is not a subject end, so it is not one of these:
-      ## Oniguruma answers those from the real subject inside a body.  See
-      ## [lookbehindBodyEndsAt].
+    absentEnd: int
+      ## The end the absent operator narrows: ``(?~|absent)`` and
+      ## ``(?~|absent|expr)`` move it in, the range clear ``(?~|)`` puts it
+      ## back at the end of the subject.  ``(?~)`` is not a clear -- it is
+      ## the absent function with an empty pattern, and leaves this alone, as
+      ## Oniguruma's does.  Like ``lookLimit`` it bounds consumption, not the
+      ## zero-width shapes: ``$``, ``\z``, ``\Z`` and ``\b`` answer from the
+      ## real subject, as Oniguruma's do -- its absent operator moves only
+      ## ``right_range``, which they do not read.  The one exception is ``\b``
+      ## at position 0; see [matchWordBoundary].
     lookLimit: int
       ## The window a running look-behind body may not consume past, or
-      ## ``NoLookLimit`` outside one.  Bounds consumption only; nothing else
-      ## reads it.
+      ## ``NoLookLimit`` outside one.  Bounds consumption only, apart from
+      ## ``\b`` at position 0 ([matchWordBoundary]).
       ##
       ## Written by [enterLookaroundBody], by [lookbehindBodyEndsAt] putting
       ## back what it found, and by the per-search resets.  A look-behind
@@ -135,7 +139,7 @@ type
       ## with ``right_range``.  A look-ahead is the exception and replaces it
       ## with ``NoLookLimit``; [enterLookaroundBody] has the list.  How far the
       ## matcher may consume is [subjectEnd], which derives from this and
-      ## ``anchorEnd`` rather than being stored beside them.
+      ## ``absentEnd`` rather than being stored beside them.
     absentScan: int
       ## Nesting depth of a running absent-pattern scan -- the walk that looks
       ## for the first position an absent operator's own pattern matches.
@@ -304,7 +308,7 @@ type
     pos: int
     flags: RegexFlags
     keepStart: int
-    anchorEnd: int
+    absentEnd: int
     lookLimit: int
     graphemeMode: GraphemeMode
 
@@ -328,8 +332,8 @@ type
     chUndoFlags ## put back the flags a group boundary restored
     chUndoFlagsGM ## put back the flags and grapheme mode a flag group restored
     chUndoCapture ## put back the span, flags and stack entry a capture wrote
-    chUndoSubjectEnd ## put back the subject end an absent range narrowed
-    chWidenSubjectEnd ## widen the subject end an absent marker narrowed
+    chUndoAbsentEnd ## put back the ``absentEnd`` an absent range narrowed
+    chWidenAbsentEnd ## widen the ``absentEnd`` an absent marker narrowed
     chAbsentFunc ## absent function: retry the continuation shorter
     chUndoPos ## rewind the position a backreference advanced
     chSubexpScope ## leave a subexpression call: depths and flags
@@ -454,10 +458,10 @@ type
       ucSavedCap: Span
       ucSavedStackEntry: Span
       ucFlags: RegexFlags
-    of chUndoSubjectEnd:
+    of chUndoAbsentEnd:
       useAbsentPos: int
-    of chWidenSubjectEnd:
-      wsSavedEnd: int ## ``subjectEnd`` before narrowing; popping widens it back.
+    of chWidenAbsentEnd:
+      wsSavedEnd: int ## ``absentEnd`` before narrowing; popping widens it back.
     of chAbsentFunc:
       afCont: ContId
       afFramesLen: int32
@@ -588,8 +592,9 @@ const NoLookLimit = int.high ## ``lookLimit`` outside a look-behind body.
 
 template subjectEnd(ctx: MatchContext): int =
   ## How far the matcher may *consume*. Consumption reads this; zero-width
-  ## shapes read ``anchorEnd``. Derived, not stored.
-  min(ctx.anchorEnd, ctx.lookLimit)
+  ## shapes read the real subject, apart from ``\b`` at position 0
+  ## ([matchWordBoundary]). Derived, not stored.
+  min(ctx.absentEnd, ctx.lookLimit)
 
 proc decodeCharUpTo(
     ctx: MatchContext, p, limit: int, code: var int32, next: var int
@@ -1035,7 +1040,7 @@ proc saveScalars(ctx: MatchContext): ScalarState {.inline.} =
     pos: ctx.pos,
     flags: ctx.flags,
     keepStart: ctx.keepStart,
-    anchorEnd: ctx.anchorEnd,
+    absentEnd: ctx.absentEnd,
     lookLimit: ctx.lookLimit,
     graphemeMode: ctx.graphemeMode,
   )
@@ -1050,7 +1055,7 @@ proc restoreScalars(ctx: MatchContext, s: ScalarState) {.inline.} =
   ctx.pos = s.pos
   ctx.flags = s.flags
   ctx.keepStart = s.keepStart
-  ctx.anchorEnd = s.anchorEnd
+  ctx.absentEnd = s.absentEnd
   ctx.lookLimit = s.lookLimit
   ctx.graphemeMode = s.graphemeMode
 
@@ -1187,12 +1192,12 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
 
   # Walk consecutive absent markers iteratively so long marker runs do not
   # consume native stack where no guard observes them. Narrowed ends are kept
-  # in ``ckRestoreSubjectEnd`` frames for explicit unwind.
+  # in ``ckRestoreAbsentEnd`` frames for explicit unwind.
   #
   # Serves the ``runCont`` path; the loop answers markers inline.
   let base = ctx.framesLen
   var i = idx
-  # Head of the ``ckRestoreSubjectEnd`` chain for the tail walk.
+  # Head of the ``ckRestoreAbsentEnd`` chain for the tail walk.
   var tail = cont
   while true:
     if i >= nodes.len:
@@ -1207,12 +1212,12 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       # (?~|absent): narrow range to exclude absent.
       let rangeStart = ctx.pos
       let absentPos = findAbsentPos(ctx, node.absentBody, rangeStart)
-      let savedEnd = ctx.anchorEnd
-      ctx.anchorEnd = absentPos
+      let savedEnd = ctx.absentEnd
+      ctx.absentEnd = absentPos
       tail = pushFrame(
         ctx,
         Frame(
-          kind: ckRestoreSubjectEnd,
+          kind: ckRestoreAbsentEnd,
           parent: tail,
           reSavedEnd: savedEnd,
           reAbsentPos: absentPos,
@@ -1221,8 +1226,8 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       inc i
       continue
     if node.kind == nkAbsent and node.absentKind == abClear and not ctx.absentSuppressed:
-      # (?~|) or (?~): clear absent range limit.
-      ctx.anchorEnd = ctx.subject.len
+      # (?~|): clear absent range limit.
+      ctx.absentEnd = ctx.subject.len
       inc i
       continue
     if i + 1 >= nodes.len:
@@ -1239,11 +1244,12 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
     return ok
 
 proc unwindAbsentFrames(ctx: MatchContext, base: int) =
-  ## Pop frames pushed by ``matchSeqCont`` and restore narrowed subject ends.
+  ## Pop frames pushed by ``matchSeqCont`` and widen each ``absentEnd`` they
+  ## narrowed.
   while ctx.framesLen > base:
     dec ctx.framesLen
-    if ctx.frames[ctx.framesLen].kind == ckRestoreSubjectEnd:
-      ctx.anchorEnd = ctx.frames[ctx.framesLen].reSavedEnd
+    if ctx.frames[ctx.framesLen].kind == ckRestoreAbsentEnd:
+      ctx.absentEnd = ctx.frames[ctx.framesLen].reSavedEnd
 
 proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
   ## Compare the encoding of ``target`` against the subject at ``p``.
@@ -1524,14 +1530,14 @@ proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
     ctx.pos == 0 or
       (ctx.pos > 0 and ctx.pos < ctx.subject.len and ctx.subject[ctx.pos - 1] == '\n')
   of akLineEnd:
-    ctx.pos >= ctx.anchorEnd or ctx.subject[ctx.pos] == '\n'
+    ctx.pos >= ctx.subject.len or ctx.subject[ctx.pos] == '\n'
   of akStringBegin:
     moNotBeginString notin ctx.matchOptions and ctx.pos == 0
   of akStringEnd:
-    ctx.pos >= ctx.anchorEnd
+    ctx.pos >= ctx.subject.len
   of akStringEndOrNewline:
-    ctx.pos >= ctx.anchorEnd or
-      (ctx.pos == ctx.anchorEnd - 1 and ctx.subject[ctx.pos] == '\n')
+    ctx.pos >= ctx.subject.len or
+      (ctx.pos == ctx.subject.len - 1 and ctx.subject[ctx.pos] == '\n')
   of akSearchBegin:
     moNotBeginPosition notin ctx.matchOptions and ctx.pos == ctx.searchStart
   of akKeep:
@@ -2022,9 +2028,13 @@ proc prevCharCode(s: openArray[char], pos: int): int32 =
 
 proc matchWordBoundary(ctx: MatchContext): bool =
   let asciiOnly = rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags
-  # An empty window is an empty string, which has no boundary. Fixed-length
-  # bodies take no window (see reduceLookBehindBodies) and still hold at 0.
-  if ctx.lookLimit == 0:
+  # ``\b`` is zero-width, so it reads the real next character: an absent
+  # range and a look-behind window bound only consumption.  The start of the
+  # subject is the exception, as in Oniguruma (``DATA_ENSURE(1)`` in
+  # ``WORD_BOUNDARY``): an empty range there is an empty string, which has no
+  # boundary.  Fixed-length look-behind bodies take no window (see
+  # reduceLookBehindBodies) and still hold at 0.
+  if ctx.pos == 0 and ctx.subjectEnd == 0:
     return false
   let prevIsWord =
     if ctx.pos > 0:
@@ -2038,11 +2048,8 @@ proc matchWordBoundary(ctx: MatchContext): bool =
         isWordChar(Rune(prevCharCode(ctx.subject.oa, ctx.pos)), asciiOnly)
     else:
       false
-  # ``\b`` is zero-width: the next character reads from ``anchorEnd``; the
-  # window bounds only consumption.
-  let seen = ctx.anchorEnd
   let nextIsWord =
-    if ctx.pos < seen:
+    if ctx.pos < ctx.subject.len:
       let lead = ctx.subject[ctx.pos].uint8
       if lead < 0x80:
         # As above, and a one-byte decode cannot be truncated.
@@ -2052,7 +2059,7 @@ proc matchWordBoundary(ctx: MatchContext): bool =
         var next: int
         # ``\b`` reads the code point directly, like ``\w``: no class
         # containers are involved, so a one-byte character above U+007F counts.
-        decodeCharUpTo(ctx, ctx.pos, seen, code, next) and
+        decodeAt(ctx.subject.oa, ctx.pos, code, next) and
           isWordChar(Rune(code), asciiOnly)
     else:
       false
@@ -2251,7 +2258,7 @@ proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
 
 proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.inline.} =
   if ctx.boundsUsable(node) and i < node.lookAlts.len:
-    node.lookAlts[i].bounds
+    node.lookAlts[i]
   else:
     lengthBounds(alt, ctx.flags, ctx.graphemeMode)
 
@@ -2264,35 +2271,25 @@ proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
   ## the position it has to end at.  A fixed-length body that backtracks must
   ## not get a window, so the test is not "may as well clip".
   ##
-  ## The second term is reni's, and it is the one place the two engines are
-  ## not the same shape.  An absent operator narrows Oniguruma's
-  ## ``right_range``, which *is* the window, so a body holding one clips
-  ## itself from the inside; reni's narrows ``anchorEnd`` and spells ``(?~)``
-  ## as a range clear, which widens instead, so the clip has to be asked for
-  ## here.  ``(?<=(?~)\b)`` is the case that shows it -- Oniguruma holds only
-  ## at the end of the subject, and without this term reni would hold at 0.
-  if ctx.bodyBounds(node).fixedLen < 0:
-    return true
-  if ctx.boundsUsable(node):
-    node.lookNeedsWindow
-  else:
-    containsAbsentOp(node.lookBody)
+  ## ``(?~)`` is the absent function with an empty pattern.  It consumes
+  ## nothing, yet does not count as fixed-length (see ``nkAbsent`` in
+  ## [lengthBounds]), so a body holding one is clipped: ``(?<=(?~)\b)``
+  ## never holds at 0, where ``(?<=\b)`` holds before a word character.
+  ctx.bodyBounds(node).fixedLen < 0
 
 proc altWindow(ctx: MatchContext, node: Node, i: int, alt: Node): bool {.inline.} =
   ## As [bodyWindow] for one alternative; each answers on its own.
-  if ctx.boundsUsable(node) and i < node.lookAlts.len:
-    let info = node.lookAlts[i]
-    return info.bounds.fixedLen < 0 or info.needsWindow
-  if lengthBounds(alt, ctx.flags, ctx.graphemeMode).fixedLen < 0:
-    return true
-  containsAbsentOp(alt)
+  ctx.altBounds(node, i, alt).fixedLen < 0
 
 proc lookbehindBodyEndsAt(
     ctx: MatchContext, body: Node, startPos, targetEnd: int, window: bool
 ): bool =
   ## Whether ``body`` matches from ``startPos`` and ends exactly at ``targetEnd``.
   ## With ``window``, consumption is clipped to ``[0, targetEnd)`` while
-  ## zero-width shapes still read the real subject. Restores the window on exit.
+  ## zero-width shapes still read the real subject -- apart from ``\b`` and
+  ## ``\B`` at position 0 when ``targetEnd`` is 0: that window is an empty
+  ## string, which has no word boundary ([matchWordBoundary]). Restores the
+  ## window on exit.
   let savedLimit = ctx.lookLimit
   ctx.pos = startPos
   if window:
@@ -2509,12 +2506,12 @@ proc absentBodyMatches(ctx: MatchContext, absentBody: Node): bool {.inline.} =
 
 proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int =
   ## First pos at/after `fromPos` where `absentBody` matches, else
-  ## `anchorEnd`. Closed sub-matches only; restores `pos`. Measured against
-  ## ``anchorEnd``: a look-behind window must not narrow an absent range.
-  result = ctx.anchorEnd
+  ## `absentEnd`. Closed sub-matches only; restores `pos`. Measured against
+  ## ``absentEnd``: a look-behind window must not narrow an absent range.
+  result = ctx.absentEnd
   let entryPos = ctx.pos
   var checkPos = fromPos
-  while checkPos < ctx.anchorEnd:
+  while checkPos < ctx.absentEnd:
     let saved = save(ctx)
     ctx.pos = checkPos
     if ctx.absentBodyMatches(absentBody):
@@ -2522,7 +2519,7 @@ proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int =
       restore(ctx, saved)
       break
     restore(ctx, saved)
-    if checkPos >= ctx.anchorEnd:
+    if checkPos >= ctx.absentEnd:
       break
     var r: Rune
     nextCharAt(ctx.subject.oa, checkPos, r)
@@ -2534,10 +2531,13 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
     return false
   case node.absentKind
   of abClear:
-    # (?~) or (?~|) - always matches empty, restore subject end
-    ctx.anchorEnd = ctx.subject.len
+    # (?~|) - always matches empty, widens ``absentEnd`` to the subject end
+    ctx.absentEnd = ctx.subject.len
     return runCont(ctx, cont)
   of abFunction:
+    if node.isEmptyAbsentFunc:
+      # (?~), (?~a*) - match empty and nothing else ([isEmptyAbsentFunc]).
+      return runCont(ctx, cont)
     # (?~pattern) - match longest text not containing pattern (see
     # ``absentBodyMatches`` for what counts as containing).
     let startPos = ctx.pos
@@ -2577,10 +2577,10 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
     let startPos = ctx.pos
     let absentBody {.cursor.} = node.absentBody
     # Find first position where absent matches
-    var absentPos = ctx.anchorEnd
+    var absentPos = ctx.absentEnd
     block findAbsent:
       var checkPos = startPos
-      while checkPos < ctx.anchorEnd:
+      while checkPos < ctx.absentEnd:
         let saved = save(ctx)
         ctx.pos = checkPos
         if ctx.absentBodyMatches(absentBody):
@@ -2588,18 +2588,18 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
           restore(ctx, saved)
           break findAbsent
         restore(ctx, saved)
-        if checkPos >= ctx.anchorEnd:
+        if checkPos >= ctx.absentEnd:
           break
         var r: Rune
         nextCharAt(ctx.subject.oa, checkPos, r)
     # Limit matching range to [startPos, absentPos)
-    let savedEnd = ctx.anchorEnd
+    let savedEnd = ctx.absentEnd
     ctx.pos = startPos
-    ctx.anchorEnd = absentPos
+    ctx.absentEnd = absentPos
     let fid = pushFrame(
       ctx,
       Frame(
-        kind: ckRestoreSubjectEnd,
+        kind: ckRestoreAbsentEnd,
         parent: cont,
         reSavedEnd: savedEnd,
         reAbsentPos: absentPos,
@@ -2607,15 +2607,15 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
     )
     let ok = matchWithCont(ctx, node.absentExpr, fid)
     ctx.framesLen = fid
-    ctx.anchorEnd = savedEnd
+    ctx.absentEnd = savedEnd
     return ok
   of abRange:
-    # (?~|absent) - range marker: zero-width, limits subjectEnd
+    # (?~|absent) - range marker: zero-width, narrows ``absentEnd``
     let absentBody {.cursor.} = node.absentBody
-    var absentPos = ctx.anchorEnd
+    var absentPos = ctx.absentEnd
     block findAbsent:
       var checkPos = ctx.pos
-      while checkPos < ctx.anchorEnd:
+      while checkPos < ctx.absentEnd:
         let saved = save(ctx)
         ctx.pos = checkPos
         if ctx.absentBodyMatches(absentBody):
@@ -2623,15 +2623,15 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
           restore(ctx, saved)
           break findAbsent
         restore(ctx, saved)
-        if checkPos >= ctx.anchorEnd:
+        if checkPos >= ctx.absentEnd:
           break
         var r: Rune
         nextCharAt(ctx.subject.oa, checkPos, r)
-    let savedEnd = ctx.anchorEnd
-    ctx.anchorEnd = absentPos
+    let savedEnd = ctx.absentEnd
+    ctx.absentEnd = absentPos
     let ok = runCont(ctx, cont)
     if not ok:
-      ctx.anchorEnd = savedEnd # restore only on failure
+      ctx.absentEnd = savedEnd # restore only on failure
     return ok
 
 proc condHolds(ctx: MatchContext, node: Node): bool =
@@ -2889,17 +2889,17 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
   of ckQuantGreedyMore, ckQuantLazyMore:
     # Repetitions belong to the loop; hand the chain back instead of recursing.
     runContFromMachine(ctx, cont)
-  of ckRestoreSubjectEnd:
+  of ckRestoreAbsentEnd:
     let savedEnd = ctx.frames[cont].reSavedEnd
     let absentPos = ctx.frames[cont].reAbsentPos
     let parent = ctx.frames[cont].parent
-    ctx.anchorEnd = savedEnd
+    ctx.absentEnd = savedEnd
     inc ctx.chainDepth
     checkNativeDepth(ctx)
     let ok = runCont(ctx, parent)
     dec ctx.chainDepth
     if not ok:
-      ctx.anchorEnd = absentPos
+      ctx.absentEnd = absentPos
     ok
   of ckEndCheckPos:
     ctx.pos == ctx.frames[cont].ecpTargetPos
@@ -3908,28 +3908,28 @@ proc runMachine(
           continue
         case node.absentKind
         of abClear:
-          # (?~) or (?~|): always empty; no undo.
-          ctx.anchorEnd = ctx.subject.len
+          # (?~|): always empty; no undo.
+          ctx.absentEnd = ctx.subject.len
           mode = mCont
         of abRange:
           # (?~|absent): narrow range, widen on failure.
           let rangeStart = ctx.pos
           let absentPos = findAbsentPos(ctx, node.absentBody, rangeStart)
-          let savedEnd = ctx.anchorEnd
-          ctx.anchorEnd = absentPos
-          ctx.pushChoice Choice(kind: chWidenSubjectEnd, wsSavedEnd: savedEnd)
+          let savedEnd = ctx.absentEnd
+          ctx.absentEnd = absentPos
+          ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
           mode = mCont
         of abExpression:
           # (?~|absent|expr): match expr narrowed, widen after.
           let startPos = ctx.pos
           let absentPos = findAbsentPos(ctx, node.absentBody, startPos)
-          let savedEnd = ctx.anchorEnd
-          ctx.anchorEnd = absentPos
-          ctx.pushChoice Choice(kind: chWidenSubjectEnd, wsSavedEnd: savedEnd)
+          let savedEnd = ctx.absentEnd
+          ctx.absentEnd = absentPos
+          ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
           cont = pushFrame(
             ctx,
             Frame(
-              kind: ckRestoreSubjectEnd,
+              kind: ckRestoreAbsentEnd,
               parent: cont,
               reSavedEnd: savedEnd,
               reAbsentPos: absentPos,
@@ -3938,6 +3938,12 @@ proc runMachine(
           node = node.absentExpr
           mode = mMatch
         of abFunction:
+          if node.isEmptyAbsentFunc:
+            # (?~), (?~a*): match empty and nothing else
+            # ([isEmptyAbsentFunc]), so there is no scan to run and no
+            # shorter end to retry.
+            mode = mCont
+            continue
           # (?~pattern): longest non-containing text, then shorter. An empty
           # body match counts (see ``absentBodyMatches``).
           let startPos = ctx.pos
@@ -4059,13 +4065,13 @@ proc runMachine(
             break
           if mk.kind == nkAbsent and mk.absentKind == abRange:
             let absentPos = findAbsentPos(ctx, mk.absentBody, ctx.pos)
-            let savedEnd = ctx.anchorEnd
-            ctx.anchorEnd = absentPos
-            ctx.pushChoice Choice(kind: chWidenSubjectEnd, wsSavedEnd: savedEnd)
+            let savedEnd = ctx.absentEnd
+            ctx.absentEnd = absentPos
+            ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
             cont = pushFrame(
               ctx,
               Frame(
-                kind: ckRestoreSubjectEnd,
+                kind: ckRestoreAbsentEnd,
                 parent: cont,
                 reSavedEnd: savedEnd,
                 reAbsentPos: absentPos,
@@ -4073,7 +4079,7 @@ proc runMachine(
             )
             inc seqIdx
           elif mk.kind == nkAbsent and mk.absentKind == abClear:
-            ctx.anchorEnd = ctx.subject.len
+            ctx.absentEnd = ctx.subject.len
             inc seqIdx
           else:
             break
@@ -4178,14 +4184,14 @@ proc runMachine(
             startGreedy(body, minRep, maxRep, count, parent, pure)
           else:
             startLazy(body, minRep, maxRep, count, parent, pure)
-      of ckRestoreSubjectEnd:
+      of ckRestoreAbsentEnd:
         # Walking out of a marker: widen end, leaving an undo to re-narrow
         # when backtracking retries inside the narrowed region.
         if ctx.choicesLen > choiceBase:
           ctx.pushChoice Choice(
-            kind: chUndoSubjectEnd, useAbsentPos: ctx.frames[cont].reAbsentPos
+            kind: chUndoAbsentEnd, useAbsentPos: ctx.frames[cont].reAbsentPos
           )
-        ctx.anchorEnd = ctx.frames[cont].reSavedEnd
+        ctx.absentEnd = ctx.frames[cont].reSavedEnd
         cont = ctx.frames[cont].parent
         mode = mCont
       of ckEndCheckPos:
@@ -4498,12 +4504,12 @@ proc runMachine(
           ctx.captureStacks[index][myDepth] = ctx.choices[top].ucSavedStackEntry
         ctx.choicesLen = top
         mode = mFail
-      of chUndoSubjectEnd:
-        ctx.anchorEnd = ctx.choices[top].useAbsentPos
+      of chUndoAbsentEnd:
+        ctx.absentEnd = ctx.choices[top].useAbsentPos
         ctx.choicesLen = top
         mode = mFail
-      of chWidenSubjectEnd:
-        ctx.anchorEnd = ctx.choices[top].wsSavedEnd
+      of chWidenAbsentEnd:
+        ctx.absentEnd = ctx.choices[top].wsSavedEnd
         ctx.choicesLen = top
         mode = mFail
       of chAbsentFunc:
@@ -4730,7 +4736,7 @@ proc resetForRegex(
     if capCount > ctx.captureStacks.len:
       ctx.captureStacks.setLen(capCount)
   ctx.lookLimit = NoLookLimit
-  ctx.anchorEnd = subject.len
+  ctx.absentEnd = subject.len
   # Subject-keyed: honour ``sameSubject`` only while the buffer pointer matches.
   if not sameSubject or ctx.seqRegionData != cast[pointer](ctx.subject.data):
     ctx.seqRegionEnd = -1
@@ -4765,7 +4771,7 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.keepStart = startPos
   ctx.leadRunEnd = -1
   ctx.lookLimit = NoLookLimit
-  ctx.anchorEnd = ctx.subject.len
+  ctx.absentEnd = ctx.subject.len
   ctx.absentScan = 0
   ctx.recursionDepth = 0
   ctx.callDepth = 0
@@ -5094,7 +5100,7 @@ proc searchImplInto*(
         if prefilterDirty:
           ctx.flags = regex.flags
           ctx.lookLimit = NoLookLimit
-          ctx.anchorEnd = subject.len
+          ctx.absentEnd = subject.len
           ctx.searchStart = start
           ctx.graphemeMode = gmNone
           prefilterDirty = false
