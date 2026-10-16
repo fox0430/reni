@@ -34,7 +34,6 @@ type
     ckQuantLazyMore ## Lazy quantifier: try one more rep, then fall back.
     ckRestoreAbsentEnd ## Absent abRange/abExpression: restore ``absentEnd``.
     ckEndCheckPos ## Lookbehind: succeed iff ctx.pos == targetPos.
-    ckCapturesChanged ## Quantifier zero-width subloop: succeed iff captures differ.
     ckFindLongestRec ## findLongest top level: record longest, return false.
 
   Frame = object
@@ -67,17 +66,17 @@ type
         ## re-entered from this frame, with the node no longer in hand, so the
         ## verdict travels along. Sits in ``qCount``'s padding, so ``Frame``
         ## does not grow.
+      qSnap: CapOff
+        ## The captures as this iteration found them: the slot of the rollback
+        ## the repetition left behind it, or ``NoCapOff`` for a pure body,
+        ## which writes none.  Read only where the iteration consumed nothing
+        ## ([emptyPassProgressed]).  In the same padding as ``qPure``.
       qSavedPos: int
     of ckRestoreAbsentEnd:
       reSavedEnd: int
       reAbsentPos: int
     of ckEndCheckPos:
       ecpTargetPos: int
-    of ckCapturesChanged:
-      ccSnapshotStart: int32
-        ## Start offset of this frame's snapshot in ``ctx.captureSnapshots``.
-        ## A flat int32 keeps ``seq[Span]`` out of the variant, which would
-        ## inflate every Frame.
     of ckFindLongestRec:
       flStartPos: int
 
@@ -191,8 +190,6 @@ type
       ## avoids destructors. Stale entries own nothing, under every memory
       ## management: a frame is plain values down to the last field.
     framesLen: int ## Live length of ``frames``.
-    captureSnapshots: seq[Span]
-      ## ``captures`` snapshots for ``ckCapturesChanged``, LIFO with ``frames``.
     choices: seq[Choice]
       ## Backtrack buffer; live length is ``choicesLen``. Never shrinks; stale
       ## entries own nothing, in the same way ``frames`` above notes.
@@ -321,7 +318,6 @@ type
     chLeafVariant ## literal / class: try the next way it can match
     chQuantGreedy ## greedy quantifier: stop repeating, run the continuation
     chQuantLazy ## lazy quantifier: the continuation failed, repeat once more
-    chZeroWidthRep ## zero-width repetition: drive the body to change captures
     chSimpleRepeat ## greedy repetition of a single-way leaf: give one rep back
     chLazyScan
       ## lazy repetition of a single-way leaf: scan to the next admissible position
@@ -419,21 +415,6 @@ type
         ## one ``int`` per element per iteration.  A give-back is a decrement.
       qrRegion: int ## First position no element accepts; carried from [seqRunRegion].
       qrScalars: ScalarState ## state at repeat start; see ``srScalars``
-    of chZeroWidthRep:
-      zBody: NodeId
-      zCont: ContId
-      zFramesLen: int32
-      zIter: int32 ## capture-changing attempts made so far
-      zSavedCap: CapOff
-        ## Slot of the attempt behind the current captures, released when the
-        ## next retry starts.  The offset alone: an attempt is snapshotted
-        ## straight after a rollback to ``zEntry``, so its scalars are
-        ## ``zEntry``'s, and a second ``SavedState`` would pad out every other
-        ## choice kind by 32 bytes.
-      zEntry: SavedState
-        ## State at the choice point, which every retry starts from: ``pos``
-        ## in between was moved by the continuation that failed back in.  Also
-        ## the rollback for the captures the attempts accumulated.
     of chUndoState:
       usFramesLen: int32
       usSaved: SavedState
@@ -945,9 +926,8 @@ template storeSlot(dst, src: untyped) =
   copyMem(addr dst, addr src, sizeof(dst))
 
 # The precondition for ``pushFrame``'s ``copyMem`` store below.  An owning
-# field added to the variant -- the ``seq[Span]`` ``ckCapturesChanged``
-# deliberately keeps out, say -- would otherwise compile silently and then
-# leak the overwritten slot and double-free the pushed temporary.
+# field added to the variant (a ``seq``, say) would otherwise compile silently
+# and then leak the overwritten slot and double-free the pushed temporary.
 requireBitwiseCopyable(Frame)
 
 proc pushFrame(ctx: MatchContext, frame: sink Frame): ContId {.inline.} =
@@ -1556,18 +1536,46 @@ proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
     else:
       not isGraphemeBoundary(ctx.subject.oa, ctx.pos)
 
-proc tryCaptureChangingMatch(ctx: MatchContext, body: Node): bool {.inline.} =
-  ## Try ``body``, accepting only capture-changing matches. Drives zero-width
-  ## quantifier subloops to alternate captures each iteration.
-  let snapStart = ctx.captureSnapshots.len.int32
-  for c in ctx.captures:
-    ctx.captureSnapshots.add(c)
-  let fid = pushFrame(
-    ctx, Frame(kind: ckCapturesChanged, parent: TrueCont, ccSnapshotStart: snapStart)
+proc emptyPassProgressed(
+    ctx: MatchContext, snap: CapOff, groups: uint32
+): bool {.noinline.} =
+  ## Whether an iteration that ended where it began still counts as one, so
+  ## the repeat goes on instead of stopping there: Oniguruma's
+  ## ``STACK_EMPTY_CHECK_MEM``.  It does when a group in ``groups`` (the
+  ## repeat's ``Regex.emptyStatus``) was set for the first time, or moved --
+  ## unless it was empty before and is empty still, since an empty span reads
+  ## the same wherever it sits.  ``snap`` holds the captures as the iteration
+  ## found them; ``NoCapOff`` means a body that writes none.  No other change
+  ## counts, as in Oniguruma's ``EMPTY_CHECK_END``.
+  ##
+  ## Not modelled: Oniguruma writes a repeat's required iterations, and every
+  ## iteration of a small bounded greedy one, out as copies with no empty
+  ## check, when the copies fit in ``QUANTIFIER_EXPAND_LIMIT_SIZE`` (10)
+  ## opcodes.  So ``^(?:\1a|())+$`` matches "a" there and not here.  Which
+  ## form a body gets depends on its compiled length, which reni does not
+  ## reproduce; every iteration here is checked, as Oniguruma checks a body
+  ## too long to copy.
+  if groups == 0 or snap == NoCapOff:
+    return false
+  let base = int(snap)
+  for g in 1 ..< min(ctx.captures.len, 32):
+    if (groups and (1'u32 shl g)) == 0:
+      continue
+    let before = ctx.capSaves[base + g]
+    let after = ctx.captures[g]
+    if after == before or after.a < 0:
+      continue
+    if before.a < 0 or before.a != before.b or after.a != after.b:
+      return true
+  false
+
+proc emptyPassProgressed(ctx: MatchContext, cont: ContId): bool {.noinline.} =
+  ## [emptyPassProgressed] for the iteration repeat frame ``cont`` closes.  Out
+  ## of line, with the frame reads, so the rare path costs ``runMachine``
+  ## nothing it would spend on the common one.
+  ctx.emptyPassProgressed(
+    ctx.frames[cont].qSnap, ctx.regex[].emptyStatus(ctx.frames[cont].qBody)
   )
-  result = matchWithCont(ctx, body, fid)
-  ctx.framesLen = fid
-  ctx.captureSnapshots.setLen(snapStart)
 
 proc classBitmapAnswers*(node: Node, b: uint8, flags: RegexFlags): bool {.inline.} =
   ## Whether ``node``'s precomputed ASCII bitmap settles byte ``b`` on its own.
@@ -1688,11 +1696,12 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
       anyMatch
   if matched: next else: -1
 
-proc isSingleWayLeaf(ctx: MatchContext, node: Node): bool {.inline.} =
+template isSingleWayLeaf(ctx: MatchContext, node: Node): bool =
   ## Whether ``node`` matches at most one way here; see [LeafGate].
   if ctx.gates != nil and ctx.flags == ctx.boundFlags:
-    return ctx.gateAt(node.id).singleWay
-  singleWayLeaf(node, ctx.flags)
+    ctx.gateAt(node.id).singleWay
+  else:
+    singleWayLeaf(node, ctx.flags)
 
 proc leafRunAccepts(
     ctx: MatchContext, node: Node, accept: var set[uint8]
@@ -2056,10 +2065,30 @@ proc leadAnchorsHold(ctx: MatchContext): bool {.inline.} =
       return false
   true
 
-proc resolveCapture(ctx: MatchContext, capIdx: int, level: int): Span =
+proc openSpan(held: Span): Span {.inline.} =
+  ## The slot of a set group ``Regex.opensUnset`` names while the group is
+  ## open: unset to every reader that tests ``a >= 0`` -- a plain reference,
+  ## a conditional -- yet still holding ``held``, the span the group last
+  ## closed with, for a reference with a level ([lastClosed]).  In the slot
+  ## itself, so every snapshot and rollback carries it along.
+  Span(a: -2 - held.a, b: held.b)
+
+proc lastClosed(s: Span): Span {.inline.} =
+  ## What a reference with a level reads in a capture slot: the span, or for
+  ## an open group the one [openSpan] holds.  Oniguruma's
+  ## ``BACKREF_WITH_LEVEL`` walks its stack for the last span the group
+  ## closed, so the open group does not hide it there.  It counts call depth
+  ## on that walk and this does not; see ``backrefLeveled``.
+  if s.a <= -2:
+    Span(a: -2 - s.a, b: s.b)
+  else:
+    s
+
+proc resolveCapture(ctx: MatchContext, capIdx: int, level: int, leveled: bool): Span =
   ## Resolve a capture, optionally using recursion-level stack.
   ## level > 0: access the level-th entry (1-based) in the capture stack for this group.
   ## level 0: use the current capture value.
+  ## ``leveled``: the reference was written with a level (``backrefLeveled``).
   if level > 0 and capIdx > 0 and capIdx - 1 < ctx.captureStacks.len:
     let stack = ctx.captureStacks[capIdx - 1] # captureStacks is 0-based by group
     if level <= stack.len:
@@ -2067,12 +2096,15 @@ proc resolveCapture(ctx: MatchContext, capIdx: int, level: int): Span =
     return UnsetSpan
   if capIdx >= ctx.captures.len:
     return UnsetSpan
-  ctx.captures[capIdx]
+  if leveled:
+    lastClosed(ctx.captures[capIdx])
+  else:
+    ctx.captures[capIdx]
 
-proc backrefEnd(ctx: MatchContext, capIdx: int, level: int): int =
+proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int =
   ## End position if capture `capIdx` matches here, else -1. Pure predicate
   ## shared by the loop and the recursive fallback.
-  let cap = resolveCapture(ctx, capIdx, level)
+  let cap = resolveCapture(ctx, capIdx, level, leveled)
   if cap.a < 0:
     return -1 # unset capture
   if rfIgnoreCase in ctx.flags:
@@ -2145,9 +2177,11 @@ proc backrefEnd(ctx: MatchContext, capIdx: int, level: int): int =
         return -1
     return ctx.pos + capLen
 
-proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0): bool =
+proc matchBackref(
+    ctx: MatchContext, capIdx: int, cont: ContId, level: int, leveled: bool
+): bool =
   ## Recursive fallback only; the loop answers backrefs itself.
-  let e = backrefEnd(ctx, capIdx, level)
+  let e = backrefEnd(ctx, capIdx, level, leveled)
   if e < 0:
     return false
   let savedPos = ctx.pos
@@ -2156,6 +2190,25 @@ proc matchBackref(ctx: MatchContext, capIdx: int, cont: ContId, level: int = 0):
     return true
   ctx.pos = savedPos
   false
+
+proc clearOnOpen(ctx: MatchContext, capIdx: int) {.inline.} =
+  ## Oniguruma's ``MEM_START_PUSH``, for a group ``Regex.opensUnset`` names:
+  ## until the group closes again it reads as unset, but to a reference with
+  ## a level ([openSpan]).  The span it held comes back on backtracking,
+  ## through the undo a close leaves too.  For the loop's entries;
+  ## [matchCapture] puts the span back itself.
+  if ctx.regex[].opensUnset(capIdx) and ctx.captures[capIdx].a >= 0:
+    ctx.pushChoice Choice(
+      kind: chUndoCapture,
+      ucCapIdx: int32(capIdx),
+      ucIndex: int32(capIdx - 1),
+      ucMyDepth: -1,
+      ucSavedCap: ctx.captures[capIdx],
+      ucSavedStackEntry: UnsetSpan,
+      ucFlags: ctx.flags,
+    )
+    ctx.captures[capIdx] = openSpan(ctx.captures[capIdx])
+    ctx.capturesDirty = true
 
 proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool =
   let capIdx = index + 1 # boundaries[0] = overall match
@@ -2179,8 +2232,16 @@ proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool
       cSavedFlags: savedFlags,
     ),
   )
+  # [clearOnOpen], undone here on the way out.
+  let held = ctx.captures[capIdx]
+  let clears = ctx.regex[].opensUnset(capIdx) and held.a >= 0
+  if clears:
+    ctx.captures[capIdx] = openSpan(held)
+    ctx.capturesDirty = true
   let ok = matchWithCont(ctx, body, fid)
   ctx.framesLen = fid
+  if not ok and clears:
+    ctx.captures[capIdx] = held
   ok
 
 proc runCapture(ctx: MatchContext, contId: ContId): bool =
@@ -2651,7 +2712,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
   case node.kind
   of nkBackreference:
     # Loop answers these itself.
-    matchBackref(ctx, node.backrefIndex, cont, node.backrefLevel)
+    matchBackref(ctx, node.backrefIndex, cont, node.backrefLevel, node.backrefLeveled)
   of nkNamedBackref:
     # Loop answers these itself.
     if ctx.regex[].nameRefCount(node.backrefRefs) == 0:
@@ -2659,7 +2720,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
     for i in ctx.regex[].nameRefsOf(node.backrefRefs):
       let idx = int(i) + 1 # captures are 1-indexed in boundaries
       let saved = save(ctx)
-      if matchBackref(ctx, idx, cont, node.namedBackrefLevel):
+      if matchBackref(ctx, idx, cont, node.namedBackrefLevel, node.namedBackrefLeveled):
         drop(ctx, saved)
         return true
       restore(ctx, saved)
@@ -2848,15 +2909,6 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
     ok
   of ckEndCheckPos:
     ctx.pos == ctx.frames[cont].ecpTargetPos
-  of ckCapturesChanged:
-    # ``captures.len`` is fixed per regex, so snapshot length always matches.
-    let snapStart = int(ctx.frames[cont].ccSnapshotStart)
-    var changed = false
-    for i in 0 ..< ctx.captures.len:
-      if ctx.captureSnapshots[snapStart + i] != ctx.captures[i]:
-        changed = true
-        break
-    changed
   of ckFindLongestRec:
     let sp = ctx.frames[cont].flStartPos
     let mLen = ctx.pos - sp
@@ -3193,7 +3245,9 @@ proc runMachine(
     ## Rollback point for a repetition.  A body that writes no captures needs
     ## scalars only: continuation captures carry their own ``chUndoCapture``
     ## entries, popped before this choice is reached -- the argument
-    ## ``chSimpleRepeat``'s ``srScalars`` already runs on.
+    ## ``chSimpleRepeat``'s ``srScalars`` already runs on.  ``NoCapOff`` also
+    ## skips the empty check, which such a body never needs: ``markGroupReads``
+    ## asserts it owns no watched group.
     if pure:
       SavedState(scalars: saveScalars(ctx), capOff: NoCapOff)
     else:
@@ -3203,6 +3257,7 @@ proc runMachine(
       body: Node, minRep, maxRep, count: int32, c: ContId, pure: bool
   ): untyped =
     ## Greedy: try one more rep, leaving "stop and run cont" behind.
+    let snapshot = quantSnapshot(pure)
     ctx.pushChoice Choice(
       kind: chQuantGreedy,
       qcBody: body.id,
@@ -3213,7 +3268,7 @@ proc runMachine(
       qcFramesLen: ctx.framesLen.int32,
       qcPhase: 0,
       qcPure: pure,
-      qcSaved: quantSnapshot(pure),
+      qcSaved: snapshot,
     )
     if maxRep < 0 or count < maxRep:
       cont = pushFrame(
@@ -3226,6 +3281,7 @@ proc runMachine(
           qMaxRep: maxRep,
           qCount: count,
           qPure: pure,
+          qSnap: snapshot.capOff,
           qSavedPos: ctx.pos,
         ),
       )
@@ -3467,6 +3523,7 @@ proc runMachine(
         # As ``nkGroup`` above, but the frame carries the span and stays.
         if not keepsFlags:
           ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
+        ctx.clearOnOpen(index + 1)
         # Capture recursion depth at entry time (before continuations modify it)
         let myDepth =
           if index < ctx.groupRecursionDepth.len:
@@ -3631,7 +3688,10 @@ proc runMachine(
                 capturesBackTo(ctx, attemptOff)
                 break
               count += 1
-              if ctx.pos == attemptScalars.pos:
+              if ctx.pos == attemptScalars.pos and
+                  not ctx.emptyPassProgressed(
+                    attemptOff, ctx.regex[].emptyStatus(body.id)
+                  ):
                 break # zero-width: count as one rep, then stop
             releaseTo(ctx, attemptOff) # release the scratch slot
             if ctx.leadRunEnd < 0 and node.id == ctx.leadRun:
@@ -3907,7 +3967,8 @@ proc runMachine(
           mode = mCont
       of nkBackreference:
         # Pure predicate plus position undo; no native frame.
-        let e = backrefEnd(ctx, node.backrefIndex, node.backrefLevel)
+        let e =
+          backrefEnd(ctx, node.backrefIndex, node.backrefLevel, node.backrefLeveled)
         if e < 0:
           mode = mFail
         else:
@@ -3918,7 +3979,9 @@ proc runMachine(
         # First same-named group that matches wins.
         var e = -1
         for i in ctx.regex[].nameRefsOf(node.backrefRefs):
-          e = backrefEnd(ctx, int(i) + 1, node.namedBackrefLevel)
+          e = backrefEnd(
+            ctx, int(i) + 1, node.namedBackrefLevel, node.namedBackrefLeveled
+          )
           if e >= 0:
             break
         if e < 0:
@@ -3966,6 +4029,7 @@ proc runMachine(
           )
           if captureIdx >= 0 and captureIdx + 1 < ctx.captures.len:
             let index = captureIdx
+            ctx.clearOnOpen(index + 1)
             let myDepth =
               if index < ctx.groupRecursionDepth.len:
                 ctx.groupRecursionDepth[index]
@@ -4096,17 +4160,10 @@ proc runMachine(
         mode = mCont
       of ckQuantGreedyMore, ckQuantLazyMore:
         let isGreedy = ctx.frames[cont].kind == ckQuantGreedyMore
-        if ctx.pos == ctx.frames[cont].qSavedPos:
-          # Zero-width: drive body to vary captures only.
-          ctx.pushChoice Choice(
-            kind: chZeroWidthRep,
-            zBody: ctx.frames[cont].qBody,
-            zCont: ctx.frames[cont].parent,
-            zFramesLen: ctx.framesLen.int32,
-            zIter: 0,
-            zSavedCap: NoCapOff,
-            zEntry: save(ctx),
-          )
+        if ctx.pos == ctx.frames[cont].qSavedPos and not ctx.emptyPassProgressed(cont):
+          # Zero-width, and nothing the repeat watches moved: stop repeating,
+          # as Oniguruma's empty check skips the jump back.  The body's other
+          # ways are still on the stack below.
           cont = ctx.frames[cont].parent
           mode = mCont
         else:
@@ -4133,19 +4190,6 @@ proc runMachine(
       of ckEndCheckPos:
         # Terminal predicate; answering here is the whole answer.
         if ctx.pos == ctx.frames[cont].ecpTargetPos:
-          cont = ctx.frames[cont].parent
-          mode = mCont
-        else:
-          mode = mFail
-      of ckCapturesChanged:
-        # Snapshot length always equals captures length (fixed per regex).
-        let snapStart = int(ctx.frames[cont].ccSnapshotStart)
-        var changed = false
-        for i in 0 ..< ctx.captures.len:
-          if ctx.captureSnapshots[snapStart + i] != ctx.captures[i]:
-            changed = true
-            break
-        if changed:
           cont = ctx.frames[cont].parent
           mode = mCont
         else:
@@ -4346,6 +4390,7 @@ proc runMachine(
         let pure = ctx.choices[top].qcPure
         ctx.choicesLen = top
         if phase == 0 and (maxRep < 0 or count < maxRep):
+          var snap = NoCapOff
           if pure:
             ctx.pushChoice Choice(
               kind: chUndoScalars,
@@ -4353,8 +4398,10 @@ proc runMachine(
               uzScalars: saveScalars(ctx),
             )
           else:
+            let saved = save(ctx)
+            snap = saved.capOff
             ctx.pushChoice Choice(
-              kind: chUndoState, usFramesLen: ctx.framesLen.int32, usSaved: save(ctx)
+              kind: chUndoState, usFramesLen: ctx.framesLen.int32, usSaved: saved
             )
           cont = pushFrame(
             ctx,
@@ -4366,6 +4413,7 @@ proc runMachine(
               qMaxRep: maxRep,
               qCount: count,
               qPure: pure,
+              qSnap: snap,
               qSavedPos: ctx.pos,
             ),
           )
@@ -4373,34 +4421,6 @@ proc runMachine(
           mode = mMatch
         else:
           mode = mFail
-      of chZeroWidthRep:
-        ctx.framesLen = ctx.choices[top].zFramesLen
-        if ctx.choices[top].zIter > 0:
-          # Keep captures; each attempt builds on the previous one.
-          releaseTo(ctx, ctx.choices[top].zSavedCap)
-        # Back to the choice point: the continuation that just failed ran
-        # from here and left ``pos`` wherever it stopped.
-        restoreScalars(ctx, ctx.choices[top].zEntry.scalars)
-        if ctx.choices[top].zIter >= ctx.captures.len.int32:
-          restore(ctx, ctx.choices[top].zEntry)
-          ctx.choicesLen = top
-          mode = mFail
-        else:
-          # A mark, not a snapshot: the attempt runs on ``zEntry``'s scalars
-          # (just restored) and ``zEntry`` rolls back everything it writes.
-          # Only where ``capSaves`` stood is needed, to trim back to next round.
-          let attemptPos = ctx.pos
-          let attemptCap = capMark(ctx)
-          if not tryCaptureChangingMatch(ctx, ctx.nodeAt(ctx.choices[top].zBody)) or
-              ctx.pos != attemptPos:
-            restore(ctx, ctx.choices[top].zEntry)
-            ctx.choicesLen = top
-            mode = mFail
-          else:
-            ctx.choices[top].zIter += 1
-            ctx.choices[top].zSavedCap = attemptCap
-            cont = ctx.choices[top].zCont
-            mode = mCont
       of chUndoState:
         restore(ctx, ctx.choices[top].usSaved)
         ctx.framesLen = ctx.choices[top].usFramesLen
@@ -4719,8 +4739,6 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   # Almost every attempt fails having touched none of these, so each clear is
   # guarded: ``setLen`` is an out-of-line call that walks destructors for
   # ``stackLensSaves``, and the loops are waste when nothing was written.
-  if ctx.captureSnapshots.len > 0:
-    ctx.captureSnapshots.setLen(0)
   if ctx.capSaves.len > 0:
     ctx.capSaves.setLen(0)
   if ctx.stackLensSaves.len > 0:

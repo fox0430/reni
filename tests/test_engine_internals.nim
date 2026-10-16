@@ -2021,15 +2021,33 @@ suite "a positive lookaround's captures are rolled back like any other":
     for i in 1 .. 5:
       check b.boundaries[i] == UnsetSpan
 
+suite "a repeat's body belongs to that repeat alone":
+  # ``Regex.emptyStatus`` keys a repeat's empty-check set by its body, and
+  # greedy, lazy and possessive repeats all read it there, so two repeats
+  # over one body would merge their sets.  Each pattern runs a rewrite that
+  # moves a body or a branch: the nested-repeat reduction (all three
+  # shapes), the inverted-range rewrite, the string-repeat expansion, and the
+  # look-behind division.
+  test "no two repeats share a body":
+    for pattern in [
+      "(?:(?:a|())*)*\\1", "(?:(?:a|()){2}){3}\\1", "(?:(?:a|())+)??\\1",
+      "(?:a|()){4,2}\\1", "(?:ab){3}(a|())*\\1", "(?<=a|bc)(?:x|())*\\1",
+      "(?<=(?:a|())*b|cd)\\1", "(?:(?:a|())+){2,}\\1",
+    ]:
+      let r = re(pattern)
+      var owned = newSeq[bool](r.nodes.len)
+      for node in r.nodes:
+        if node != nil and node.kind == nkQuantifier:
+          let body = node.quantBody.id.int
+          check not owned[body]
+          owned[body] = true
+
 suite "a zero-width repetition retries from its own choice point":
+  # ``(b{0,2})+`` matches empty, and an iteration that consumes nothing ends
+  # the repetition.  When the continuation then fails, backtracking goes on
+  # in the body from where that iteration began, not from where the
+  # continuation failed.  Oniguruma 6.9.10 agrees with every expectation.
   test "the continuation's position does not carry into the next attempt":
-    # ``(b{0,2})+`` matches empty, so the repetition is driven by
-    # ``chZeroWidthRep``: each retry re-runs the body to make it capture
-    # something new.  The retry has to start where the choice was made.  It
-    # used to start wherever the continuation had failed, which let the body
-    # match at a position the repetition never reached -- and then the
-    # continuation ran on from there, reporting a match that began before
-    # anything matched.
     let a = search("aax", re("(b{0,2})+.x"))
     check a.matchSpan == 1 .. 3
     check a.boundaries[1] == 1 .. 1
@@ -2041,9 +2059,9 @@ suite "a zero-width repetition retries from its own choice point":
     check search("aax", re("(b{0,2})+ax")).matchSpan == 1 .. 3
 
   test "an exhausted zero-width repetition leaves no captures behind":
-    # Every attempt is rolled back when the construct gives up, so a pure
+    # Every iteration is rolled back when the repetition gives up, so a pure
     # repetition upstream -- which restores scalars only -- cannot inherit
-    # them.
+    # what they captured.
     check not search("aay", re("^(?:.)*(b{0,2})+x")).found
     let m = search("aax", re("^(?:.)*?(b{0,2})+x"))
     check m.matchSpan == 0 .. 3

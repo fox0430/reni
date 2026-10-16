@@ -736,6 +736,10 @@ suite "Bug fixes and validation":
     expect RegexError:
       discard re("a{1,99999999999999999999}")
 
+  test "conditional group number past 32 bits raises error":
+    expect RegexError:
+      discard re("(a)(?(4294967297)a|b)")
+
   test "octal escape at max codepoint \\o{4177777} succeeds":
     let r = re("\\o{4177777}")
     check r.ast.kind == nkEscapedLiteral

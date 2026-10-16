@@ -378,10 +378,21 @@ type
     of nkBackreference:
       backrefIndex*: int
       backrefLevel*: int ## recursion-level offset for \k<n+level> (0 = normal)
+      backrefLeveled*: bool
+        ## Written with a level, ``+0`` too: inside its open group it reads the
+        ## span the group last closed (``BACKREF_WITH_LEVEL``), where a plain
+        ## reference reads unset (``Regex.opensUnset``).  Oniguruma takes the
+        ## span closed at the reference's own call depth, reni the last at any
+        ## depth: ``(?<n>a|b\g<n>\k<n+0>)`` on "bbaa" matches 2..3 there and
+        ## 1..4 here.
     of nkNamedBackref:
       backrefName*: string
       namedBackrefLevel*: int ## recursion-level offset for \k<name+level> (0 = normal)
+      namedBackrefLeveled*: bool ## As ``backrefLeveled``.
       backrefRefs*: NameRefs ## groups ``backrefName`` resolves to
+      backrefScope*: int32
+        ## How many named groups the parser had opened when it read the
+        ## reference; see [namedGroupsRead].
     of nkLookaround:
       lookKind*: LookaroundKind
       lookBody*: Node
@@ -418,7 +429,10 @@ type
       condRefs*: NameRefs
         ## Groups ``condRefName`` resolves to; here, in the rest of that same
         ## padding slot, since this branch is the one on the 64-byte line.
-      condRefIndex*: int ## capture index for ckBackref
+      condRefIndex*: int32 ## capture index for ckBackref
+      condScope*: int32
+        ## ``backrefScope`` for ckNamedRef.  Both 32 bits wide, so the two
+        ## share the word ``condRefIndex`` had alone.
       condRefName*: string ## capture name for ckNamedRef
 
       condYes*: Node ## yes branch
@@ -571,6 +585,12 @@ proc `==`*(a, b: NodeId): bool {.borrow.}
 const NoNameRefs* = NameRefs(0)
   ## **Internal API.** The name-reference table's reserved empty run, so a
   ## [NameRefs] field nobody wrote names no group rather than the first one's.
+
+const EveryNamedGroup* = high(int32)
+  ## **Internal API.** A scope ([namedGroupsRead]) that every named group is
+  ## inside: for ``\g<name>``, and for a bare ``(?(name)...)``.  Oniguruma
+  ## reads the bare spelling as a condition on the pattern ``name``; reni
+  ## reads it as PCRE2 does, as a test of every group so named.
 
 const NoNodeId* = NodeId(0)
   ## **Internal API.** The node table's reserved slot 0, which holds ``nil``.
@@ -887,6 +907,27 @@ type
       ## One entry per ``NodeId``, derived under ``flags`` when the pattern
       ## compiled; see [LeafGate].  Empty on a ``Regex`` assembled without it,
       ## which only costs the matcher the derivation it does anyway.
+    emptyStatus: seq[uint32]
+      ## By the [NodeId] of a repeat's *body*, which its continuation frame
+      ## holds: the groups whose change makes an iteration that consumed
+      ## nothing count as progress, bit ``n`` for group ``n`` (Oniguruma's
+      ## ``empty_status_mem``).  A group is in it when this is the innermost
+      ## repeat around it that may match empty, and a reference or a
+      ## ``(?(n)...)`` reads it from outside the repeat.  Groups from 32 up
+      ## have no bit, as under Oniguruma's ``MEM_STATUS_LIMIT_ON``.
+      ##
+      ## Filled by ``markGroupReads``.  No rewrite leaves a body under two
+      ## repeats, so the key names one (``test_engine_internals`` pins it).
+      ## Empty when no repeat in the pattern has a set.
+    opensUnset: seq[bool]
+      ## By capture index (1-based): whether entering the group clears it, as
+      ## Oniguruma's ``MEM_START_PUSH`` does for every group a reference or a
+      ## conditional reads.  Until the group closes again, a plain reference
+      ## or a ``(?(n)...)`` reads it as unset, on a later iteration too:
+      ## ``(b|a\1)+`` stops after the "b" of "bab", where PCRE2 and Perl read
+      ## that "b" in the second iteration.  A reference with a level still
+      ## reads the span the group last closed with (see ``backrefLeveled``):
+      ## the cleared slot encodes it.  Empty when no group is read.
     flags: RegexFlags
       ## The flags the pattern was compiled under.  Read through the `flags`
       ## accessor, which carries the reason this is not a public field.
@@ -978,6 +1019,29 @@ proc setLeafGates*(r: var Regex, gates: sink seq[LeafGate]) {.inline.} =
   ## needs the node table that constructor builds, and fold tables it must not
   ## depend on.
   r.leafGates = gates
+
+proc emptyStatus*(r: Regex, body: NodeId): uint32 {.inline.} =
+  ## **Internal API.** The empty-check set of the repeat over ``body``; see
+  ## ``Regex.emptyStatus``.
+  if body.int < r.emptyStatus.len:
+    r.emptyStatus[body.int]
+  else:
+    0
+
+proc setEmptyStatus*(r: var Regex, status: sink seq[uint32]) =
+  ## **Internal API.** Fill in ``Regex.emptyStatus``: by body [NodeId], or
+  ## empty when no repeat has a set.
+  r.emptyStatus = status
+
+proc opensUnset*(r: Regex, capIdx: int): bool {.inline.} =
+  ## **Internal API.** Whether entering group ``capIdx`` (1-based) clears it;
+  ## see ``Regex.opensUnset``.
+  capIdx < r.opensUnset.len and r.opensUnset[capIdx]
+
+proc setOpensUnset*(r: var Regex, groups: sink seq[bool]) =
+  ## **Internal API.** Fill in ``Regex.opensUnset``: by capture index
+  ## (1-based), or empty when no group needs it.
+  r.opensUnset = groups
 
 proc nameRefCount*(r: Regex, refs: NameRefs): int32 {.inline.} =
   ## **Internal API.** How many capture groups ``refs`` names.
@@ -1190,6 +1254,29 @@ proc numberNodes*(ast: Node): seq[Node] =
       if child != nil:
         pending.add(child)
 
+iterator namedGroupsRead*(
+    namedCaptures: openArray[(string, int)], name: string, scope: int32
+): int =
+  ## **Internal API.** The groups called ``name`` a reference to it reads,
+  ## 0-based, in declaration order, where ``scope`` is how many named groups
+  ## had opened where the reference is written.  Oniguruma looks the name up
+  ## right there, as it parses the reference, so a group of that name declared
+  ## later is not one it reads, while the group the reference sits in is:
+  ## ``(?<n>a)\k<n>(?<n>b)`` reads the first ``n`` alone.  Where no group so
+  ## named has opened yet, Oniguruma rejects the pattern
+  ## (``ONIGERR_UNDEFINED_NAME_REFERENCE``) and reni reads every one.
+  var upto = min(int(scope), namedCaptures.len)
+  var before = false
+  for i in 0 ..< upto:
+    if namedCaptures[i][0] == name:
+      before = true
+      break
+  if not before:
+    upto = namedCaptures.len
+  for i in 0 ..< upto:
+    if namedCaptures[i][0] == name:
+      yield namedCaptures[i][1]
+
 proc resolveNameRefs*(nodes: seq[Node], namedCaptures: seq[(string, int)]): seq[int32] =
   ## Resolve every name reference in ``nodes`` to the capture groups it names,
   ## recording the run's offset on the node and returning the table the
@@ -1199,46 +1286,43 @@ proc resolveNameRefs*(nodes: seq[Node], namedCaptures: seq[(string, int)]): seq[
   ## [numberNodes] numbered.  Slot 0 is a zero length, so a node this never
   ## visits -- a numeric ``\g<1>``, say -- names no group.
   ##
-  ## A name declared twice yields a run of both groups, in declaration order,
+  ## A name declared twice yields a run of the groups [namedGroupsRead] gives,
   ## which is why one index would not do: ``\k<name>`` tries each, and
   ## ``(?(<name>)...)`` holds if any of them captured.
   result = @[0'i32]
   if namedCaptures.len == 0:
     return
-  # One run per distinct name, not per reference: a pattern naming one group
-  # from a hundred places stores one copy of the answer, not a hundred.
-  var runs: Table[string, int32]
+  # One run per distinct answer, not per reference: a pattern naming one group
+  # from a hundred places stores one copy of it, not a hundred.  An answer is
+  # the first so many groups of one name, so the name and the count key it.
+  var runs: Table[(string, int32), int32]
   for node in nodes:
     if node == nil:
       continue
-    template resolve(name: string, field: untyped) =
+    template resolve(name: string, scope: int32, field: untyped) =
       if name.len > 0:
-        var off = runs.getOrDefault(name, -1'i32)
-        if off < 0:
-          off = int32(result.len)
-          result.add(0'i32)
-          for (declared, index) in namedCaptures:
-            if declared == name:
+        var found = 0'i32
+        for _ in namedCaptures.namedGroupsRead(name, scope):
+          inc found
+        var off = int32(NoNameRefs)
+        if found > 0:
+          off = runs.getOrDefault((name, found), -1'i32)
+          if off < 0:
+            off = int32(result.len)
+            result.add(found)
+            for index in namedCaptures.namedGroupsRead(name, scope):
               result.add(int32(index))
-          let found = int32(result.len) - off - 1
-          if found == 0:
-            # Nothing to point at: drop the length slot again and record the
-            # reserved empty run, so the next reference skips the scan.
-            result.setLen(off)
-            off = int32(NoNameRefs)
-          else:
-            result[off] = found
-          runs[name] = off
+            runs[(name, found)] = off
         field = NameRefs(off)
 
     case node.kind
     of nkNamedBackref:
-      resolve(node.backrefName, node.backrefRefs)
+      resolve(node.backrefName, node.backrefScope, node.backrefRefs)
     of nkConditional:
       if node.condKind == ckNamedRef:
-        resolve(node.condRefName, node.condRefs)
+        resolve(node.condRefName, node.condScope, node.condRefs)
     of nkSubexpCall:
-      resolve(node.callName, node.callRefs)
+      resolve(node.callName, EveryNamedGroup, node.callRefs)
     else:
       discard
 

@@ -45,11 +45,13 @@ type
     lo, hi: int
     sure: bool
 
-  GroupSpans = object
+  GroupSpans* = object
     ## What [charSpan] reads beyond the node it measures: the group bodies a
     ## backreference or a call is measured through, each group's span once
     ## measured, and the groups the pattern refers to anywhere.  Collected
-    ## when the first positive look-behind is tuned; most patterns have none.
+    ## when the first group is measured; most patterns never get there.  The
+    ## compiler's empty-check pass measures through one too, on the numbered
+    ## final tree (see [initGroupSpans]).
     root: Node
     names: seq[(string, int)]
     bodies: seq[Node]
@@ -58,6 +60,12 @@ type
     visiting: seq[bool]
     referenced: seq[bool]
     ready: bool
+    open: int ## How many groups are being measured; see [repeatBodySpan].
+    bodySpans: seq[CharSpan]
+    bodyKnown: seq[bool]
+      ## By [NodeId]: a repeat's body span, once measured; see
+      ## [repeatBodySpan].  Empty unless [initGroupSpans] was given the
+      ## numbering.
 
 const CharSpanCap = 1 shl 30
   ## Where a count saturates, as Oniguruma's ``distance_add`` and
@@ -147,10 +155,9 @@ proc ensureGroups(g: var GroupSpans) =
     if idx >= 0 and idx < g.referenced.len:
       g.referenced[idx] = true
 
-  proc markName(g: var GroupSpans, name: string) =
-    for (n, idx) in g.names:
-      if n == name:
-        mark(g, idx)
+  proc markName(g: var GroupSpans, name: string, scope: int32) =
+    for idx in g.names.namedGroupsRead(name, scope):
+      mark(g, idx)
 
   proc walk(g: var GroupSpans, node: Node) =
     if node == nil:
@@ -159,18 +166,18 @@ proc ensureGroups(g: var GroupSpans) =
     of nkBackreference:
       mark(g, node.backrefIndex - 1)
     of nkNamedBackref:
-      markName(g, node.backrefName)
+      markName(g, node.backrefName, node.backrefScope)
     of nkSubexpCall:
       if node.callIndex > 0:
         mark(g, node.callIndex - 1)
       elif node.callName.len > 0:
-        markName(g, node.callName)
+        markName(g, node.callName, EveryNamedGroup)
     of nkConditional:
       case node.condKind
       of ckBackref:
         mark(g, node.condRefIndex - 1)
       of ckNamedRef:
-        markName(g, node.condRefName)
+        markName(g, node.condRefName, node.condScope)
       else:
         discard
     else:
@@ -194,29 +201,47 @@ proc groupSpan(g: var GroupSpans, idx: int): CharSpan =
     return CharSpan(lo: 0, hi: -1)
   if not g.measured[idx]:
     g.visiting[idx] = true
+    inc g.open
     var s = charSpan(g.bodies[idx], g)
+    dec g.open
     g.visiting[idx] = false
     s.sure = false
     g.spans[idx] = s
     g.measured[idx] = true
   g.spans[idx]
 
-proc namedGroupSpan(g: var GroupSpans, name: string): CharSpan =
-  ## Any of the groups called ``name``, as a backreference to a name that
-  ## several groups share reads any one of them.
+proc namedGroupSpan(g: var GroupSpans, name: string, scope: int32): CharSpan =
+  ## Any of the groups called ``name`` that a reference in ``scope`` reads
+  ## ([namedGroupsRead]), as a backreference to a name that several groups
+  ## share reads any one of them.
   ensureGroups(g)
   var first = true
-  for (n, idx) in g.names:
-    if n == name:
-      let s = groupSpan(g, idx)
-      result =
-        if first:
-          s
-        else:
-          either(result, s)
-      first = false
+  for idx in g.names.namedGroupsRead(name, scope):
+    let s = groupSpan(g, idx)
+    result =
+      if first:
+        s
+      else:
+        either(result, s)
+    first = false
   if first:
     result = CharSpan(lo: 0, hi: -1)
+
+proc repeatBodySpan(q: Node, g: var GroupSpans): CharSpan =
+  ## [charSpan] of repeat ``q``'s body, kept by [NodeId] when
+  ## [initGroupSpans] was given the numbering.  A repeat inside another is
+  ## then measured once, not again for every repeat around it.  Nothing is
+  ## kept or read while a group is being measured: a reference back into
+  ## that group reads as unbounded there (see [groupSpan]), and the same
+  ## body measured from outside it reads it in full.
+  let id = q.id.int
+  let keep = g.open == 0 and id > 0 and id < g.bodyKnown.len
+  if keep and g.bodyKnown[id]:
+    return g.bodySpans[id]
+  result = charSpan(q.quantBody, g)
+  if keep:
+    g.bodySpans[id] = result
+    g.bodyKnown[id] = true
 
 proc charSpan(node: Node, g: var GroupSpans): CharSpan =
   ## Oniguruma's ``node_char_len1`` over this tree.  ``\R`` and ``\X`` are
@@ -258,7 +283,7 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
     if lo == 0 and hi == 0:
       spanOf(0)
     else:
-      charSpan(node.quantBody, g).repeated(lo, hi)
+      repeatBodySpan(node, g).repeated(lo, hi)
   of nkCapture:
     groupSpan(g, node.captureIndex)
   of nkNamedCapture:
@@ -285,12 +310,12 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
     if node.namedBackrefLevel != 0:
       CharSpan(lo: 0, hi: -1)
     else:
-      namedGroupSpan(g, node.backrefName)
+      namedGroupSpan(g, node.backrefName, node.backrefScope)
   of nkSubexpCall:
     if node.callIndex > 0:
       groupSpan(g, node.callIndex - 1)
     elif node.callName.len > 0:
-      namedGroupSpan(g, node.callName)
+      namedGroupSpan(g, node.callName, EveryNamedGroup)
     else:
       CharSpan(lo: 0, hi: -1) # ``\g<0>``: the whole pattern, recursively
   of nkConditional:
@@ -316,6 +341,31 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
       spanOf(0, sure = false)
     of abFunction, abExpression:
       CharSpan(lo: 0, hi: -1)
+
+proc initGroupSpans*(root: Node, names: seq[(string, int)], nodeCount = 0): GroupSpans =
+  ## Measure through the groups of ``root``; ``names`` maps each capture
+  ## name to its group.  With ``nodeCount``, the size of the table ``root``
+  ## was numbered into, [repeatBodySpan] keeps what it measures.  Leave it 0
+  ## on a tree a pass is still reshaping, as [tuneLookBehinds] does.
+  GroupSpans(
+    root: root,
+    names: names,
+    bodySpans: newSeq[CharSpan](nodeCount),
+    bodyKnown: newSeq[bool](nodeCount),
+  )
+
+proc repeatBodyMayBeEmpty*(q: Node, g: var GroupSpans): bool =
+  ## Whether repeat ``q``'s body may match empty: what Oniguruma's
+  ## ``node_min_byte_len(body) == 0`` decides for the repeat's
+  ## ``emptiness``.  That counts bytes and [charSpan] characters, but the two
+  ## minimums are zero together outside three corners: ``(*FAIL)``,
+  ## infinitely long there and the empty ``(?!)`` it parses to here; a
+  ## reference inside the group it names, empty there (``ND_IS_RECURSION``)
+  ## and measured through the group here; and a reference with a level other
+  ## than 0, empty here wherever it stands.  An iteration through the first,
+  ## or through a plain reference into its own open group
+  ## (``Regex.opensUnset``), always fails, so no empty check reads those.
+  repeatBodySpan(q, g).lo == 0
 
 const AsciiWordBytes =
   {'0'.uint8 .. '9'.uint8, 'A'.uint8 .. 'Z'.uint8, '_'.uint8, 'a'.uint8 .. 'z'.uint8}
@@ -850,5 +900,5 @@ proc tuneLookBehinds*(ast: Node, names: seq[(string, int)], flags: RegexFlags) =
   ## group, for the references and calls a body is measured through.  Must
   ## run where [reduceBody] says: before every pass that reads a look-behind's
   ## bounds, since a reduced body may become fixed-length.
-  var g = GroupSpans(root: ast, names: names)
+  var g = initGroupSpans(ast, names)
   tuneLookBehindsIn(ast, g, flags)

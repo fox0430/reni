@@ -33,6 +33,10 @@ type Parser* = object
   sawAbsent*: bool
     ## True once a ``(?~...)`` has been parsed, so the compiler can skip the
     ## passes that only look for absent operators.
+  sawGroupRead*: bool
+    ## True once a backreference, or a conditional that reads a group or may
+    ## (see ``parseConditional``), has been parsed, so the compiler can skip
+    ## ``markGroupReads`` when nothing reads a group.
 
 const
   MaxNestingDepth = 256
@@ -370,6 +374,7 @@ proc parseEscape(p: var Parser): Node =
     if idxStr.len == 1 or idx <= p.captureCount:
       # Single digit (\1-\9) or valid multi-digit backref
       result = Node(kind: nkBackreference, backrefIndex: idx)
+      p.sawGroupRead = true
     elif ch in {'1' .. '7'}:
       # Multi-digit, invalid capture: treat leading octal digits as octal
       p.pos -= idxStr.len # back up to first digit
@@ -385,6 +390,7 @@ proc parseEscape(p: var Parser): Node =
     else:
       # First digit is 8 or 9, can't be octal: treat as backref
       result = Node(kind: nkBackreference, backrefIndex: idx)
+      p.sawGroupRead = true
   of 'x':
     p.advance()
     if p.peek == '{':
@@ -665,6 +671,7 @@ proc parseEscape(p: var Parser): Node =
     # Parse +level or -level suffix (e.g., \k<1+3> → index=1, level=3)
     var baseName = name
     var level = 0
+    var leveled = false
     let plusPos = name.find('+', start = 1)
       # skip first char (could be +/- for relative ref)
     let minusPos = name.find('-', start = 1)
@@ -681,6 +688,7 @@ proc parseEscape(p: var Parser): Node =
           isLevelNum = false
           break
       if isLevelNum:
+        leveled = true
         for c in levelStr:
           appendDecimal(level, c)
         if name[levelPos] == '-':
@@ -712,13 +720,29 @@ proc parseEscape(p: var Parser): Node =
         elif baseName[0] == '+':
           idx = p.relativeForwardIndex(idx)
           # Forward reference — bounds checked at compile time.
-        result = Node(kind: nkBackreference, backrefIndex: idx, backrefLevel: level)
+        result = Node(
+          kind: nkBackreference,
+          backrefIndex: idx,
+          backrefLevel: level,
+          backrefLeveled: leveled,
+        )
       else:
-        result =
-          Node(kind: nkNamedBackref, backrefName: baseName, namedBackrefLevel: level)
+        result = Node(
+          kind: nkNamedBackref,
+          backrefName: baseName,
+          namedBackrefLevel: level,
+          namedBackrefLeveled: leveled,
+          backrefScope: int32(p.namedCaptures.len),
+        )
     else:
-      result =
-        Node(kind: nkNamedBackref, backrefName: baseName, namedBackrefLevel: level)
+      result = Node(
+        kind: nkNamedBackref,
+        backrefName: baseName,
+        namedBackrefLevel: level,
+        namedBackrefLeveled: leveled,
+        backrefScope: int32(p.namedCaptures.len),
+      )
+    p.sawGroupRead = true
   of 'g':
     p.advance()
     var name = ""
@@ -1156,6 +1180,9 @@ proc parseConditional(p: var Parser): Node =
   var condIndex: int
   var condName: string
   var condBodyNode: Node = nil
+  # A name in ``<>`` or ``''`` reads the groups opened before it, as a
+  # ``\k<name>`` does; a bare one, not Oniguruma's spelling, every group.
+  var condScope = EveryNamedGroup
 
   if p.peek == ')':
     condKind = ckAlwaysTrue
@@ -1226,6 +1253,7 @@ proc parseConditional(p: var Parser): Node =
     p.expect('>')
     p.expect(')')
     resolveCondRef(name, condKind, condIndex, condName)
+    condScope = int32(p.namedCaptures.len)
   elif p.peek == '\'':
     p.advance()
     var name = ""
@@ -1235,6 +1263,7 @@ proc parseConditional(p: var Parser): Node =
     p.expect('\'')
     p.expect(')')
     resolveCondRef(name, condKind, condIndex, condName)
+    condScope = int32(p.namedCaptures.len)
   elif p.peek in {'0' .. '9'} or p.peek == '-':
     var neg = false
     if p.peek == '-':
@@ -1300,10 +1329,20 @@ proc parseConditional(p: var Parser): Node =
   if p.peek == '|':
     p.advance()
     no = p.parseRegex()
+  # A bare name no group has yet may name a later one, which
+  # ``resolveForwardRefConditions`` turns into a ``ckNamedRef``.  Every other
+  # condition reads no group of its own.
+  if condKind in {ckBackref, ckNamedRef} or
+      (condKind == ckRegexCond and condName.len > 0):
+    p.sawGroupRead = true
+  if condIndex > high(int32):
+    # No group has that number; said here, as the node keeps 32 bits of it.
+    p.error("invalid conditional group reference '(" & $condIndex & ")'")
   Node(
     kind: nkConditional,
     condKind: condKind,
-    condRefIndex: condIndex,
+    condRefIndex: int32(condIndex),
+    condScope: condScope,
     condRefName: condName,
     condYes: yes,
     condNo: no,
@@ -1513,7 +1552,13 @@ proc parseGroup(p: var Parser): Node =
             p.advance()
           if name.len == 0:
             p.error("empty backreference name")
-          result = Node(kind: nkNamedBackref, backrefName: name, namedBackrefLevel: 0)
+          result = Node(
+            kind: nkNamedBackref,
+            backrefName: name,
+            namedBackrefLevel: 0,
+            backrefScope: int32(p.namedCaptures.len),
+          )
+          p.sawGroupRead = true
         else:
           # (?P>name) — Python named subroutine call
           p.advance()

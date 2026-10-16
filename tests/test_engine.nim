@@ -3088,6 +3088,201 @@ suite "zero-width match iteration":
   test "split with zero-width lookahead":
     check split("abc", re("(?=b)")) == @["a", "bc"]
 
+suite "an empty iteration that moves a group a reference reads is progress":
+  # An iteration that consumes nothing ends a repetition, except where it
+  # changed a group that a backreference or ``(?(n)...)`` reads from outside
+  # the repetition: then the next iteration may read it differently, and the
+  # repetition goes on (Oniguruma's ``EMPTY_CHECK_END_MEMST``).  Every answer
+  # below is libonig 6.9.10's.
+
+  test "a group set by an empty iteration lets the next one consume":
+    # The first iteration fails ``a\1`` (group 1 unset) and takes ``()``.
+    let m = search("a", re("(?:a\\1|())*"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 1 .. 1
+    check search("a", re("(?:a\\1|())*+")).matchSpan == 0 .. 1
+    let lazy = search("a", re("(?:a\\1|())*?$"))
+    check lazy.matchSpan == 0 .. 1
+    check lazy.boundaries[1] == 0 .. 0
+
+  test "so does a required iteration":
+    # No other engine needs the rule for this one: PCRE2 and Perl run both
+    # required iterations whatever they consume.
+    let m = search("a", re("^(?:a\\1|()){2}$"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 0 .. 0
+
+  test "and one a reference after the repetition reads":
+    let m = search("axa", re("(.*?x?){0,2}x\\1"))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1] == 0 .. 1
+    let n = search("qqqqa", re("(q*?){0,2}\\1*a"))
+    check n.matchSpan == 0 .. 5
+    check n.boundaries[1] == 0 .. 1
+
+  test "a read Oniguruma counts as inside the repetition changes nothing":
+    # Oniguruma means to watch only reads from outside, and decides
+    # "inside" by parent pointers it sets for the first element of each
+    # list and alternation alone.  So a read first in its sequence is
+    # inside, and one anywhere later is not.
+    let m = search("a", re("(?:\\1a|())*"))
+    check m.matchSpan == 0 .. 0
+    check m.boundaries[1] == 0 .. 0
+    check search("a", re("(?:(?:\\1)a|())*")).matchSpan == 0 .. 0
+    check search("a", re("(?:(?:x|\\1)a|())*")).matchSpan == 0 .. 1
+
+  test "only the groups a reference reads count":
+    # Groups 3 and 4 are set by iterations that changed nothing watched, and
+    # are rolled back with them.
+    let m = search("", re("(?:()|()|()|()|()|())*\\2\\5"))
+    check m.matchSpan == 0 .. 0
+    for i in [1, 2, 5]:
+      check m.boundaries[i] == 0 .. 0
+    for i in [3, 4, 6]:
+      check m.boundaries[i] == UnsetSpan
+
+  test "an empty group moved to another empty span has not changed":
+    # A backreference reads an empty span the same wherever it sits.
+    let m = search("bb", re("^(?:()|b*?)*?\\1$"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1] == 0 .. 0
+
+  test "a group in a negative look-around is not watched":
+    # ``(?(?!X)...)`` keeps X's captures when X matches, where Oniguruma keeps
+    # nothing of a negative look-around (libonig rejects these patterns).
+    # Watched, groups 1 and 2 would move each other back and forth at 0
+    # forever.
+    let m = search("aa", re("(?:(?(?!(a(?!\\2)|aa))x)(?(?!(\\1))x))*\\1\\2"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1] == 0 .. 1
+    check m.boundaries[2] == 0 .. 1
+
+  test "a chain of references through groups compiles in linear time":
+    # Whether a repeat may match empty reads each group through every
+    # reference to it.  Measured afresh each time, group ``k`` of
+    # ``()(\1\1)(\2\2)...`` would cost twice group ``k - 1``: 2^40 walks here.
+    var pattern = "()"
+    for k in 1 ..< 40:
+      pattern.add("(\\" & $k & "\\" & $k & ")")
+    pattern.add("(?:\\40)*")
+    check search("", re(pattern)).matchSpan == 0 .. 0
+
+  test "a group inside X{1} belongs to the repetition around it":
+    # Oniguruma's parser puts X in the place of X{1}, so here ``*`` watches
+    # group 1, which ``a\1`` reads from outside it, as it does without the
+    # ``{1}``.
+    let m = search("a", re("(?:b?(?:a\\1|()){1})*"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 1 .. 1
+    # Group 3 changes in the first iteration, so a second one sets group 2.
+    let n = search("", re("(?:(()|(){1}))*\\3"))
+    check n.matchSpan == 0 .. 0
+    check n.boundaries[2] == 0 .. 0
+    check n.boundaries[3] == 0 .. 0
+    check search("", re("(?:(((())){1}()|(\\2)))+\\6")).matchSpan == 0 .. 0
+
+suite "a group reads as unset until it closes":
+  # Oniguruma clears a group a reference reads as the group opens
+  # (``MEM_START_PUSH``), so a reference or a ``(?(n)...)`` inside it finds it
+  # unset, on a later iteration too.  PCRE2 and Perl read the span the
+  # previous iteration left.  Every answer below is libonig 6.9.10's.
+
+  test "a reference inside its own group fails":
+    let m = search("bab", re("(b|a\\1)+"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 0 .. 1
+    check search("bab", re("(?<n>b|a\\k<n>)+")).matchSpan == 0 .. 1
+
+  test "a conditional inside its own group takes the no branch":
+    let d = search("bad", re("(b|a(?(1)c|d))+"))
+    check d.matchSpan == 0 .. 3
+    check d.boundaries[1] == 1 .. 3
+    check search("bac", re("(b|a(?(1)c|d))+")).matchSpan == 0 .. 1
+    check search("bad", re("(?<n>b|a(?(<n>)c|d))+")).matchSpan == 0 .. 3
+
+  test "an empty iteration that set the group is progress, and the next fails":
+    # The first iteration sets group 1, which ``\1`` reads from outside the
+    # repetition, so the repetition goes on; the second finds it unset again
+    # and ends the same way.
+    let m = search("a", re("(a\\1|)*"))
+    check m.matchSpan == 0 .. 0
+    check m.boundaries[1] == 0 .. 0
+    check search("a", re("(a\\1|())*")).matchSpan == 0 .. 0
+    let anchored = search("a", re("((?:a\\1|()))*$"))
+    check anchored.matchSpan == 1 .. 1
+    check anchored.boundaries[1] == 1 .. 1
+
+  test "a reference with a level reads the last span the group closed":
+    # ``BACKREF_WITH_LEVEL`` walks the stack for it rather than reading the
+    # cleared slot.
+    let m = search("bab", re("(b|a\\k<1+0>)+"))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1] == 1 .. 3
+    check search("bab", re("(?<n>b|a\\k<n+0>)+")).matchSpan == 0 .. 3
+
+  test "so does it when a plain reference reads the group too":
+    # ``\1`` makes the group clear as it opens; the level reference inside
+    # still finds the first iteration's "b".
+    let m = search("bab", re("(b|a\\k<1+0>)+(?:x\\1)?"))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1] == 1 .. 3
+    check search("bab", re("(?<n>b|a\\k<n+0>)+(?:x\\k<n>)?")).matchSpan == 0 .. 3
+    # The plain reference inside the group still finds it unset.
+    check search("bab", re("(b|a\\1)+(?:x\\k<1+0>)?")).matchSpan == 0 .. 1
+
+  test "a call closes the group for the caller still inside it":
+    let m = search("bbaa", re("(a|b\\g<1>\\1)"))
+    check m.matchSpan == 1 .. 4
+    check m.boundaries[1] == 1 .. 4
+
+  test "a group given up on gets back the span it held":
+    # The second iteration opens group 1 again.  When ``\1`` fails after it,
+    # backtracking out of the group puts the first iteration's "b" back, and
+    # ``\1`` reads that.
+    let m = search("bb", re("(?:(b|cx))*\\1"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1] == 0 .. 1
+
+suite "a name reads the groups declared before it":
+  # Oniguruma looks a name up as it parses the reference, so ``\k<n>`` and
+  # ``(?(<n>)...)`` read the groups called ``n`` opened by then, the one they
+  # sit in too, and none declared later.  Every answer below is libonig
+  # 6.9.10's but the last test's, a pattern it rejects.
+
+  test "a backreference does not read a later group of its name":
+    # On the first iteration ``\k<n>`` finds only the first ``n``, unset.
+    let m = search("aab", re("(?<n>x)?(?:\\k<n>b|(?<n>a))+"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[1] == UnsetSpan
+    check m.boundaries[2] == 1 .. 2
+    let n = search("a", re("(?<n>x)?(?<n>y)?(?:a\\k<n>|(?<n>))*"))
+    check n.matchSpan == 0 .. 0
+    check n.boundaries[3] == 0 .. 0
+
+  test "nor does a conditional":
+    let m = search("bcac", re("(?<n>x)?(?:(?(<n>)a|b)(?<n>c))+"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[2] == 1 .. 2
+    check search("bcac", re("(?<n>x)?(?:(?('n')a|b)(?<n>c))+")).matchSpan == 0 .. 2
+
+  test "a later group of the name is not watched by a repetition":
+    # Setting the second ``n`` changes nothing ``\k<n>`` reads, so the first
+    # iteration, empty, ends the repetition.
+    let m = search("a", re("(?<n>)\\k<n>(?<n>|a){2}$"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[2] == 1 .. 1
+    # The second iteration's condition finds the first ``m`` open, so unset,
+    # and does not see the second, set by the first iteration.
+    let n = search("b", re("(?<m>(?(<m>)b|(?<m>)))+\\k<m>"))
+    check n.matchSpan == 0 .. 0
+    check n.boundaries[1] == 0 .. 0
+
+  test "a name no group has yet reads the later one":
+    # libonig rejects these (ONIGERR_UNDEFINED_NAME_REFERENCE); reni reads
+    # every group so named, as PCRE2 does.
+    check search("aab", re("(?:\\k<n>b|(?<n>a))+")).matchSpan == 0 .. 3
+    check search("aab", re("(?:(?(<n>)b|a)(?<n>))+")).matchSpan == 0 .. 1
+
 suite "extractFirstChar with zero-width prefixes":
   test "word boundary before literal":
     let r = re("\\babc")

@@ -38,12 +38,17 @@
 ## Perl, Python, Oniguruma and reni all report 1..2 -- two iterations of one
 ## "a" -- where PCRE2 reports 0..2, one iteration of "aa".
 ##
-## Oniguruma gives *both* answers depending on whether a backreference appears
-## elsewhere in the pattern, which is what makes the quorum unreliable here
-## rather than merely split: wrap that same pattern in one and Oniguruma moves
-## to PCRE2's side, so two engines "confirm" a span that Perl and Python read
-## the way reni does.  So a divergence whose differing spans are empty on one
-## side, or end at the same offset, is reported, not failed.
+## Oniguruma gives *both* answers depending on whether a backreference reads
+## the group: wrap that same pattern in one and Oniguruma moves to PCRE2's
+## side.  That is its ``EMPTY_CHECK_END_MEMST`` -- an empty iteration that
+## moved a group a reference reads from outside does not end the repetition
+## -- and reni follows it (``Regex.emptyStatus``).  Before it did, two engines
+## "confirmed" a span that Perl and Python read the way reni did, which is why
+## a divergence whose differing spans are empty on one side, or end at the
+## same offset, is reported, not failed.  Over the 128 seeds from the default
+## no divergence needs that excuse any more.  It stays for the iterations
+## Oniguruma writes out with no empty check at all, which depends on how long
+## the body compiles to (``emptyPassProgressed`` in ``reni/engine.nim``).
 ##
 ## The split is not confined to the group it happens in: a backreference
 ## consumes what the losing iteration left there, so the match span moves with
@@ -79,39 +84,27 @@
 ## on Nim ``stable`` deliberately, and a corpus that moves with the compiler
 ## would turn a required job red on a release with no change under test.
 ##
-## The default seed is clean; other seeds are not.  One shape is open, older
-## than this file: an atomic group over a possessive body, where reni gives up
-## a match the other two engines find.  Each case quoted for it diverges on
-## its own, with Oniguruma 6.9.10 and PCRE2 10.49 giving the same answer
-## against reni: ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on "abqq" answers
-## 0..1 here and 0..4 there, and
+## The default seed is clean, and so are the 128 seeds from it.  The shape
+## this list used to open with, "an atomic group over a possessive body", was
+## neither: ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on "abqq" reduces to
+## ``(?:a\1|()){2}`` on "a", an empty iteration that sets a group the next one
+## reads, which is the backreference rule above.  So did
 ## ``b((([ab])a*+|a*?)(\3.*?(?>ab*q)|a\w(?>x\w++x))*?|a*?\2\w+){0,2}a`` on
-## "bxbaba" 2..4 here and 0..6 there.
+## "bxbaba", and the three cases a 128-seed sweep used to fail on, seeds
+## 20260978 (``(.*?x?){0,2}x\1`` on "axa"), 20260960 (``(q*?){0,2}\1*a`` on
+## "qqqqa", reduced) and 20261033.  All of them give Oniguruma's answer now.
 ##
-## No sweep is named for it: the corpus of none of the ones this list used to
-## name (seeds 424242, 20250101 and 99991, 24 each) holds either pattern.  It
-## also named two more shapes, a backreference to a group that a repetition
-## writes: ``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax" and
+## This list also named two shapes with a backreference to a group that a
+## repetition writes: ``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax" and
 ## ``(a{0,2}+.*(?:a*?){0,2})*\1a`` on "aqbbxqx".  Neither is a divergence.
 ## Oniguruma gives up on both, and PCRE2 was asked ``{0,2}+`` as a possessive
 ## interval; asked what Oniguruma reads, it answers as reni does.
 ##
-## A wider sweep also prints cases where PCRE2 sides with Oniguruma and Perl
-## 5.42 with reni.  Sweeping 128 seeds from the default prints three.
-## ``RENI_FUZZ_SEED=20260978 RENI_FUZZ_SEEDS=1`` prints ``(.*?x?){0,2}x\1`` on
-## "axa": 0..2 here and 0..3 there, the iteration split above carried into the
-## match span by a backreference, past what ``onlyIterationSplitSpans``
-## excuses.  ``RENI_FUZZ_SEED=20260960 RENI_FUZZ_SEEDS=1`` prints the same
-## split carried into the group, with
-## ``(?:(b|q*?+){0,2}\1*+a|(?:\w{1,3}(?:b{0,2}qb)?)b*?+\Kx)\K`` on "qqqqaaq";
-## it reduces to ``(q*?){0,2}\1*a`` on "qqqqa", where group 1 holds 1..2 here,
-## in Perl and in Python, and 0..1 there.
-## ``RENI_FUZZ_SEED=20261033 RENI_FUZZ_SEEDS=1`` prints
-## ``^((?:(?!bxx)(?=ba\w)\Kb+\K|q)*(a{0,2})\K(?:(\2?)|(\3\K\3\Kb)){0,2}\K)q``
-## on "bq": no match here and 1..2 there.  It has not been reduced.
-##
-## So a red run is not automatically a new bug: read the divergence it prints
-## against the cases above before suspecting the change under test.
+## A wider sweep still prints disputes, where Oniguruma stands alone:
+## ``(?=b.|(?:x*?q++b)*b).*+`` on "aaabb" finds nothing there and 3..5 here
+## and in PCRE2.  So a red run is not automatically a new bug: read the
+## divergence it prints against the cases above before suspecting the change
+## under test.
 
 ## Building this links against Oniguruma and PCRE2, which the rest of
 ## ``tests/`` does not, so it is opt-in: without ``-d:reniFuzzDiff`` the file
@@ -437,9 +430,9 @@ else:
     ##   place, but one engine got there in one iteration where the other took
     ##   two, so only the start differs.  ``(a*?){0,2}x`` on "aax" is the
     ##   minimal case: reni, Perl, Python and Oniguruma all say 1..2, PCRE2
-    ##   says 0..2, and adding a backreference elsewhere flips Oniguruma onto
-    ##   PCRE2's side, manufacturing a quorum against an answer three other
-    ##   engines share.
+    ##   says 0..2, and a backreference to the group flips Oniguruma onto
+    ##   PCRE2's side.  reni flips with it now, but a body Oniguruma writes
+    ##   out without an empty check splits its own way still.
     ##
     ## A wrong rollback moves a span somewhere else entirely -- a stale start
     ## *and* a stale end -- which neither tell covers.

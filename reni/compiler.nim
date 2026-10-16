@@ -66,11 +66,12 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     if node.condKind == ckBackref and node.condRefIndex > 0:
       let oldIdx = node.condRefIndex - 1 # 0-based
       if oldIdx in indexMap:
-        newRefIdx = indexMap[oldIdx] + 1 # back to 1-based
+        newRefIdx = int32(indexMap[oldIdx] + 1) # back to 1-based
     Node(
       kind: nkConditional,
       condKind: node.condKind,
       condRefIndex: newRefIdx,
+      condScope: node.condScope,
       condRefName: node.condRefName,
       condYes: demoteUnnamedCaptures(node.condYes, indexMap),
       condNo: demoteUnnamedCaptures(node.condNo, indexMap),
@@ -82,7 +83,12 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     let oldIdx = node.backrefIndex - 1
     if oldIdx in indexMap:
       newIdx = indexMap[oldIdx] + 1
-    Node(kind: nkBackreference, backrefIndex: newIdx, backrefLevel: node.backrefLevel)
+    Node(
+      kind: nkBackreference,
+      backrefIndex: newIdx,
+      backrefLevel: node.backrefLevel,
+      backrefLeveled: node.backrefLeveled,
+    )
   of nkSubexpCall:
     var newCallIndex = node.callIndex
     if node.callIndex > 0:
@@ -615,6 +621,7 @@ proc mergeLiterals(node: Node): Node =
       kind: nkConditional,
       condKind: node.condKind,
       condRefIndex: node.condRefIndex,
+      condScope: node.condScope,
       condRefName: node.condRefName,
       condYes: mergeLiterals(node.condYes),
       condNo: mergeLiterals(node.condNo),
@@ -694,6 +701,146 @@ proc markGroupBodyKeepsFlags(node: Node): bool =
     node.namedCaptureBodyKeepsFlags = not result
   else:
     discard
+
+type EmptyCheckEnv = object ## What [markGroupReads] reads beside the tree.
+  spans: GroupSpans ## measures a repeat's body, through the groups it reads
+  owner: seq[Node]
+    ## By group number: the innermost repeat that may match empty around the
+    ## group's definition, or nil.
+  opensUnset: seq[bool] ## By group number: read; see ``Regex.opensUnset``.
+  status: seq[uint32] ## By body [NodeId]; see ``Regex.emptyStatus``.
+
+proc assignEmptyOwners(node: Node, unclaimed: var seq[int], env: var EmptyCheckEnv) =
+  ## Oniguruma's ``set_empty_repeat_node_trav``: give each group the innermost
+  ## repeat around it that may match empty.  Bottom up, so inner repeats are
+  ## measured first and [repeatBodyMayBeEmpty] reuses their spans.
+  ## ``unclaimed`` holds the groups defined so far that no repeat has claimed.
+  ## A look-around leaves the groups inside it unowned, as ``ANCR_PREC_READ``
+  ## and ``ANCR_LOOK_BEHIND`` do for the positive ones.  Oniguruma owns a
+  ## negative one's groups, harmlessly since it keeps none of them; reni's
+  ## ``(?(?!X)...)`` keeps X's captures, and two such owned groups could move
+  ## each other back and forth forever.  ``X{1}`` claims nothing, as Oniguruma
+  ## parses it to ``X``.
+  if node == nil:
+    return
+  let mark = unclaimed.len
+  case node.kind
+  of nkCapture:
+    unclaimed.add(node.captureIndex + 1)
+  of nkNamedCapture:
+    unclaimed.add(node.namedCaptureIndex + 1)
+  else:
+    discard
+  for child in node.childNodes:
+    assignEmptyOwners(child, unclaimed, env)
+  case node.kind
+  of nkQuantifier:
+    if node.quantMax != 0 and not (node.quantMin == 1 and node.quantMax == 1) and
+        node.repeatBodyMayBeEmpty(env.spans):
+      for i in mark ..< unclaimed.len:
+        if unclaimed[i] < env.owner.len:
+          env.owner[unclaimed[i]] = node
+      unclaimed.setLen(mark)
+  of nkLookaround:
+    unclaimed.setLen(mark)
+  else:
+    discard
+
+proc noteGroupRead(group: int, visible: seq[Node], floor: int, env: var EmptyCheckEnv) =
+  ## A backreference or condition at a place where ``visible[floor ..^ 1]`` are
+  ## the repeats Oniguruma sees it inside reads ``group``.
+  if group <= 0 or group >= env.owner.len:
+    return
+  env.opensUnset[group] = true
+  let q = env.owner[group]
+  if q == nil or group >= 32:
+    return
+  for i in floor ..< visible.len:
+    if visible[i] == q:
+      return
+  let body = q.quantBody.id.int
+  env.status[body] = env.status[body] or (1'u32 shl group)
+
+proc scanGroupReads(
+    node: Node, r: Regex, visible: var seq[Node], floor: int, env: var EmptyCheckEnv
+) =
+  ## Oniguruma's ``set_empty_status_check_trav``: a read of a group counts for
+  ## the group's owner unless the read is inside that repeat, and "inside" is
+  ## decided as ``is_ancestor_node`` decides it -- by parent pointers, of which
+  ## ``set_parent_node_trav`` sets only one per list or alternation: from its
+  ## first element.  Every later element's chain ends at its own cell.  So a
+  ## read counts as inside exactly when every list and alternation between it
+  ## and the repeat is entered at its first element: ``(?:\1a|())*`` reads
+  ## group 1 inside, ``(?:a\1|())*`` from outside.  ``visible[floor ..^ 1]``
+  ## are the repeats ``node`` is inside in that sense.  A name reads the
+  ## groups ``r`` resolved it to.
+  if node == nil:
+    return
+  case node.kind
+  of nkConcat:
+    # An isolated ``(?i)`` needs nothing of its own: the parser already wraps
+    # the rest of the group in it, as Oniguruma's option node does.
+    for i, child in node.children.view:
+      scanGroupReads(child, r, visible, if i == 0: floor else: visible.len, env)
+  of nkAlternation:
+    for i, alt in node.alternatives.view:
+      scanGroupReads(alt, r, visible, if i == 0: floor else: visible.len, env)
+  of nkQuantifier:
+    visible.add(node)
+    scanGroupReads(node.quantBody, r, visible, floor, env)
+    discard visible.pop()
+  of nkBackreference:
+    noteGroupRead(node.backrefIndex, visible, floor, env)
+  of nkNamedBackref:
+    for i in r.nameRefsOf(node.backrefRefs):
+      noteGroupRead(int(i) + 1, visible, floor, env)
+  else:
+    if node.kind == nkConditional:
+      case node.condKind
+      of ckBackref:
+        noteGroupRead(node.condRefIndex, visible, floor, env)
+      of ckNamedRef:
+        for i in r.nameRefsOf(node.condRefs):
+          noteGroupRead(int(i) + 1, visible, floor, env)
+      else:
+        discard
+    for child in node.childNodes:
+      scanGroupReads(child, r, visible, floor, env)
+
+proc markGroupReads(
+    r: var Regex, namedCaptures: seq[(string, int)], captureCount: int
+) =
+  ## Fill ``Regex.emptyStatus`` and ``Regex.opensUnset`` from the references
+  ## and conditionals that read groups.  Runs on the numbered final tree, so
+  ## a repeat's body is measured once and a name reads the groups
+  ## ``resolveNameRefs`` gave it.
+  var env = EmptyCheckEnv(
+    spans: initGroupSpans(r.ast, namedCaptures, r.nodes.len),
+    owner: newSeq[Node](captureCount + 1),
+    opensUnset: newSeq[bool](captureCount + 1),
+    status: newSeq[uint32](r.nodes.len),
+  )
+  var unclaimed: seq[int]
+  assignEmptyOwners(r.ast, unclaimed, env)
+  var visible: seq[Node]
+  scanGroupReads(r.ast, r, visible, 0, env)
+  # The matcher's pure fast paths skip the empty check (``quantSnapshot``);
+  # a body that writes nothing defines no group, so it never owns one.
+  for node in r.nodes:
+    if node != nil and node.kind == nkQuantifier and node.quantBodyPure and
+        node.quantBody != nil:
+      let id = node.quantBody.id.int
+      doAssert id <= 0 or id >= env.status.len or env.status[id] == 0,
+        "pure repeat body with an empty-check set"
+  var watched = false
+  for groups in env.status:
+    if groups != 0:
+      watched = true
+      break
+  if watched:
+    r.setEmptyStatus(move env.status)
+  if true in env.opensUnset:
+    r.setOpensUnset(move env.opensUnset)
 
 proc sameFirstChar(a, b: FirstCharInfo): bool =
   ## Structural equality for two hints.  Spelled out because ``FirstCharInfo``
@@ -2292,3 +2439,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   result.setLeafGates(buildLeafGates(result.nodes, result.flags))
   # Same numbering, same flags: an element names its leaf by ``NodeId``.
   buildSeqRuns(result.nodes, result.flags)
+  # Same numbering: a repeat's frame names its body by ``NodeId``.  Oniguruma
+  # skips it too when nothing reads a group.
+  if p.sawGroupRead and captureCount > 0:
+    result.markGroupReads(namedCaptures, captureCount)
