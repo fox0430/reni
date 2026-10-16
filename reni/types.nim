@@ -402,6 +402,11 @@ type
         ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
         ## has to leave a rollback behind for the captures a positive
         ## lookaround keeps -- see ``keepLookCaptures``.
+      lookDivided*: bool
+        ## Positive look-behind only, set by ``tuneLookBehinds``: Oniguruma
+        ## reads its body's alternation as one look-behind per branch, so a
+        ## matched branch is retried once the continuation fails.  Any other
+        ## look-behind commits to its first match.
     of nkAtomicGroup:
       atomicBody*: Node
     of nkConditional:
@@ -1119,6 +1124,36 @@ iterator childNodes*(node: Node): Node =
       yield node.absentExpr
   else:
     discard
+
+proc collectGroupBodies*(
+    node: Node,
+    bodies: var seq[Node],
+    flags: var seq[RegexFlags],
+    currentFlags: RegexFlags = {},
+) =
+  ## Walk AST to collect capture group bodies and their definition-time flags.
+  if node == nil:
+    return
+  var activeFlags = currentFlags
+  case node.kind
+  of nkCapture:
+    if node.captureIndex >= bodies.len:
+      bodies.setLen(node.captureIndex + 1)
+      flags.setLen(node.captureIndex + 1)
+    bodies[node.captureIndex] = node.captureBody
+    flags[node.captureIndex] = activeFlags
+  of nkNamedCapture:
+    if node.namedCaptureIndex >= bodies.len:
+      bodies.setLen(node.namedCaptureIndex + 1)
+      flags.setLen(node.namedCaptureIndex + 1)
+    bodies[node.namedCaptureIndex] = node.namedCaptureBody
+    flags[node.namedCaptureIndex] = activeFlags
+  of nkFlagGroup:
+    activeFlags = activeFlags + node.flagsOn - node.flagsOff
+  else:
+    discard
+  for child in node.childNodes:
+    collectGroupBodies(child, bodies, flags, activeFlags)
 
 proc numberNodes*(ast: Node): seq[Node] =
   ## Give every node reachable from ``ast`` its slot in the returned table and

@@ -1,6 +1,6 @@
 import std/[algorithm, tables, sets, unicode]
 
-import types, unicode_utils, parser, leafgate
+import types, unicode_utils, parser, leafgate, lookbehind_tune
 
 proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
   ## When named captures exist, convert unnamed nkCapture to nkGroup
@@ -116,36 +116,6 @@ proc resolveForwardRefConditions(node: Node, namedCaptures: seq[(string, int)]) 
         break
   for child in node.childNodes:
     resolveForwardRefConditions(child, namedCaptures)
-
-proc collectGroupBodies(
-    node: Node,
-    bodies: var seq[Node],
-    flags: var seq[RegexFlags],
-    currentFlags: RegexFlags = {},
-) =
-  ## Walk AST to collect capture group bodies and their definition-time flags.
-  if node == nil:
-    return
-  var activeFlags = currentFlags
-  case node.kind
-  of nkCapture:
-    if node.captureIndex >= bodies.len:
-      bodies.setLen(node.captureIndex + 1)
-      flags.setLen(node.captureIndex + 1)
-    bodies[node.captureIndex] = node.captureBody
-    flags[node.captureIndex] = activeFlags
-  of nkNamedCapture:
-    if node.namedCaptureIndex >= bodies.len:
-      bodies.setLen(node.namedCaptureIndex + 1)
-      flags.setLen(node.namedCaptureIndex + 1)
-    bodies[node.namedCaptureIndex] = node.namedCaptureBody
-    flags[node.namedCaptureIndex] = activeFlags
-  of nkFlagGroup:
-    activeFlags = activeFlags + node.flagsOn - node.flagsOff
-  else:
-    discard
-  for child in node.childNodes:
-    collectGroupBodies(child, bodies, flags, activeFlags)
 
 proc validateUtf8(s: string) =
   ## Check that the pattern string is valid UTF-8.
@@ -1828,8 +1798,8 @@ proc reduceNestedQuantifier(node: Node) =
   ## *shape* the passes after it read.
   ##
   ## A look-behind body is where that shape becomes an answer.
-  ## [reduceLookBehindBodies] pins a leading repeat over a *simple* atom only
-  ## -- see [isSimpleRepeatBody] -- so it can only reduce ``(?:a*)*\b`` to
+  ## [tuneLookBehinds] pins a leading repeat over a *simple* atom only
+  ## -- see ``isSimpleRepeatBody`` -- so it can only reduce ``(?:a*)*\b`` to
   ## the bare ``\b`` Oniguruma ends up with once this pass has flattened the
   ## pair first.  Oniguruma gets the ordering for free by doing this while
   ## parsing, long before any look-behind tuning runs; here it is the
@@ -1976,77 +1946,6 @@ proc tuneRepeats(node: Node, expand: bool) =
     reduceNestedQuantifier(node)
     if expand:
       expandStringRepeat(node)
-
-proc isSimpleRepeatBody(node: Node): bool {.inline.} =
-  ## Repeat bodies the look-behind reduction handles: strings, char types,
-  ## char classes and backreferences. Captures and alternations do not reduce.
-  ##
-  ## ``\X`` and ``\R`` are char types here and are not ones Oniguruma
-  ## reduces: it has no node for either, expanding both into a subexpression
-  ## while parsing, and its table reads the node kind.  The difference is not
-  ## cosmetic.  Both run over as many characters as the text gives them, so a
-  ## body holding one has no fixed length and earns the window that makes
-  ## ``(?<=\X*\b)`` refuse at offset 0 -- which reducing the repeat away
-  ## would take from it.
-  if node == nil:
-    return false
-  if node.kind == nkCharType:
-    return node.charType notin {ctGraphemeCluster, ctNewlineSeq}
-  node.kind in {
-    nkLiteral, nkEscapedLiteral, nkString, nkCharClass, nkBackreference, nkNamedBackref
-  }
-
-proc reduceLeadingRepeat(node: Node): bool =
-  ## Pin one leading repeat of a look-behind body to its lower bound.
-  ## Returns whether it became empty, letting the caller advance. Skips
-  ## possessives and non-simple bodies (see [isSimpleRepeatBody]).
-  if node == nil or node.kind != nkQuantifier or node.quantKind == qkPossessive:
-    return false
-  if not isSimpleRepeatBody(peelBareGroups(node.quantBody)):
-    return false
-  node.quantMax = node.quantMin
-  node.quantMin == 0
-
-proc reduceLeadingElement(node: Node): bool =
-  ## Pin one leading element of a look-behind front to empty where possible.
-  ## Bare groups are transparent; anything else is tried as a repeat.
-  let peeled = peelBareGroups(node)
-  if peeled == nil:
-    return true
-  if peeled.kind == nkConcat:
-    for child in peeled.children.view:
-      if not reduceLeadingElement(child):
-        return false
-    return true
-  reduceLeadingRepeat(peeled)
-
-proc reduceLookBehindBody(node: Node) =
-  ## Apply the reduction along the front of a look-behind body, stopping at
-  ## the first element that does not empty. Each alternative is its own body.
-  let peeled = peelBareGroups(node)
-  if peeled == nil:
-    return
-  case peeled.kind
-  of nkAlternation:
-    for alt in peeled.alternatives.view:
-      reduceLookBehindBody(alt)
-  of nkConcat:
-    for child in peeled.children.view:
-      if not reduceLeadingElement(child):
-        break
-  else:
-    discard reduceLeadingRepeat(peeled)
-
-proc reduceLookBehindBodies(node: Node) =
-  ## Run the reduction over every look-behind in the tree. Must run after
-  ## ``normaliseInvertedRanges`` and before ``annotateContinuations``, whose
-  ## possessives this pass skips.
-  if node == nil:
-    return
-  if node.kind == nkLookaround and node.lookKind in {lkBehind, lkNegBehind}:
-    reduceLookBehindBody(node.lookBody)
-  for child in node.childNodes:
-    reduceLookBehindBodies(child)
 
 proc annotateContinuations(
     node: Node, flags: RegexFlags, after: ContinuationReq, calls: bool, mayRewrite: bool
@@ -2301,9 +2200,10 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # before the look-behind reduction, which only sees a leading repeat over a
   # simple atom and so needs both shapes settled first.
   tuneRepeats(ast, expand = not foldsAnywhere(ast, flags))
-  # Pin a look-behind body's leading repeats to their lower bound.
-  # Runs before every pass that reads bounds; a reduced body may become fixed-length.
-  reduceLookBehindBodies(ast)
+  # Pin a look-behind body's leading repeats to their lower bound, and drop or
+  # divide the look-behinds Oniguruma does.  Runs before every pass that reads
+  # bounds; a reduced body may become fixed-length.
+  tuneLookBehinds(ast, namedCaptures, flags)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).

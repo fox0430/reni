@@ -337,7 +337,7 @@ type
     chAbsentFunc ## absent function: retry the continuation shorter
     chUndoPos ## rewind the position a backreference advanced
     chSubexpScope ## leave a subexpression call: depths and flags
-    chLookbehindAlt ## alternation lookbehind: try the next alternative
+    chLookbehindAlt ## divided lookbehind: try the next alternative
     chUndoCallout ## put back the counter a callout incremented
 
   Choice = object
@@ -1138,8 +1138,9 @@ proc keepLookCaptures(
 ) =
   ## Finish a positive lookaround that matched: roll the scalars back to ``s``
   ## and keep what the (zero-width) body captured.  A lookaround commits to
-  ## its first answer, so the entry only ever undoes; alternation lookbehind,
-  ## which does retry, keeps its own ``chLookbehindAlt`` snapshot instead.
+  ## its first answer, so the entry only ever undoes; a divided look-behind
+  ## (``lookDivided``), which does retry, keeps its own ``chLookbehindAlt``
+  ## snapshot instead.
   ## ``\K`` is kept alongside the captures -- see
   ## ``restoreScalarsKeepingStart``.  The two are separate policies: a caller
   ## that wants only the captures passes ``keepKeptStart = false``, which is
@@ -1567,32 +1568,6 @@ proc tryCaptureChangingMatch(ctx: MatchContext, body: Node): bool {.inline.} =
   result = matchWithCont(ctx, body, fid)
   ctx.framesLen = fid
   ctx.captureSnapshots.setLen(snapStart)
-
-proc matchCcAtomWithFold(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
-  ## Match a character class atom, checking case-fold variants for
-  ## POSIX, char type, and Unicode property atoms when case-insensitive.
-  if matchCcAtom(r, atom, flags):
-    return true
-  if rfIgnoreCase in flags:
-    # With rfIgnoreCaseAscii, only fold ASCII characters
-    if rfIgnoreCaseAscii in flags and int32(r) > 127:
-      return false
-    let asciiOnly = rfIgnoreCaseAscii in flags
-    case atom.kind
-    of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp, ccNestedClass:
-      # Check case-fold variants.  ASCII-only folding restricts both ends, not
-      # just the subject: the subject is already known to be ASCII here, and a
-      # variant that is not stays out, so ``k`` reaches ``K`` but never U+212A
-      # and ``[[:^ascii:]]`` does not match it.
-      for variant in caseFoldVariants(r):
-        if variant == r or (asciiOnly and int32(variant) > 127):
-          continue
-        if matchCcAtom(variant, atom, flags):
-          return true
-    else:
-      # ``ccLiteral`` and ``ccRange`` fold inside [matchCcAtom] itself.
-      discard
-  false
 
 proc classBitmapAnswers*(node: Node, b: uint8, flags: RegexFlags): bool {.inline.} =
   ## Whether ``node``'s precomputed ASCII bitmap settles byte ``b`` on its own.
@@ -2033,7 +2008,7 @@ proc matchWordBoundary(ctx: MatchContext): bool =
   # subject is the exception, as in Oniguruma (``DATA_ENSURE(1)`` in
   # ``WORD_BOUNDARY``): an empty range there is an empty string, which has no
   # boundary.  Fixed-length look-behind bodies take no window (see
-  # reduceLookBehindBodies) and still hold at 0.
+  # tuneLookBehinds) and still hold at 0.
   if ctx.pos == 0 and ctx.subjectEnd == 0:
     return false
   let prevIsWord =
@@ -2409,15 +2384,12 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
     startTry = prevCharStart(ctx.subject.oa, startTry)
   true
 
-type LookAltResult = enum
-  ## Result of one `lookbehindAltNext` call.
-  laFixed ## fixed alternative matched: run `lbaCont`
-  laCommitted ## variable alternative matched and committed: run `lbaCont`
-  laExhausted ## no alternative matched: keep failing
-
-proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
-  ## Try remaining alternatives from `lbaNext` on. Fixed matches keep the
-  ## entry for retry; variable matches commit and pop it; exhaustion restores.
+proc lookbehindAltNext(ctx: MatchContext, top: int): bool =
+  ## Try the branches of a divided look-behind ([lookDivided]) from `lbaNext`
+  ## on, each as a look-behind of its own: a fixed-length one at its single
+  ## start, any other shortest-first, and either one committing to its first
+  ## match.  A match keeps the entry, so the next branch is tried once the
+  ## continuation fails; exhaustion restores the entry state and pops it.
   let node {.cursor.} = ctx.nodeAt(ctx.choices[top].lbaNode)
   let targetEnd = ctx.choices[top].lbaTarget
   let alts = peelBareGroups(node.lookBody)
@@ -2433,60 +2405,33 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
     let alt {.cursor.} = alts.alternatives[k]
     let altLen = ctx.altBounds(node, k, alt)
     let altFbl = altLen.fixedLen
-    if altFbl >= 0:
-      # Fixed alternative: single start position.
-      let st = targetEnd - altFbl
-      if st >= 0:
-        let stackSnap = saveStackLens(ctx)
-        let saved = save(ctx)
-        let bodyMatch =
-          lookbehindBodyEndsAt(ctx, alt, st, targetEnd, ctx.altWindow(node, k, alt))
-        if bodyMatch:
-          # Keep captures (and ``\K``); retry replays the entry snapshot.
-          restoreScalarsKeepingStart(ctx, saved.scalars)
-          restoreStackLens(ctx, stackSnap)
-          drop(ctx, saved)
-          ctx.choices[top].lbaNext = int32(k + 1)
-          return laFixed
-        restore(ctx, saved)
+    # A fixed-length branch has one start; any other is scanned from the
+    # shortest start back.
+    let altMinPos =
+      if altFbl >= 0:
+        targetEnd - altFbl
+      elif altLen.maxLen >= 0:
+        max(0, targetEnd - altLen.maxLen)
+      else:
+        0
+    var startTry = if altFbl >= 0: altMinPos else: targetEnd
+    while startTry >= max(altMinPos, 0):
+      let stackSnap = saveStackLens(ctx)
+      let saved = save(ctx)
+      let bodyMatch =
+        lookbehindBodyEndsAt(ctx, alt, startTry, targetEnd, ctx.altWindow(node, k, alt))
+      if bodyMatch:
+        # Keep captures (and ``\K``); retry replays the entry snapshot.
+        restoreScalarsKeepingStart(ctx, saved.scalars)
         restoreStackLens(ctx, stackSnap)
-    else:
-      # Variable alternative: shortest-first scan, commit on first match.
-      let altMbl = altLen.maxLen
-      let altMinPos =
-        if altMbl >= 0:
-          max(0, targetEnd - altMbl)
-        else:
-          0
-      var startTry = targetEnd
-      while startTry >= altMinPos:
-        let stackSnap = saveStackLens(ctx)
-        let saved = save(ctx)
-        let bodyMatch = lookbehindBodyEndsAt(
-          ctx, alt, startTry, targetEnd, ctx.altWindow(node, k, alt)
-        )
-        if bodyMatch:
-          restoreScalarsKeepingStart(ctx, saved.scalars)
-          restoreStackLens(ctx, stackSnap)
-          # Commit with shortest priority: the entry has no retry left, so
-          # its snapshot becomes the rollback for the captures kept here, as
-          # ``keepLookCaptures`` does for the non-alternation shapes.
-          let entrySaved = ctx.choices[top].lbaSaved
-          let entryFramesLen = ctx.choices[top].lbaFramesLen
-          ctx.stackLensSaves.setLen(int(ctx.choices[top].lbaLensOff))
-          if node.lookBodyPure:
-            releaseTo(ctx, entrySaved.capOff)
-            ctx.choicesLen = top
-          else:
-            # What ``keepCaptures`` would push, written over the entry in
-            # place instead -- hence not going through that proc.
-            ctx.choices[top] = keptCaptureChoice(ctx, entrySaved, entryFramesLen)
-          return laCommitted
-        restore(ctx, saved)
-        restoreStackLens(ctx, stackSnap)
-        if startTry == 0:
-          break
-        startTry = prevCharStart(ctx.subject.oa, startTry)
+        drop(ctx, saved)
+        ctx.choices[top].lbaNext = int32(k + 1)
+        return true
+      restore(ctx, saved)
+      restoreStackLens(ctx, stackSnap)
+      if startTry == 0:
+        break
+      startTry = prevCharStart(ctx.subject.oa, startTry)
     inc k
   # Exhausted: restore entry state and release slots.
   rewind(ctx, ctx.choices[top].lbaSaved)
@@ -2494,7 +2439,7 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): LookAltResult =
   releaseTo(ctx, ctx.choices[top].lbaSaved.capOff)
   ctx.stackLensSaves.setLen(int(ctx.choices[top].lbaLensOff))
   ctx.choicesLen = top
-  laExhausted
+  false
 
 proc absentBodyMatches(ctx: MatchContext, absentBody: Node): bool {.inline.} =
   ## Whether the absent pattern matches at ``ctx.pos`` by a path that may
@@ -3746,7 +3691,7 @@ proc runMachine(
           mode = mFail
       of nkLookaround:
         # Lookarounds commit to the first answer; no choice point, no extra
-        # rollback. Alternation lookbehind retries via ``chLookbehindAlt``.
+        # rollback. A divided look-behind retries via ``chLookbehindAlt``.
         case node.lookKind
         of lkAhead:
           if isLeafLookaheadBody(node.lookBody):
@@ -3780,18 +3725,10 @@ proc runMachine(
             restoreStackLens(ctx, stackSnap)
             mode = if bodyMatch: mFail else: mCont
         of lkBehind:
-          # Alternation retries later fixed alternatives via heap entry; other
-          # shapes commit to the first match.  Bare groups are transparent
-          # ([peelBareGroups]), so a grouped body splits the same way.
-          let peeledLook = peelBareGroups(node.lookBody)
-          let isAlt = peeledLook != nil and peeledLook.kind == nkAlternation
-          let bodyLen =
-            if isAlt:
-              LenBounds(fixedLen: -1, maxLen: -1)
-            else:
-              ctx.bodyBounds(node)
-          let fbl = bodyLen.fixedLen
-          if isAlt:
+          # A divided look-behind ([lookDivided]) retries its later branches
+          # via heap entry; any other commits to the first match, an
+          # alternation included.
+          if node.lookDivided:
             let entrySaved = save(ctx)
             let entryLensOff = ctx.stackLensSaves.len
             ctx.stackLensSaves.add(saveStackLens(ctx))
@@ -3805,35 +3742,34 @@ proc runMachine(
               lbaSaved: entrySaved,
               lbaLensOff: int32(entryLensOff),
             )
-            case lookbehindAltNext(ctx, ctx.choicesLen - 1)
-            of laFixed, laCommitted:
-              mode = mCont
-            of laExhausted:
-              mode = mFail
-          elif fbl < 0:
-            mode = if lookbehindVarHolds(ctx, node, bodyLen): mCont else: mFail
-          elif isLeafLookbehindBody(node.lookBody):
-            # Leaf body: tested in place, without a frame or a re-entry.
-            mode =
-              if leafBodyEndsAt(ctx, node.lookBody, ctx.pos, fbl): mCont else: mFail
-          elif ctx.pos - fbl < 0:
-            mode = mFail
+            mode = if lookbehindAltNext(ctx, ctx.choicesLen - 1): mCont else: mFail
           else:
-            # Fixed-length lookbehind: only one starting position to try.
-            let targetEnd = ctx.pos
-            let stackSnap = saveStackLens(ctx)
-            let saved = save(ctx)
-            let bodyMatch = lookbehindBodyEndsAt(
-              ctx, node.lookBody, targetEnd - fbl, targetEnd, ctx.bodyWindow(node)
-            )
-            if bodyMatch:
-              keepLookCaptures(ctx, node, saved)
-              restoreStackLens(ctx, stackSnap)
-              mode = mCont
-            else:
-              restore(ctx, saved)
-              restoreStackLens(ctx, stackSnap)
+            let bodyLen = ctx.bodyBounds(node)
+            let fbl = bodyLen.fixedLen
+            if fbl < 0:
+              mode = if lookbehindVarHolds(ctx, node, bodyLen): mCont else: mFail
+            elif isLeafLookbehindBody(node.lookBody):
+              # Leaf body: tested in place, without a frame or a re-entry.
+              mode =
+                if leafBodyEndsAt(ctx, node.lookBody, ctx.pos, fbl): mCont else: mFail
+            elif ctx.pos - fbl < 0:
               mode = mFail
+            else:
+              # Fixed-length lookbehind: only one starting position to try.
+              let targetEnd = ctx.pos
+              let stackSnap = saveStackLens(ctx)
+              let saved = save(ctx)
+              let bodyMatch = lookbehindBodyEndsAt(
+                ctx, node.lookBody, targetEnd - fbl, targetEnd, ctx.bodyWindow(node)
+              )
+              if bodyMatch:
+                keepLookCaptures(ctx, node, saved)
+                restoreStackLens(ctx, stackSnap)
+                mode = mCont
+              else:
+                restore(ctx, saved)
+                restoreStackLens(ctx, stackSnap)
+                mode = mFail
         of lkNegBehind:
           # Negative lookbehind keeps nothing; single predicate.
           mode = if negLookbehindHolds(ctx, node): mCont else: mFail
@@ -4543,12 +4479,11 @@ proc runMachine(
       of chLookbehindAlt:
         let kCont = ctx.choices[top].lbaCont
         let kFramesLen = ctx.choices[top].lbaFramesLen
-        case lookbehindAltNext(ctx, top)
-        of laFixed, laCommitted:
+        if lookbehindAltNext(ctx, top):
           cont = kCont
           ctx.framesLen = kFramesLen
           mode = mCont
-        of laExhausted:
+        else:
           mode = mFail
       of chUndoCallout:
         let n {.cursor.} = ctx.nodeAt(ctx.choices[top].ucoNode)

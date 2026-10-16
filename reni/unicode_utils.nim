@@ -2349,6 +2349,31 @@ proc matchCcAtom*(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
       rightMatch = not rightMatch
     leftMatch and rightMatch
 
+proc matchCcAtomWithFold*(r: Rune, atom: CcAtom, flags: RegexFlags): bool {.inline.} =
+  ## Match a character class atom, folding case for POSIX, char-type and
+  ## Unicode-property atoms when case-insensitive; [matchCcAtom] folds literals
+  ## and ranges itself.
+  if matchCcAtom(r, atom, flags):
+    return true
+  if rfIgnoreCase in flags:
+    if rfIgnoreCaseAscii in flags and int32(r) > 127:
+      return false
+    let asciiOnly = rfIgnoreCaseAscii in flags
+    case atom.kind
+    of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp, ccNestedClass:
+      # ASCII-only folding restricts both ends: the subject is already ASCII
+      # here, and a variant that is not stays out, so ``k`` reaches ``K`` but
+      # never U+212A.
+      for variant in caseFoldVariants(r):
+        if variant == r or (asciiOnly and int32(variant) > 127):
+          continue
+        if matchCcAtom(variant, atom, flags):
+          return true
+    else:
+      # ``ccLiteral`` and ``ccRange`` fold inside [matchCcAtom] itself.
+      discard
+  false
+
 const AsciiRestrictFlags = {rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix}
   ## The flags a class atom can read below U+0080.  Each only ever turns some
   ## test's ``asciiOnly`` argument on (``posixAsciiOnly`` and

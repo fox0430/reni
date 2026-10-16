@@ -79,24 +79,19 @@
 ## on Nim ``stable`` deliberately, and a corpus that moves with the compiler
 ## would turn a required job red on a release with no change under test.
 ##
-## The default seed is clean; other seeds are not.  Two shapes are open, both
-## older than this file.  Each case quoted for them diverges on its own, with
-## Oniguruma 6.9.10 and PCRE2 10.49 giving the same answer against reni:
+## The default seed is clean; other seeds are not.  One shape is open, older
+## than this file: an atomic group over a possessive body, where reni gives up
+## a match the other two engines find.  Each case quoted for it diverges on
+## its own, with Oniguruma 6.9.10 and PCRE2 10.49 giving the same answer
+## against reni: ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on "abqq" answers
+## 0..1 here and 0..4 there, and
+## ``b((([ab])a*+|a*?)(\3.*?(?>ab*q)|a\w(?>x\w++x))*?|a*?\2\w+){0,2}a`` on
+## "bxbaba" 2..4 here and 0..6 there.
 ##
-## * an atomic group over a possessive body, where reni gives up a match the
-##   other two engines find -- ``[ba]?(?>(.{1,3}+|(b?))\2{1,3}){1,3}`` on
-##   "abqq" answers 0..1 here and 0..4 there, and
-##   ``b((([ab])a*+|a*?)(\3.*?(?>ab*q)|a\w(?>x\w++x))*?|a*?\2\w+){0,2}a`` on
-##   "bxbaba" 2..4 here and 0..6 there;
-## * an alternation lookbehind, which reni retries once the continuation after
-##   it fails where both oracles read the assertion as atomic --
-##   ``(?>baa|b(?<=b|(.))\1)`` on "bbabaa" answers 0..2 here and 3..6 there,
-##   and ``((?<=a|(.))\2{0,2}+\w)\2b`` on "aaab" 1..4 here and no match there.
-##
-## No sweep is named for either: the corpus of none of the ones this list used
-## to name (seeds 424242, 20250101 and 99991, 24 each) holds any of the four
-## patterns.  It also named two more shapes, a backreference to a group that a
-## repetition writes: ``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax" and
+## No sweep is named for it: the corpus of none of the ones this list used to
+## name (seeds 424242, 20250101 and 99991, 24 each) holds either pattern.  It
+## also named two more shapes, a backreference to a group that a repetition
+## writes: ``(\w{0,2}+b{0,2}+)+\w(?:(q\1)a*)+`` on "xaaqaax" and
 ## ``(a{0,2}+.*(?:a*?){0,2})*\1a`` on "aqbbxqx".  Neither is a divergence.
 ## Oniguruma gives up on both, and PCRE2 was asked ``{0,2}+`` as a possessive
 ## interval; asked what Oniguruma reads, it answers as reni does.
@@ -259,7 +254,7 @@ else:
   proc lookPiece(g: var Gen): string =
     ## One element of a lookbehind body: a bare atom, or a capturing group
     ## around one or two.  A lookbehind that captures is the whole point --
-    ## ``keepLookCaptures`` and the ``chLookbehindAlt`` commit path own the
+    ## ``keepLookCaptures`` and the ``chLookbehindAlt`` entry own the
     ## rollback for what the body wrote, and a body built out of ``atom``
     ## alone can never reach either, since ``atom`` emits no groups.
     if g.r.rand(2) == 0:
@@ -313,11 +308,11 @@ else:
     of 7:
       # Lookbehind: keep the body simple enough to stay bounded, but let it
       # capture, and sometimes make it an alternation -- the fixed, variable
-      # and alternation shapes each own their kept captures differently, and
-      # the alternation one is the only construct that re-enters a lookbehind
-      # after it has already matched once.
+      # and divided shapes each own their kept captures differently, and a
+      # divided alternation (branches of different lengths) is the only
+      # construct that re-enters a lookbehind after it has already matched
+      # once.
       let neg = g.r.rand(1) == 0
-      let closedBefore = g.closed.len
       let first = lookBehindBody(g)
       let alt = g.r.rand(2) == 0
       let second =
@@ -325,18 +320,6 @@ else:
           "|" & lookBehindBody(g)
         else:
           ""
-      if alt:
-        # A backreference *outside* an alternation lookbehind, naming a group
-        # one of its branches wrote, is another shape the engines split on --
-        # and this one splits Oniguruma from itself.  ``(?<=b|(b))\1`` on "bb"
-        # answers 1 in Ruby, whose Onigmo re-enters the lookbehind to try the
-        # other branch once ``\1`` fails, and no match in Oniguruma 6.9.10 and
-        # in PCRE2, which both commit to the branch that already succeeded.
-        # reni answers with Ruby.  Two engines make a quorum against it, so
-        # leaving the shape in would fail the sweep on a disagreement that is
-        # not about rollback at all.  The groups stay numbered; they just stop
-        # being nameable from outside.
-        g.closed.setLen(closedBefore)
       both("(?<" & (if neg: "!" else: "=") & first & second & ")")
     of 8:
       # Conditional.  Both the backreference and the consuming/lookahead

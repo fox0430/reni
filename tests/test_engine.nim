@@ -1545,11 +1545,12 @@ suite "Special escapes":
     check search("xab", re("x(?=a\\K)ab")).boundaries[0] == 2 .. 3
     check search("ab", re("ab(?<=a\\Kb)")).boundaries[0] == 1 .. 2
     check search("ab", re("ab(?<=(a)\\Kb)")).boundaries[0] == 1 .. 2
-    # Alternation lookbehind commits through its own path: a fixed-length
-    # alternative retries from the entry snapshot, a variable one writes the
-    # rollback over the entry.  Both have to keep ``\K`` as well.
+    # A divided look-behind -- one Oniguruma reads as a look-behind per
+    # branch -- keeps its own entry to retry from, after a fixed-length
+    # branch and a variable one alike.  Both have to keep ``\K`` as well.
     check search("ab", re("ab(?<=(x)|a\\Kb)")).boundaries[0] == 1 .. 2
     check search("aab", re("aab(?<=(x)|a+\\Kb)")).boundaries[0] == 2 .. 3
+    check search("aab", re("aab(?<=(a)+\\Kb|(x))")).boundaries[0] == 2 .. 3
     # A negative assertion keeps nothing, ``\K`` included.
     check search("ab", re("(?!a\\Kq)ab")).boundaries[0] == 0 .. 2
     check search("ab", re("(?<!a\\Kq)ab")).boundaries[0] == 0 .. 2
@@ -2280,6 +2281,107 @@ suite "Lookbehind edge cases":
     let m3 = search("zzxy", re("(?<!ab|cd)xy"))
     check m3.found
 
+suite "a look-behind alternation retries only where Oniguruma divides it":
+  # A look-behind commits to its first match, as any assertion does, except
+  # where Oniguruma divides one whose body is an alternation into one
+  # look-behind per branch -- ``(?<=A|B)`` into ``(?<=A)|(?<=B)`` -- and only
+  # then is a later branch tried once the continuation fails.  It divides
+  # when every branch after the first has a fixed length and the lengths are
+  # not all the same (``CHAR_LEN_TOP_ALT_FIXED`` in ``tune_look_behind``).
+  # Every answer below is libonig 6.9.10's.
+
+  test "branches of one length commit to the first that matches":
+    check not search("bb", re("(?<=b|(b))\\1")).found
+    check not search("bb", re("(?<=x|b|(b))\\1")).found
+    check not search("bb", re("(?<=(?:b|(b)))\\1")).found
+
+  test "branches of different lengths are retried":
+    let m = search("bb", re("(?<=xy|b|(b))\\1"))
+    check m.matchSpan == 1 .. 2
+    check m.boundaries[1] == 0 .. 1
+    let n = search("abab", re("(?<=b|(.b))\\1"))
+    check n.matchSpan == 2 .. 4
+    check n.boundaries[1] == 0 .. 2
+
+  test "the first branch is not measured":
+    # A variable first branch still divides the look-behind; a variable
+    # later one keeps it whole.
+    let m = search("bb", re("(?<=(b)+|(b))\\2"))
+    check m.matchSpan == 1 .. 2
+    check m.boundaries[1] == UnsetSpan
+    check m.boundaries[2] == 0 .. 1
+    check not search("bb", re("(?<=(b)|(b)+)\\2")).found
+
+  test "lengths are counted in characters, not bytes":
+    check not search("\xC3\xA9\xC3\xA9", re("(?<=\xC3\xA9|(.))\\1")).found
+
+  test "a nested alternation divides again":
+    let m = search("aaa", re("(?<=(?:a|(.)a)|xyz)\\1"))
+    check m.matchSpan == 2 .. 3
+    check m.boundaries[1] == 0 .. 1
+
+  test "a branch is measured once its leading repeats are pinned":
+    # ``a*a`` pins to ``a``, so both branches are one character long...
+    check not search("aa", re("(?<=a*a|(a))\\1")).found
+    # ...but ``b*a`` is ``(?>b*)a`` by then, which is no repeat to pin.
+    let m = search("aa", re("(?<=b*a|(a))\\1"))
+    check m.matchSpan == 1 .. 2
+    check m.boundaries[1] == 0 .. 1
+    # Under case folding ``\u017F`` is the class of ``s``, ``S`` and itself,
+    # which Oniguruma does not hold apart from the class of ``\xE9``: neither
+    # stays inside ASCII.  So ``\u017F*`` pins, and the branch is fixed.
+    let f = search("b\xC3\xA9b", re("(?i)(?<=b(.)|\xC5\xBF*\xC3\xA9)(?(1)b|x)"))
+    check f.matchSpan == 3 .. 4
+    check f.boundaries[1] == 1 .. 3
+    check not search("b\xC3\xA9b", re("(?i)(?<=b(.)|a*\xC3\xA9)(?(1)b|x)")).found
+    # ``(?I)`` holds ``[k]`` apart from the Kelvin sign U+212A, so ``[k]*`` is
+    # possessive in front of it and stays: the first branch is variable and
+    # the look-behind divides.  Under plain ``(?i)`` they fold together, the
+    # repeat pins, and every branch is one character long.
+    let k = search("bb", re("(?iI)(?<=[k]*\xE2\x84\xAA|b|(b))\\1"))
+    check k.matchSpan == 1 .. 2
+    check k.boundaries[1] == 0 .. 1
+    check not search("bb", re("(?i)(?<=[k]*\xE2\x84\xAA|b|(b))\\1")).found
+
+  test "a look-behind that surely matches empty is dropped":
+    # ``(?<=(a)|)`` always holds, so Oniguruma drops it and never sets the
+    # group...
+    let m = search("ax", re("(?<=(a)|)x"))
+    check m.matchSpan == 1 .. 2
+    check m.boundaries[1] == UnsetSpan
+    # ...unless something reads the group.
+    let r = search("axa", re("(?<=(a)|)x\\1"))
+    check r.matchSpan == 1 .. 3
+    check r.boundaries[1] == 0 .. 1
+    # ``(?(1))`` is a bare assertion there, which can fail: no drop.
+    check not search("c", re("(Q)|(?<=a|(?(1))|b)c")).found
+
+  test "a reference counts even from a look-behind that is dropped":
+    # Oniguruma marks the groups something refers to before it tunes any
+    # look-behind, so the reference in the first one keeps the second whole,
+    # though the first is dropped.
+    for pattern in ["(?<=(?(1)x)|)(?<=(a)|)x", "(?<=\\1{0}|)(?<=(a)|)x"]:
+      let m = search("ax", re(pattern))
+      check m.matchSpan == 1 .. 2
+      check m.boundaries[1] == 0 .. 1
+
+  test "a look-behind inside is dropped before the one around it is measured":
+    # ``(?<=a*)`` is dropped first and leaves an empty branch, so the body
+    # around it surely matches empty and is dropped too.
+    let m = search("bx", re("(?<=(b)|(?<=a*))x"))
+    check m.matchSpan == 1 .. 2
+    check m.boundaries[1] == UnsetSpan
+
+  test "a group is measured once, however many references read it":
+    # Each group of ``(a)(\1\1)(\2\2)...`` reads the one before it twice.
+    # Measured afresh through every reference, the last look-behind cost
+    # twice as much per group, and forty of them would not compile.
+    var pattern = "(a)"
+    for i in 2 .. 40:
+      pattern.add "(\\" & $(i - 1) & "\\" & $(i - 1) & ")"
+    pattern.add "(?<=x|\\40)"
+    check not search("ax", re(pattern)).found
+
 suite "look-behind body window":
   # A look-behind body is matched forward from a candidate start and has to
   # end exactly where the look-behind sits, but Oniguruma also refuses it the
@@ -2430,10 +2532,28 @@ suite "look-behind body window":
     # The group is transparent to the reducer, not just around the body: a
     # string behind one is still a string, and a repeat behind one is still
     # the front element, so both pin to nothing and the body goes unclipped.
-    for pattern in ["(?<=(?:ab)*\\b)a", "(?<=(?:a*)\\b)a", "(?<=(?:a*b*)\\b)a"]:
+    for pattern in ["(?<=(?:ab)*\\b)a", "(?<=(?:a*)\\b)a", "(?<=z*(?:a*b*)\\b)a"]:
       let m = search("abcd", re(pattern))
       check m.found
       check m.boundaries[0] == 0 .. 1
+
+    # A sequence in one is spliced into the sequence around it -- except as
+    # its first element, which onig's parser keeps as a node of its own, and
+    # the walk stops there.  So does it at an empty group, wherever it stands.
+    # Each of these keeps a repeat, and with it the window.
+    for pattern in [
+      "(?<=(?:a*b*)\\b)a", "(?<=(?:a*\\b)\\b)a", "(?<=a*(?:)b*\\b)a", "(?<=(?:)a*\\b)a"
+    ]:
+      check not search("abcd", re(pattern)).found
+    check search("abcd", re("(?<=a*(?:)\\b)a")).boundaries[0] == 0 .. 1
+    check search("a", re("(?<!(?:a*\\b)\\b)a")).boundaries[0] == 0 .. 1
+
+    # Under case folding a string inside a look-behind is one class per
+    # character, a sequence by the time the reducer runs, and not a repeat
+    # body it pins.  One with no character to fold stays a string.
+    check not search("a", re("(?i)(?<=(?:ab)*\\b)a")).found
+    check search("a", re("(?i)(?<!(?:ab)*\\b)a")).boundaries[0] == 0 .. 1
+    check search("a", re("(?i)(?<=(?:12)*\\b)a")).boundaries[0] == 0 .. 1
 
     # A backreference behind the repeat is simple too, so it pins the same
     # way: the reduced body holds at ``0`` in "a" where the window would deny

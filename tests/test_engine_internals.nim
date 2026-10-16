@@ -1908,12 +1908,16 @@ suite "a positive lookaround's captures are rolled back like any other":
     let f = search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(xx)))aay"))
     check f.matchSpan == 0 .. 7
     check f.boundaries[1] == 2 .. 4
-    # Alternation, fixed alternative: retried through ``chLookbehindAlt``.
+    # Alternation of one length: commits like any other body.
     let a = search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(x)|a))aay"))
     check a.matchSpan == 0 .. 7
     check a.boundaries[1] == 3 .. 4
-    # Alternation, variable alternative: commits, so the entry it committed
-    # from has to become the rollback.
+    # Divided, fixed-length branch: kept on the ``chLookbehindAlt`` entry,
+    # which the retry replays.
+    let d = search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(x)|xab))aay"))
+    check d.matchSpan == 0 .. 7
+    check d.boundaries[1] == 3 .. 4
+    # Divided, variable branch: the same entry, kept the same way.
     let v = search("aaaxaay", re("^(?:..)*(?(1)q|(?<=(a+x)|a))aay"))
     check v.matchSpan == 0 .. 7
     check v.boundaries[1] == 2 .. 4
@@ -1921,36 +1925,30 @@ suite "a positive lookaround's captures are rolled back like any other":
     check not search("aaxxaay", re("^(?:..)*(?(1)q|(?<=(a)))aay")).found
 
   test "a retried lookbehind alternative drops the previous one's captures":
-    # The first alternative matches and its ``(a)`` is kept, the continuation
-    # fails on the branch ``(?(2)...)`` chose for it, and the entry is
-    # re-entered for the second alternative.  Group 1 belongs to the
-    # alternative that was abandoned, so nothing downstream may still read
-    # it -- left set, it flips a ``(?(1)...)`` the same way a leaked
-    # lookahead capture does.
-    # Only that bookkeeping is pinned: whether the assertion is retried at all
-    # is left open.  Oniguruma and PCRE2 read a lookbehind as atomic, so they
-    # never reach the second alternative and report no match for this pattern;
-    # reni does retry it and matches.  The test therefore accepts either
-    # answer, and checks the captures only when a match is reported, so making
-    # the lookbehind atomic later needs no change here.
-    # Neither of these needs the retry -- the first alternative's capture
-    # answers the condition in the first, the first alternative simply fails
-    # in the second -- so they hold under either reading and keep the entry,
-    # the rewind and the conditional itself under assertion even if the
-    # retry-dependent check below stops running.
-    let f = search("ax", re(r"^.(?<=(a)|(\w))(?(1)x|q)"))
+    # The ``xy`` branch makes the lengths differ, so Oniguruma divides the
+    # look-behind and retries its branches.  The first matches and its
+    # ``(a)`` is kept, the continuation fails on the branch ``(?(2)...)``
+    # chose for it, and the entry is re-entered for the second.  Group 1
+    # belongs to the branch that was abandoned, so nothing downstream may
+    # still read it -- left set, it flips a ``(?(1)...)`` the same way a
+    # leaked lookahead capture does.
+    let r = search("ax", re(r"^.(?<=(a)|(\w)|xy)(?(2)x|q)"))
+    check r.matchSpan == 0 .. 2
+    check r.boundaries[1].a == -1
+    check r.boundaries[2] == 0 .. 1
+    # Neither of these needs the retry -- the first branch's capture answers
+    # the condition in the first, the first branch simply fails in the second.
+    let f = search("ax", re(r"^.(?<=(a)|(\w)|xy)(?(1)x|q)"))
     check f.matchSpan == 0 .. 2
     check f.boundaries[1] == 0 .. 1
     check f.boundaries[2].a == -1
-    let s = search("ax", re(r"^.(?<=(q)|(\w))(?(2)x|q)"))
+    let s = search("ax", re(r"^.(?<=(q)|(\w)|xy)(?(2)x|q)"))
     check s.matchSpan == 0 .. 2
     check s.boundaries[1].a == -1
     check s.boundaries[2] == 0 .. 1
-    let r = search("ax", re(r"^.(?<=(a)|(\w))(?(2)x|q)"))
-    if r.found:
-      check r.matchSpan == 0 .. 2
-      check r.boundaries[1].a == -1
-      check r.boundaries[2] == 0 .. 1
+    # Branches of one length are not divided, so nothing is retried, as in
+    # Oniguruma and PCRE2.
+    check not search("ax", re(r"^.(?<=(a)|(\w))(?(2)x|q)")).found
 
   test "a negative lookaround condition keeps its captures undoable":
     # ``(?(?!(x))...)`` deliberately preserves what the body captured when the
@@ -1974,7 +1972,7 @@ suite "a positive lookaround's captures are rolled back like any other":
     check a.matchSpan == 0 .. 5
     check a.boundaries[1] == UnsetSpan
     check a.boundaries[2] == UnsetSpan # ``(q)`` cannot match; "aaaax" has no q
-    # Same arithmetic on the variable-alternative lookbehind commit path.
+    # Same arithmetic on a divided look-behind's variable branch.
     let b = search("qzzaxz", re("^.*(?<=(a+x)|q)(?:(r)b)*zz"))
     check b.matchSpan == 0 .. 3
     check b.boundaries[1] == UnsetSpan # the ``q`` alternative is the one that ran
