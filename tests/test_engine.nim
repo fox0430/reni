@@ -800,6 +800,40 @@ suite "ReDoS protection (stepLimit)":
     let m = search("aab", re("(a+)+b"), stepLimit = 0)
     check m.found
 
+  test "the limit bounds each start position, not the search":
+    # Every attempt is cheap, but their steps sum past the limit.  Oniguruma,
+    # which also limits each position, finds no match, and the per-byte
+    # budget covers the sum.
+    var subject = ""
+    for i in 0 ..< 2_000:
+      subject.add "w" & $i & " "
+    let r = re("(\\w+)\\s+\\1\\b")
+    check not search(subject, r, stepLimit = 100).found
+    check not searchBackward(subject, r, stepLimit = 100).found
+    var found = 0
+    for _ in findAll(subject, r, stepLimit = 100):
+      inc found
+    check found == 0
+    # One attempt over the limit still raises.  No literal follows the
+    # repeat, so no required-byte check can refuse the subject first.
+    expect RegexLimitError:
+      discard search(subject & "a".repeat(20), re("(a+)+\\d"), stepLimit = 100)
+
+  test "a search's work stays linear in the subject":
+    # Each attempt runs to the end of the subject and back, well inside the
+    # limit, so the search costs quadratic time: 12 s here with no bound on
+    # the search as a whole.  The per-byte budget stops it after a few
+    # million steps.
+    let subject = "a".repeat(20_000)
+    for pattern in ["(?:a|b)*[!?]", "(?:a|ab)*?[!?]", "\\w*?[!?]"]:
+      checkpoint pattern
+      expect RegexLimitError:
+        discard search(subject, re(pattern))
+      expect RegexLimitError:
+        discard searchBackward(subject, re(pattern))
+      # A single attempt is bounded by the limit alone, and fits in it.
+      check not matchAt(subject, re(pattern), 0).found
+
 suite "search with start position":
   test "search from middle of string":
     let r = re("\\d+")

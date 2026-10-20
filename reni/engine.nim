@@ -180,7 +180,15 @@ type
     groupRecursionDepth: seq[int] ## per-group recursion depth counter
     steps: int ## match step counter for ReDoS protection
     graphemeMode: GraphemeMode ## current grapheme mode from (?y{g}) or (?y{w})
-    stepLimit: int ## max steps allowed (``int.high`` = unlimited)
+    stepLimit: int
+      ## Where ``steps`` raises.  A search loop may raise it to the budget of
+      ## the attempt it runs ([stepBudget]); it is never above that budget.
+    attemptStepLimit: int
+      ## The caller's step limit for one attempt (``int.high`` = unlimited).
+    budgetOrigin: int
+      ## Where the search started; its step budget grows with every byte an
+      ## attempt's start has moved away from here.
+    rerunCount: int ## Backs [stepReruns]; nothing resets it.
     maxRecursionDepth: int ## max subexpression recursion depth
     calloutCounters: Table[string, int] ## (*COUNT) / (*MAX) tag counters
     callDepth: int
@@ -4737,9 +4745,10 @@ proc newMatchContext*(maxCapCount: int = 0): MatchContext =
   ## avoids reallocation when the first regex has that many capture groups
   ## (default 0 means "grow on first use").
   result = MatchContext()
-  # ``resetForRegex`` overwrites this; default to unlimited so a context used
+  # ``resetForRegex`` overwrites these; default to unlimited so a context used
   # before a reset cannot trip the step limit.
   result.stepLimit = int.high
+  result.attemptStepLimit = int.high
   if maxCapCount > 0:
     result.captures = newSeq[Span](maxCapCount + 1)
     # ``newSeq`` zero-fills, and ``Span(0, 0)`` is not ``UnsetSpan``.
@@ -4753,8 +4762,14 @@ proc scratchCaps*(ctx: MatchContext): tuple[frames, choices, repPositions: int] 
 
 proc stepsUsed*(ctx: MatchContext): int =
   ## Steps charged by the last search, including the one that raised. For
-  ## tests reading how much work a limit let through; a reset clears it.
+  ## tests reading how much work a limit let through; a reset clears it.  An
+  ## attempt run again ([stepLimitLagged]) is charged once.
   ctx.steps
+
+proc stepReruns*(ctx: MatchContext): int =
+  ## Attempts run again under a caught-up step limit, over ``ctx``'s life.
+  ## For tests that need a rerun to have happened, not only its answer.
+  ctx.rerunCount
 
 proc noteScratchUsage(ctx: MatchContext) =
   ## Release oversized scratch buffers after several small searches in a row.
@@ -4814,6 +4829,7 @@ proc resetForRegex(
     sameSubject: bool = false,
 ) =
   ## Reset per-regex buffers, reusing ``ctx``'s existing seq capacity.
+  ## A search loop that reruns attempts sets ``budgetOrigin`` itself.
   ## ``sameSubject`` keeps subject-keyed memos when ``subject`` is the string
   ## the last search ran over; the buffer pointer is checked too.
   ## ``regex`` is borrowed, so every caller passes the address of its own
@@ -4874,11 +4890,13 @@ proc resetForRegex(
   if not sameSubject or ctx.seqRegionData != cast[pointer](ctx.subject.data):
     ctx.seqRegionEnd = -1
   ctx.seqRegionData = cast[pointer](ctx.subject.data)
-  ctx.stepLimit = if stepLimit > 0: stepLimit else: int.high
+  ctx.attemptStepLimit = if stepLimit > 0: stepLimit else: int.high
+  # The first attempt's budget: no steps charged and no distance moved.
+  ctx.stepLimit = ctx.attemptStepLimit
   ctx.maxRecursionDepth = maxRecursionDepth
   # Reset the per-search counters that used to be zero-initialized by
-  # allocating a fresh ``MatchContext``.
-  ctx.steps = 0
+  # allocating a fresh ``MatchContext``.  ``steps`` is the entry points' to
+  # clear, before an early return can leave the last search's count.
   ctx.absentScan = 0
   ctx.recursionDepth = 0
   ctx.callDepth = 0
@@ -4894,6 +4912,52 @@ proc resetForRegex(
     ctx.captures.setLen(ctx.capturesLen)
     # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
     ctx.capturesDirty = true
+
+proc stepBudget(ctx: MatchContext, attemptSteps, attemptStart: int): int =
+  ## The most ``steps`` may reach in the attempt that began at
+  ## ``attemptStart`` with ``attemptSteps`` charged: the attempt's own limit,
+  ## or the search's (``SearchStepsPerByte``) when that is less.  A limit
+  ## summed over the start positions raises on a long subject of cheap
+  ## attempts; one per attempt alone lets a pattern whose cost is polynomial
+  ## in the subject run unchecked.
+  let limit = ctx.attemptStepLimit
+  if limit == int.high:
+    return int.high
+  # Only a search that has charged more than ``limit`` steps asks, so neither
+  # sum comes near ``int.high``.
+  let earned = SearchStepsPerByte * abs(attemptStart - ctx.budgetOrigin)
+  min(attemptSteps + limit, limit + earned)
+
+proc stepLimitLagged(
+    ctx: MatchContext, attemptSteps, attemptStart: int
+): bool {.noinline.} =
+  ## Whether the ``RegexLimitError`` an attempt just raised is ``stepLimit``
+  ## lagging the attempt's budget rather than the attempt overrunning it.  If
+  ## so, the steps go back to where the attempt began and ``stepLimit`` up to
+  ## its budget, for the caller to run the attempt again from the start.
+  ##
+  ## Comparing ``steps`` with the budget itself would put a call that returns
+  ## on the matcher's hottest paths, measured at up to 2.5% of the matcher's
+  ## instructions.  A lagging ``stepLimit`` costs nothing until a search
+  ## charges that many steps.  It is never above the budget: neither term of
+  ## [stepBudget] shrinks as the search moves on.  Only the step check leaves
+  ## ``steps`` past ``stepLimit``, so the other limits are told apart by that
+  ## alone.
+  ##
+  ## An attempt runs at most twice, so a search does at most about twice the
+  ## work its budget counts.  The second runs pile up only where attempts
+  ## each cost more than half the limit.  Catching ``stepLimit`` up before
+  ## every attempt that might pass it would avoid them, but measured at up
+  ## to 10% where attempts are cheap, and 0.9% with the catch-up spaced out.
+  if ctx.steps <= ctx.stepLimit:
+    return false
+  let budget = stepBudget(ctx, attemptSteps, attemptStart)
+  if ctx.stepLimit >= budget:
+    return false
+  ctx.steps = attemptSteps
+  ctx.stepLimit = budget
+  inc ctx.rerunCount
+  true
 
 proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ## Reset per-position state without reallocating.
@@ -4968,6 +5032,20 @@ proc releaseBorrowed(ctx: MatchContext) {.inline.} =
   ctx.gatesLen = 0
   ctx.subject = Subject(data: nil, size: 0)
 
+template runAttempt(ctx: MatchContext, startPos, searchStart: int, attempt: untyped) =
+  ## Run ``attempt``, the match tried at ``startPos``, and once more from the
+  ## start if [stepLimitLagged] says the limit it raised on lagged its budget.
+  block:
+    let attemptSteps = ctx.steps
+    while true:
+      resetForPosition(ctx, startPos, searchStart)
+      try:
+        attempt
+        break
+      except RegexLimitError:
+        if not stepLimitLagged(ctx, attemptSteps, startPos):
+          raise
+
 proc searchImplInto*(
     ctx: MatchContext,
     subject: string,
@@ -4992,6 +5070,7 @@ proc searchImplInto*(
     ctx.flBestMatch.found = false
     ctx.flBestMatch.boundaries.setLen(0)
   writeNotFound(m)
+  ctx.steps = 0
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
@@ -5006,6 +5085,7 @@ proc searchImplInto*(
   resetForRegex(
     ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth, sameSubject
   )
+  ctx.budgetOrigin = start
   let fc = regex.firstCharInfo
   # A case-sensitive literal prefix is looked for as raw bytes, the way
   # Oniguruma's exact-string optimization does, so every byte offset is a
@@ -5260,27 +5340,29 @@ proc searchImplInto*(
           ctx.leadLeafCool = LeadLeafRetry
 
     if not prefiltered:
-      resetForPosition(ctx, startPos, start)
       prefilterDirty = true
-
-      if findLongest:
-        # Find longest: try all match alternatives at this position.  The
-        # ckFindLongestRec frame mutates ``ctx.flBestMatch`` whenever a
-        # longer match is found and returns false to force backtracking.
-        let fid = pushFrame(
-          ctx, Frame(kind: ckFindLongestRec, parent: TrueCont, flStartPos: startPos)
-        )
-        discard matchWithCont(ctx, regex.ast, fid)
-        ctx.framesLen = fid
-      else:
-        if matchNode(ctx, regex.ast):
-          ctx.capturesDirty = true
-          ctx.captures[0] = span(startPos, ctx.pos)
-          if ctx.keepStart != startPos:
-            ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
-          # Copy into m so that ctx.captures stays usable across calls.
-          writeFoundCopy(m, ctx.captures, ctx.groupSlots, startPos)
-          return
+      var matched = false
+      runAttempt(ctx, startPos, start):
+        if findLongest:
+          # Find longest: try all match alternatives at this position.  The
+          # ckFindLongestRec frame mutates ``ctx.flBestMatch`` whenever a
+          # longer match is found and returns false to force backtracking.
+          # A rerun finds the same ones again, which leaves it as it was.
+          let fid = pushFrame(
+            ctx, Frame(kind: ckFindLongestRec, parent: TrueCont, flStartPos: startPos)
+          )
+          discard matchWithCont(ctx, regex.ast, fid)
+          ctx.framesLen = fid
+        else:
+          matched = matchNode(ctx, regex.ast)
+      if matched:
+        ctx.capturesDirty = true
+        ctx.captures[0] = span(startPos, ctx.pos)
+        if ctx.keepStart != startPos:
+          ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
+        # Copy into m so that ctx.captures stays usable across calls.
+        writeFoundCopy(m, ctx.captures, ctx.groupSlots, startPos)
+        return
 
     # Advance to the next candidate start position.  Neither a plain
     # continuation-byte test nor the declared length is right alone — the
@@ -5342,6 +5424,7 @@ proc searchBackwardImplInto*(
   defer:
     releaseBorrowed(ctx)
   writeNotFound(m)
+  ctx.steps = 0
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
@@ -5350,13 +5433,14 @@ proc searchBackwardImplInto*(
     noteScratchUsage(ctx)
     return
   ctx.matchOptions = options
-  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
-  let fc = regex.firstCharInfo
   var startPos =
     if start >= 0:
       min(start, subject.len)
     else:
       subject.len
+  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
+  ctx.budgetOrigin = startPos
+  let fc = regex.firstCharInfo
   # The backward scan steps with ``prevCharHead`` — Oniguruma's
   # ``ONIGENC_STEP_BACK(.., 1)``, the rule ``onig_search`` itself walks back
   # with.  It is deliberately *not* the ``encLen`` chain the forward scan
@@ -5404,9 +5488,11 @@ proc searchBackwardImplInto*(
 
     # \G in backward search anchors at the end of the string (the origin of
     # the backward scan), not at each candidate start position.
-    resetForPosition(ctx, startPos, subject.len)
+    var matched = false
+    runAttempt(ctx, startPos, subject.len):
+      matched = matchNode(ctx, regex.ast)
 
-    if matchNode(ctx, regex.ast):
+    if matched:
       ctx.capturesDirty = true
       ctx.captures[0] = span(startPos, ctx.pos)
       if ctx.keepStart != startPos:
@@ -5459,7 +5545,9 @@ proc matchAtImplInto*(
   defer:
     releaseBorrowed(ctx)
   writeNotFound(m)
+  ctx.steps = 0
   ctx.matchOptions = options
+  # One attempt, whose budget ``resetForRegex`` sets: nothing to rerun.
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
   resetForPosition(ctx, pos, pos)
   if matchNode(ctx, regex.ast):

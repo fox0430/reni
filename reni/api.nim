@@ -10,8 +10,10 @@
 ## ``$$`` substitutions), and ``split``.
 ##
 ## All matching procs accept ``stepLimit`` and ``maxRecursionDepth``
-## parameters for ReDoS protection; out-of-range indices raise
-## ``ValueError`` and invalid replacement references raise ``RegexError``.
+## parameters for ReDoS protection.  ``stepLimit`` bounds each start position
+## a search tries; see ``SearchStepsPerByte`` for the search as a whole.
+## Out-of-range indices raise ``ValueError`` and invalid replacement
+## references raise ``RegexError``.
 ## ``search``, ``searchBackward``, ``matchAt`` and their ``IntoCtx`` variants
 ## also take ``options: MatchOptions`` to disable ``\A`` / ``\G`` per call
 ## without recompiling the pattern; omitted options enable both anchors.
@@ -322,8 +324,8 @@ type MatchScanner* = object
   prevReported: Span ## Reported span of the last yielded match, or unset.
   finished: bool ## Whether the scan has run off the end of the subject.
   started: bool ## Whether an attempt of this scan has already run.
-  stepLimit: int ## Step limit every attempt of this scan runs under.
-  maxRecursionDepth: int ## Recursion limit every attempt runs under.
+  stepLimit: int ## Step limit every search of this scan runs under.
+  maxRecursionDepth: int ## Recursion limit every search runs under.
 
 proc initMatchScanner*(
     subject: string,
@@ -334,8 +336,9 @@ proc initMatchScanner*(
   ## A scanner over ``subject``, positioned at ``start``, before the first
   ## match.  A ``start`` outside ``subject`` raises ``ValueError`` here rather
   ## than ending the scan later with the empty answer an exhausted scan also
-  ## gives.  The limits belong to the scan, so two attempts of one scan cannot
-  ## run under different ones.
+  ## gives.  The limits belong to the scan, so two searches of one scan cannot
+  ## run under different ones.  Each search's step budget starts over from
+  ## where the scan stands.
   if start < 0 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
   MatchScanner(

@@ -139,13 +139,17 @@ assert m.boundaries[0] == 3 .. 6
 
 ```nim
 # Limit matching steps to prevent catastrophic backtracking.
-# Raises RegexLimitError when the step count exceeds stepLimit.
+# Raises RegexLimitError when an attempt exceeds stepLimit steps.
 try:
   let m = search("aaaaaaaaaaab", re("(a+)+$"), stepLimit = 10000)
   doAssert m.found
 except RegexLimitError:
   echo "step limit exceeded"
 ```
+
+An attempt is the match tried at one start position. All the attempts of one
+search together may take `stepLimit` steps plus `SearchStepsPerByte` (100)
+for every byte the start position has moved, and raise past that.
 
 ### Stack budget (stack-overflow protection)
 

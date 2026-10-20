@@ -213,6 +213,7 @@ suite "the README's export list is the whole export list":
 
   test "limits and errors":
     mustExport DefaultStepLimit
+    mustExport SearchStepsPerByte
     mustExport DefaultMaxRecursionDepth
     mustExport RegexError
     mustExport RegexLimitError

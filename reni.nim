@@ -93,4 +93,5 @@ export
   types.`$`,
   # The limits ``search`` and friends take.
   types.DefaultStepLimit,
+  types.SearchStepsPerByte,
   types.DefaultMaxRecursionDepth

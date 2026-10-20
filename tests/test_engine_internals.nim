@@ -1223,6 +1223,86 @@ suite "a greedy repeat of a single-way leaf is a scan, not a choice per rep":
   test "grapheme repetition still steps by grapheme":
     check search("áb", re("\\X*b")).found
 
+suite "the step budget of a search":
+  test "a search runs past the limit while every attempt stays inside it":
+    # ``steps`` counts the whole search.  Passing ``stepLimit`` reruns the
+    # attempt under its budget, which the bytes the search moved have grown.
+    let ctx = newMatchContext()
+    var m: Match
+    var subject = ""
+    for i in 0 ..< 200:
+      subject.add "w" & $i & " "
+    let reruns = ctx.stepReruns
+    check not searchIntoCtx(ctx, subject, re("(\\w+)\\s+\\1\\b"), m, stepLimit = 50)
+    check ctx.stepsUsed > 50
+    check ctx.stepReruns > reruns
+
+  test "an attempt a lagging stepLimit stopped runs again whole":
+    # After the cheap attempts on ``x``, ``stepLimit`` still holds what the
+    # first attempt was allowed, short of what the attempt at 30 may take.
+    # A repeat of a sequence of runs takes each run's scan as the whole run,
+    # so going on from a scan that stopped there would end ``[a-z]+`` early
+    # and start the match at 79.
+    let ctx = newMatchContext()
+    var m: Match
+    let subject = "x ".repeat(15) & "a".repeat(70) & "1 b2!"
+    let r = re("(?:[a-z]+\\d\\s*)+!")
+    check searchIntoCtx(ctx, subject, r, m, stepLimit = 0)
+    check m.boundaries[0] == 30 .. 105
+    let reruns = ctx.stepReruns
+    check searchIntoCtx(ctx, subject, r, m, stepLimit = 100)
+    check m.boundaries[0] == 30 .. 105
+    check ctx.stepReruns > reruns
+
+  test "a find-longest search reruns its attempts and keeps the longest match":
+    # Every position is tried, and the attempts from 30 on pass the lagging
+    # ``stepLimit`` one after another, the one at 30 holding the longest
+    # match.  A rerun finds the same matches in the same order, so what the
+    # cut-short run recorded stands.
+    let ctx = newMatchContext()
+    var m: Match
+    let subject = "x ".repeat(15) & "a".repeat(70) & "1 b2!"
+    let r = re("(?:([a-z]+)\\d\\s*)+!", {rfFindLongest})
+    for limit in [0, 150]:
+      checkpoint $limit
+      let reruns = ctx.stepReruns
+      check searchIntoCtx(ctx, subject, r, m, stepLimit = limit)
+      check m.boundaries.len == 2
+      check m.boundaries[0] == 30 .. 105
+      check m.boundaries[1] == 102 .. 103
+      check (ctx.stepReruns > reruns) == (limit > 0)
+
+  test "a search the required byte refuses charges nothing":
+    # The quick reject returns before any attempt; the count of the search
+    # before it must not show through.
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, "aaaa", re("^[a-z]+$"), m)
+    check ctx.stepsUsed > 0
+    # ``a+b`` requires an ``a``, which ``xyz`` lacks.
+    check not searchIntoCtx(ctx, "xyz", re("a+b"), m)
+    check ctx.stepsUsed == 0
+    check searchIntoCtx(ctx, "aaaa", re("^[a-z]+$"), m)
+    check not searchBackwardIntoCtx(ctx, "xyz", re("a+b"), m)
+    check ctx.stepsUsed == 0
+
+  test "the budget is measured from where the search starts":
+    # The run of ``a`` costs about 2 million steps, more than the limit plus
+    # what its own 1,000 bytes earn.  Searched from the start of the subject,
+    # the 20,000 bytes of ``x`` before it earn the rest; searched from where
+    # the run begins, they earn nothing.
+    let ctx = newMatchContext()
+    var m: Match
+    let r = re("(?:a|b)*[!?]")
+    let forward = "x".repeat(20_000) & "a".repeat(1_000)
+    check not searchIntoCtx(ctx, forward, r, m)
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, forward, r, m, start = 20_000)
+    let backward = "a".repeat(1_000) & "x".repeat(20_000)
+    check not searchBackwardIntoCtx(ctx, backward, r, m)
+    expect RegexLimitError:
+      discard searchBackwardIntoCtx(ctx, backward, r, m, start = 1_000)
+
 suite "a greedy repeat retreats to the byte its continuation requires":
   # ``annotateContinuations`` writes ``quantFollowByte`` where the
   # continuation can begin with exactly one ASCII character, and

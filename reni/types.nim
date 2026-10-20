@@ -998,6 +998,14 @@ type
       ## and ``pcre2_get_startchar``.
 
 const DefaultStepLimit* = 1_000_000
+  ## Steps one attempt -- the match tried at one start position -- may take
+  ## before it raises ``RegexLimitError``; see ``SearchStepsPerByte`` for the
+  ## search as a whole.
+const SearchStepsPerByte* = 100
+  ## Steps a search earns, on top of the step limit, for every byte its start
+  ## position moves, which keeps a search's work linear in the subject.  The
+  ## densest pattern measured on the benchmark's code corpus,
+  ## ``(\w+)\s+\1\b``, takes about 6.4 steps a byte.
 const DefaultMaxRecursionDepth* = 50
 
 const UnsetSpan* = Span(a: -1, b: -1)
