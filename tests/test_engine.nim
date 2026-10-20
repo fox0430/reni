@@ -3139,6 +3139,18 @@ suite "an empty iteration that moves a group a reference reads is progress":
     check lazy.matchSpan == 0 .. 1
     check lazy.boundaries[1] == 0 .. 0
 
+  test "groups up to 31 are watched, past any number of unwatched ones":
+    # The groups in front are never read, so only the last group's bit is
+    # set.  From group 32 up there is no bit (``MEM_STATUS_LIMIT_ON``), and
+    # the empty iteration ends the repetition.  ``\k<n>``, since ``\16`` and
+    # up name no group defined yet and read as an octal escape.
+    proc emptyRun(groupsBefore: int, reference: string): Span =
+      search("a", re("(x)?".repeat(groupsBefore) & "(?:a" & reference & "|())*")).matchSpan
+
+    check emptyRun(15, "\\k<16>") == 0 .. 1
+    check emptyRun(30, "\\k<31>") == 0 .. 1
+    check emptyRun(31, "\\k<32>") == 0 .. 0
+
   test "so does a required iteration":
     # No other engine needs the rule for this one: PCRE2 and Perl run both
     # required iterations whatever they consume.
@@ -4222,3 +4234,75 @@ suite "literal alternation trie":
   test "nothing matches at the end of the subject":
     check not search("in", re("(int|uint|float)")).found
     check not search("", re("(int|uint|float)")).found
+
+suite "a case-sensitive literal compared in place":
+  # The matcher compares a case-sensitive literal's bytes where it stands
+  # instead of walking the ways a literal can match.  What bounds the walk
+  # has to bound the compare too: the end an absent range or a look-behind
+  # sets, a character the decoder does not start where the literal does, and
+  # ``(?i)`` turned on or off partway.  An alternation of plain literals is
+  # answered by its trie and never reaches the compare, so the branches below
+  # carry a capture.  Every answer is libonig 6.9.10's.
+
+  test "a branch on the generic path still captures what it read":
+    let m = search("bb=", re("(?:(b)|(b))+="))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[1] == 1 .. 2
+    check m.boundaries[2] == UnsetSpan
+
+  test "an absent range ends what the literal may consume":
+    check not search("ab=", re("(?~|=)(?:(a)|b)+=")).found
+    check search("ab=", re("(?~|=)(?:(a)|b)+(?~|)=")).matchSpan == 0 .. 3
+    check not search("eéx", re("(?~|é)(?:(é)|e)+(?~|)x")).found
+
+  test "a look-behind body stops at its window":
+    # The atomic group cannot hand ``b`` back, so a ``(b)`` read past the
+    # window at 1 would fail the look-behind there.
+    let m = search("ab", re("(?<=(?>(a)(b)?))"))
+    check m.matchSpan == 1 .. 1
+    check m.boundaries[2] == UnsetSpan
+    check search("abc", re("(?<=(?>(a)(b)?))c")).boundaries[2] == 1 .. 2
+
+  test "escapes and characters of several bytes":
+    check search(".-.=", re("(?:(\\.)|-)+=")).boundaries[1] == 2 .. 3
+    let m = search("éeéx", re("(?:(é)|e)+x"))
+    check m.matchSpan == 0 .. 6
+    check m.boundaries[1] == 3 .. 5
+    check search("Éex", re("(?:(é)|e)+x")).matchSpan == 2 .. 4
+
+  test "malformed bytes are not the character they would decode to":
+    # ``\xC1\x81`` is an overlong ``A``; ``\xC3`` swallows the ``\xC3`` of the
+    # ``é`` behind it, so that ``é`` starts inside a character.
+    check not search("\xC1\x81", re("(?:x|y)?A")).found
+    check search("\xC1\x81A", re("(?:x|y)?A")).matchSpan == 2 .. 3
+    check not search("\xC3\xC3\xA9y", re("(?:x|(é))+y")).found
+    check search("\xC3\xA9y", re("(?:x|(é))+y")).matchSpan == 0 .. 3
+
+  test "(?i) turned on and off partway":
+    check search("aBcabC", re("(?:a(?i)b(?-i)c)+")).matchSpan == 0 .. 3
+
+suite "an alternation takes no capture snapshot":
+  # Backtracking into an alternation does not copy the capture vector back:
+  # every capture written after its choice point carries an undo of its own,
+  # popped first.  So each row writes group 1 after the alternation, fails,
+  # and takes a later branch that never writes it, through each of the three
+  # choice points (the trie, the first-byte hints, the plain walk) and each
+  # way a capture leaves an undo behind.  Every answer is libonig 6.9.10's.
+  proc readsUnset(pattern: string): bool =
+    let m = search("abc", re(pattern))
+    m.matchSpan == 0 .. 3 and m.boundaries[1] == UnsetSpan
+
+  test "a group closed in the continuation":
+    check readsUnset("(?:a|ab)(?:(b)x|c)") # trie
+    check readsUnset("(?:a|a.|b)(?:(b)x|c)") # first-byte hints
+    check readsUnset("(?:a|a.)(?:(b)x|c)") # plain
+
+  test "a group written inside a construct that commits":
+    check readsUnset("(?:a|ab)(?:(?=(b))x|c)")
+    check readsUnset("(?:a|a.)(?:(?=(b))x|c)")
+    check readsUnset("(?:a|a.)(?:(?>(b))x|c)")
+    check readsUnset("(?:a|a.|b)(?:(?>(b)+)x|c)")
+
+  test "a group written next to \\K and a backreference":
+    check readsUnset("(?:a|a.)(?:\\K(b)x|c)")
+    check readsUnset("(?:a|a.)(?:(b)\\1x|c)")

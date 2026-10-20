@@ -230,9 +230,12 @@ type
     repPeak: int
       ## High-water mark of ``repLen``. Needed because simple repeats push no
       ## choice point, so ``choicesPeak`` cannot see them.
-    capSaves: seq[Span] ## Capture vectors for live ``SavedState`` snapshots (bulk copy).
+    capSaves: seq[Span]
+      ## Capture vectors for live ``SavedState`` snapshots (bulk copy).  Live
+      ## length is ``capSavesLen``, so release is a length store and growth
+      ## zero-fills only when the buffer is full.
+    capSavesLen: int ## Live length of ``capSaves``.
     capSavesPeak: int ## High-water mark of ``capSaves`` for the current search.
-    capSavesHigh: int ## Highest peak seen since the buffer was last released.
     capUndos: seq[CapUndo]
       ## Pre-images for the groups a kept body actually wrote, for
       ## ``chUndoSparse`` entries. LIFO with ``choices``; live length is
@@ -381,9 +384,12 @@ type
       aIdx: int32 ## next branch to try
       aCont: ContId
       aFramesLen: int32
-      aCapOff: CapOff
       aPos: int
       aKeepStart: int
+      when not defined(release):
+        aCapCheck: CapOff
+          ## Debug builds only: the captures at the push, which every pop
+          ## asserts it finds again; see [altCheckPush].
     of chLeafVariant:
       lNode: NodeId
       lVariant: int32 ## next way to try
@@ -1010,38 +1016,70 @@ const NoCapOff = CapOff(-1)
 
 proc capMark(ctx: MatchContext): CapOff {.inline.} =
   ## The current top of ``capSaves``, for trimming back to later.
-  CapOff(ctx.capSaves.len)
+  CapOff(ctx.capSavesLen)
+
+template checkSlot(ctx: MatchContext, off: CapOff) =
+  ## Bounds check for a slot of the explicit-length ``capSaves`` buffer: the
+  ## seq itself is never shrunk, so its own check cannot see a released slot.
+  ## Dropped under danger.
+  assert int(off) + ctx.captures.len <= ctx.capSavesLen, "read a released capture slot"
 
 proc releaseTo(ctx: MatchContext, off: CapOff) {.inline.} =
   ## Release ``off``'s slot and everything above it.
   doAssert off != NoCapOff, "released a snapshot that pushed no slot"
-  ctx.capSaves.setLen(int(off))
+  ctx.capSavesLen = int(off)
 
 proc retainSlot(ctx: MatchContext, off: CapOff) {.inline.} =
   ## Release everything above ``off``'s slot but keep the slot itself, so a
   ## later rollback can still read it.  The one place that knows a slot is
   ## ``captures.len`` elements wide rather than one.
   doAssert off != NoCapOff, "retained a snapshot that pushed no slot"
-  ctx.capSaves.setLen(int(off) + ctx.captures.len)
+  ctx.capSavesLen = int(off) + ctx.captures.len
 
 proc capturesBackTo(ctx: MatchContext, off: CapOff) {.inline.} =
   ## Copy the slot at ``off`` back into ``ctx.captures``, leaving it in place.
   doAssert off != NoCapOff, "restored a snapshot that pushed no slot"
+  ctx.checkSlot off
   copyCaptures(ctx.captures[0], ctx.capSaves[int(off)], ctx.captures.len)
 
 proc pushCaptures(ctx: MatchContext): CapOff {.inline.} =
   ## Copy ``ctx.captures`` onto the side stack and return its slot offset.
   result = capMark(ctx)
   let n = ctx.captures.len
-  ctx.capSaves.setLen(int(result) + n)
+  let top = int(result) + n
+  if top > ctx.capSaves.len:
+    ctx.capSaves.setLen(max(top, max(64, ctx.capSaves.len * 2)))
   copyCaptures(ctx.capSaves[int(result)], ctx.captures[0], n)
-  if ctx.capSaves.len > ctx.capSavesPeak:
-    ctx.capSavesPeak = ctx.capSaves.len
+  ctx.capSavesLen = top
+  if top > ctx.capSavesPeak:
+    ctx.capSavesPeak = top
 
 proc popCapturesTo(ctx: MatchContext, off: CapOff) {.inline.} =
   ## Copy the slot at ``off`` back into ``ctx.captures`` and release it.
   capturesBackTo(ctx, off)
   releaseTo(ctx, off)
+
+template altCheckPush(ctx: MatchContext) =
+  ## Debug builds only: snapshot the captures for the alternation choice just
+  ## pushed.  An alternation takes no snapshot of its own, since every capture
+  ## written after its choice point carries an undo popped first; the debug
+  ## pops assert that, so a writer that leaves none fails the suites rather
+  ## than an answer.
+  when not defined(release):
+    ctx.choices[ctx.choicesLen - 1].aCapCheck = pushCaptures(ctx)
+
+template altCheckPop(ctx: MatchContext, top: int) =
+  ## Debug builds only: the captures are what [altCheckPush] saw.
+  when not defined(release):
+    let off = int(ctx.choices[top].aCapCheck)
+    for i in 0 ..< ctx.captures.len:
+      doAssert ctx.capSaves[off + i] == ctx.captures[i],
+        "a capture written after an alternation left no undo"
+
+template altCheckDrop(ctx: MatchContext, top: int) =
+  ## Debug builds only: release [altCheckPush]'s slot with its choice.
+  when not defined(release):
+    releaseTo(ctx, ctx.choices[top].aCapCheck)
 
 proc saveScalars(ctx: MatchContext): ScalarState {.inline.} =
   ## Snapshot everything but the capture vector.  Nothing is pushed onto
@@ -1120,6 +1158,7 @@ proc keptCaptureChoice(ctx: MatchContext, s: SavedState, framesLen: int32): Choi
   ## equivalent: a write made after this entry carries its own undo, popped
   ## first, so every group outside the run already holds the snapshot's value.
   doAssert s.capOff != NoCapOff, "kept the captures of a snapshot that pushed no slot"
+  ctx.checkSlot s.capOff
   let n = ctx.captures.len
   let base = int(s.capOff)
   var changed = 0
@@ -1262,12 +1301,8 @@ proc unwindAbsentFrames(ctx: MatchContext, base: int) =
     if ctx.frames[ctx.framesLen].kind == ckRestoreAbsentEnd:
       ctx.absentEnd = ctx.frames[ctx.framesLen].reSavedEnd
 
-proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
-  ## Compare the encoding of ``target`` against the subject at ``p``.
-  ## Returns the position just past it, or -1 on mismatch.  Oniguruma holds a
-  ## case-sensitive literal as the bytes it was written with and compares
-  ## those, so this never decodes the subject: an overlong encoding of the
-  ## same code point is a different byte string and does not match.
+proc matchEncodedBytes(ctx: MatchContext, target: Rune, p: int): int =
+  ## [matchBytes] for a character of more than one byte.
   var buf: array[4, char]
   let n = utf8Encode(int32(target), buf)
   if p + n > ctx.subjectEnd:
@@ -1276,6 +1311,21 @@ proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
     if ctx.subject[p + i] != buf[i]:
       return -1
   p + n
+
+proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
+  ## Compare the encoding of ``target`` against the subject at ``p``.
+  ## Returns the position just past it, or -1 on mismatch.  Oniguruma holds a
+  ## case-sensitive literal as the bytes it was written with and compares
+  ## those, so this never decodes the subject: an overlong encoding of the
+  ## same code point is a different byte string and does not match.
+  if int32(target) < 0x80:
+    # One byte, and no encoding to build for it.
+    if p < ctx.subjectEnd and ctx.subject[p] == char(int32(target)):
+      p + 1
+    else:
+      -1
+  else:
+    matchEncodedBytes(ctx, target, p)
 
 const LiteralVariants = 2
   ## Ways one literal can match: direct compare plus ``(?i)`` multi-char fold.
@@ -1566,9 +1616,7 @@ proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
     else:
       not isGraphemeBoundary(ctx.subject.oa, ctx.pos)
 
-proc emptyPassProgressed(
-    ctx: MatchContext, snap: CapOff, groups: uint32
-): bool {.noinline.} =
+proc progressedSince(ctx: MatchContext, snap: CapOff, groups: uint32): bool {.inline.} =
   ## Whether an iteration that ended where it began still counts as one, so
   ## the repeat goes on instead of stopping there: Oniguruma's
   ## ``STACK_EMPTY_CHECK_MEM``.  It does when a group in ``groups`` (the
@@ -1587,24 +1635,36 @@ proc emptyPassProgressed(
   ## too long to copy.
   if groups == 0 or snap == NoCapOff:
     return false
+  ctx.checkSlot snap
   let base = int(snap)
-  for g in 1 ..< min(ctx.groupSlots, 32):
-    if (groups and (1'u32 shl g)) == 0:
-      continue
+  # Groups 1 up to ``groupSlots`` and below 32, set bits only: a repeat
+  # watches few of the pattern's groups.
+  var rest = groups and not 1'u32
+  if ctx.groupSlots < 32:
+    rest = rest and ((1'u32 shl ctx.groupSlots) - 1)
+  while rest != 0:
+    let g = countTrailingZeroBits(rest)
+    rest = rest and (rest - 1)
     let before = ctx.capSaves[base + g]
     let after = ctx.captures[g]
-    if after == before or after.a < 0:
+    if (after.a == before.a and after.b == before.b) or after.a < 0:
       continue
     if before.a < 0 or before.a != before.b or after.a != after.b:
       return true
   false
 
+proc emptyPassProgressed(
+    ctx: MatchContext, snap: CapOff, groups: uint32
+): bool {.noinline.} =
+  ## [progressedSince], out of line: the possessive repeat's empty check.
+  progressedSince(ctx, snap, groups)
+
 proc emptyPassProgressed(ctx: MatchContext, cont: ContId): bool {.noinline.} =
-  ## [emptyPassProgressed] for the iteration repeat frame ``cont`` closes.  Out
+  ## [progressedSince] for the iteration repeat frame ``cont`` closes.  Out
   ## of line, with the frame reads, so the rare path costs ``runMachine``
   ## nothing it would spend on the common one.
-  ctx.emptyPassProgressed(
-    ctx.frames[cont].qSnap, ctx.regex[].emptyStatus(ctx.frames[cont].qBody)
+  progressedSince(
+    ctx, ctx.frames[cont].qSnap, ctx.regex[].emptyStatus(ctx.frames[cont].qBody)
   )
 
 proc classBitmapAnswers*(node: Node, b: uint8, flags: RegexFlags): bool {.inline.} =
@@ -3370,11 +3430,10 @@ proc runMachine(
   var seqIdx = 0
 
   template releaseToBase(): untyped =
-    ## Trim stacks to entry lengths. ``capSaves`` is guarded since the common
-    ## case pushed nothing and ``setLen`` walks destructors.
+    ## Trim stacks to entry lengths.  ``min``: a slot below ``capBase`` is
+    ## not this machine's to bring back.
     ctx.framesLen = framesBase
-    if capBase < capMark(ctx):
-      releaseTo(ctx, capBase)
+    ctx.capSavesLen = min(ctx.capSavesLen, int(capBase))
     ctx.capUndosLen = capUndoBase
     ctx.repLen = repBase
     ctx.choicesLen = choiceBase
@@ -3481,6 +3540,32 @@ proc runMachine(
     else:
       restore(ctx, ctx.choices[top].qcSaved)
 
+  template tryLeafVariants(firstVariant, lastVariant: int, advance: untyped): untyped =
+    ## Match the leaf ``node`` by its first way that fits, leaving the next
+    ## way behind as a choice.  ``advance`` is the end of way ``v``, or -1.
+    var v {.inject.} = firstVariant
+    var e = -1
+    while v < lastVariant:
+      e = advance
+      if e >= 0:
+        break
+      inc v
+    if e < 0:
+      mode = mFail
+    else:
+      # Single-way leaf has no second variant; skip the choice entry.
+      if v + 1 < lastVariant and not isSingleWayLeaf(ctx, node):
+        ctx.pushChoice Choice(
+          kind: chLeafVariant,
+          lNode: node.id,
+          lVariant: int32(v + 1),
+          lCont: cont,
+          lFramesLen: ctx.framesLen.int32,
+          lPos: ctx.pos,
+        )
+      ctx.pos = e
+      mode = mCont
+
   template chargeTrieBranch(): untyped =
     ## What running the picked branch would have cost: the old path re-entered
     ## ``mMatch`` on it and paid a step.  The walk stays inside the
@@ -3497,36 +3582,26 @@ proc runMachine(
       if ctx.steps > ctx.stepLimit:
         raise newException(RegexLimitError, "match step limit exceeded")
       case node.kind
-      of nkLiteral, nkEscapedLiteral, nkCharClass:
-        let firstVariant =
-          if node.kind == nkCharClass:
-            classFirstVariant(ctx, node)
+      of nkLiteral, nkEscapedLiteral:
+        let r = if node.kind == nkLiteral: node.rune else: node.escapedRune
+        if rfIgnoreCase notin ctx.flags:
+          # A case-sensitive literal matches one way, its own bytes, so it
+          # needs neither the variant walk nor ``literalAdvance``: this is
+          # that proc's variant 0.
+          let e = matchBytes(ctx, r, ctx.pos)
+          if e < 0:
+            mode = mFail
           else:
-            0
-        let lastVariant =
-          if node.kind == nkCharClass: ClassVariants else: LiteralVariants
-        var v = firstVariant
-        var e = -1
-        while v < lastVariant:
-          e = leafVariantAdvance(ctx, node, v)
-          if e >= 0:
-            break
-          inc v
-        if e < 0:
-          mode = mFail
+            ctx.pos = e
+            mode = mCont
         else:
-          # Single-way leaf has no second variant; skip the choice entry.
-          if v + 1 < lastVariant and not isSingleWayLeaf(ctx, node):
-            ctx.pushChoice Choice(
-              kind: chLeafVariant,
-              lNode: node.id,
-              lVariant: int32(v + 1),
-              lCont: cont,
-              lFramesLen: ctx.framesLen.int32,
-              lPos: ctx.pos,
-            )
-          ctx.pos = e
-          mode = mCont
+          tryLeafVariants(0, LiteralVariants, literalAdvance(ctx, r, v))
+      of nkCharClass:
+        # Through ``leafVariantAdvance`` although the kind is known: calling
+        # ``classAdvance`` directly read +0.1% ``Ir`` on the class items.
+        tryLeafVariants(
+          classFirstVariant(ctx, node), ClassVariants, leafVariantAdvance(ctx, node, v)
+        )
       of nkString:
         let e = stringAdvance(ctx, node)
         if e < 0:
@@ -3564,7 +3639,7 @@ proc runMachine(
         elif node.altTrie != nil and rfIgnoreCase notin ctx.flags:
           # Every branch is a literal, so one walk both picks the branch and
           # consumes it: no branch node is left to run, and a pick of the last
-          # branch leaves no choice point and so costs no capture snapshot.
+          # branch leaves no choice point.
           let trie {.cursor.} = node.altTrie
           let pick = nextTrieBranch(ctx, trie, 0'i32)
           if pick.idx < 0:
@@ -3581,10 +3656,10 @@ proc runMachine(
                 aIdx: pick.idx + 1,
                 aCont: cont,
                 aFramesLen: ctx.framesLen.int32,
-                aCapOff: pushCaptures(ctx),
                 aPos: ctx.pos,
                 aKeepStart: ctx.keepStart,
               )
+              ctx.altCheckPush()
             ctx.pos = pick.endPos
             mode = mCont
         elif node.altFirst.len != node.alternatives.len:
@@ -3594,18 +3669,22 @@ proc runMachine(
           # branches share a single hint, where a test could never pass over
           # anything.
           if node.alternatives.len > 1:
-            # Save pos, captures, keepStart — but NOT flags.
-            # Isolated flag groups (?i) extend across alternation branches.
+            # Save pos and keepStart — but NOT flags: isolated flag groups
+            # (?i) extend across alternation branches.  Nor captures: every
+            # capture written after this push carries its own undo (a
+            # ``chUndoCapture``, or the ``chUndoState`` / kept-capture entry of
+            # a construct that cut its body's), popped before this choice, so
+            # the vector is back where it was by the time the choice is.
             ctx.pushChoice Choice(
               kind: chAlt,
               aNode: node.id,
               aIdx: 1,
               aCont: cont,
               aFramesLen: ctx.framesLen.int32,
-              aCapOff: pushCaptures(ctx),
               aPos: ctx.pos,
               aKeepStart: ctx.keepStart,
             )
+            ctx.altCheckPush()
           node = node.alternatives[0]
           mode = mMatch
         else:
@@ -3632,10 +3711,10 @@ proc runMachine(
                 aIdx: int32(first + 1),
                 aCont: cont,
                 aFramesLen: ctx.framesLen.int32,
-                aCapOff: pushCaptures(ctx),
                 aPos: ctx.pos,
                 aKeepStart: ctx.keepStart,
               )
+              ctx.altCheckPush()
             node = node.alternatives[first]
             mode = mMatch
       of nkGroup:
@@ -4390,10 +4469,10 @@ proc runMachine(
       let top = ctx.choicesLen - 1
       case ctx.choices[top].kind
       of chAlt:
-        # Snapshot survives until last branch; copy by hand, release at end.
+        # No capture vector to put back; see the push.
+        ctx.altCheckPop(top)
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart
-        capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         # Index in place to avoid copying the alternatives seq per backtrack.
         let idx = int(ctx.choices[top].aIdx)
@@ -4401,7 +4480,7 @@ proc runMachine(
         let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
         node = altNode.alternatives[idx]
         if idx + 1 >= altNode.alternatives.len:
-          releaseTo(ctx, ctx.choices[top].aCapOff)
+          ctx.altCheckDrop(top)
           ctx.choicesLen = top
         else:
           ctx.choices[top].aIdx = int32(idx + 1)
@@ -4415,9 +4494,9 @@ proc runMachine(
         # narrow end can still match under the wide one.  Telling the two
         # kinds apart is what keeps an unhinted alternation at exactly its
         # old cost -- the case dispatch already had to happen.
+        ctx.altCheckPop(top)
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart
-        capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         cont = ctx.choices[top].aCont
         let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
@@ -4433,12 +4512,12 @@ proc runMachine(
         if nxt < 0:
           # No untried branch can start here: drop the choice and keep
           # failing, as ``chAlt`` does when its index runs out.
-          releaseTo(ctx, ctx.choices[top].aCapOff)
+          ctx.altCheckDrop(top)
           ctx.choicesLen = top
           mode = mFail
         else:
           if nxt + 1 >= altNode.alternatives.len:
-            releaseTo(ctx, ctx.choices[top].aCapOff)
+            ctx.altCheckDrop(top)
             ctx.choicesLen = top
           else:
             ctx.choices[top].aIdx = int32(nxt + 1)
@@ -4450,16 +4529,16 @@ proc runMachine(
         # hand.  ``rfIgnoreCase`` needs no second test -- ``altTrie`` is nil
         # for any pattern that could have switched it on since the entry (see
         # ``altTriesUsable``).
+        ctx.altCheckPop(top)
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart
-        capturesBackTo(ctx, ctx.choices[top].aCapOff)
         ctx.framesLen = ctx.choices[top].aFramesLen
         cont = ctx.choices[top].aCont
         let altNode {.cursor.} = ctx.nodeAt(ctx.choices[top].aNode)
         let trie {.cursor.} = altNode.altTrie
         let pick = nextTrieBranch(ctx, trie, ctx.choices[top].aIdx)
         if pick.idx < 0:
-          releaseTo(ctx, ctx.choices[top].aCapOff)
+          ctx.altCheckDrop(top)
           ctx.choicesLen = top
           mode = mFail
         else:
@@ -4467,7 +4546,7 @@ proc runMachine(
           if pick.idx + 1 < altNode.alternatives.len:
             ctx.choices[top].aIdx = pick.idx + 1
           else:
-            releaseTo(ctx, ctx.choices[top].aCapOff)
+            ctx.altCheckDrop(top)
             ctx.choicesLen = top
           ctx.pos = pick.endPos
           mode = mCont
@@ -4780,14 +4859,13 @@ proc noteScratchUsage(ctx: MatchContext) =
   if ctx.capSavesPeak > CapSavesKeep or ctx.choicesPeak > ChoicesKeep or
       ctx.repPeak > RepPositionsKeep or ctx.capUndosPeak > CapUndosKeep:
     ctx.scratchQuiet = 0
-    ctx.capSavesHigh = max(ctx.capSavesHigh, ctx.capSavesPeak)
     ctx.capUndosHigh = max(ctx.capUndosHigh, ctx.capUndosPeak)
   else:
     inc ctx.scratchQuiet
     if ctx.scratchQuiet >= ScratchQuietRuns:
-      if ctx.capSavesHigh > CapSavesKeep:
+      if ctx.capSaves.len > CapSavesKeep:
         ctx.capSaves = newSeqOfCap[Span](CapSavesKeep)
-        ctx.capSavesHigh = 0
+        ctx.capSavesLen = 0
       if ctx.frames.len > FramesKeep:
         ctx.frames = newSeq[Frame](FramesKeep)
         ctx.framesLen = 0
@@ -4978,11 +5056,10 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.stackBase = currentStackAddr()
   ctx.framesLen = 0
   ctx.repLen = 0
+  ctx.capSavesLen = 0
   # Almost every attempt fails having touched none of these, so each clear is
   # guarded: ``setLen`` is an out-of-line call that walks destructors for
   # ``stackLensSaves``, and the loops are waste when nothing was written.
-  if ctx.capSaves.len > 0:
-    ctx.capSaves.setLen(0)
   if ctx.stackLensSaves.len > 0:
     ctx.stackLensSaves.setLen(0)
   if ctx.capturesDirty:
