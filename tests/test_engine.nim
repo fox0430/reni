@@ -3283,6 +3283,93 @@ suite "a name reads the groups declared before it":
     check search("aab", re("(?:\\k<n>b|(?<n>a))+")).matchSpan == 0 .. 3
     check search("aab", re("(?:(?(<n>)b|a)(?<n>))+")).matchSpan == 0 .. 1
 
+suite "a name declared twice reads one group, the one Oniguruma picks":
+  # ``\k<n>`` over several groups called ``n`` takes one of them and leaves
+  # no choice for the rest: without a level the last-declared group that is
+  # set and matches here (``BACKREF_MULTI``), with level 0 the closed span
+  # opened last, matching or not (``BACKREF_WITH_LEVEL``).  Every answer
+  # below is libonig 6.9.10's.
+
+  test "a backreference tries the last-declared group first":
+    let m = search("aa", re("(?<n>a)(?<n>)\\k<n>"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 0 .. 1
+    check m.boundaries[2] == 1 .. 1
+    check search("aab", re("(?<n>a)(?<n>)\\k<n>b")).matchSpan == 1 .. 3
+    check search("aA", re("(?i)(?<n>a)(?<n>)\\k<n>")).matchSpan == 0 .. 1
+
+  test "an earlier group is tried when a later one is unset or does not match":
+    check search("aba", re("(?<n>a)(?<n>b)\\k<n>")).matchSpan == 0 .. 3
+    let m = search("aa", re("(?<n>a)(?<n>b)?\\k<n>"))
+    check m.matchSpan == 0 .. 2
+    check m.boundaries[2] == UnsetSpan
+
+  test "a failing continuation does not try another group":
+    # The empty second ``n`` matches, ``$`` fails after it, and the first
+    # ``n``, which would have reached the end, is not tried.
+    check not search("aa", re("^(?<n>a)(?<n>)\\k<n>$")).found
+    check not search("abax", re("(?<n>|a(?<n>)){2}b\\k<n>x")).found
+
+  test "a reference with a level reads the span opened last":
+    check search("aa", re("(?<n>a)(?<n>)\\k<n+0>")).matchSpan == 0 .. 1
+    # Nested, the inner group opened last.
+    let nested = search("xaba", re("(?<n>x(?<n>a)b)\\k<n+0>"))
+    check nested.matchSpan == 0 .. 4
+    check nested.boundaries[2] == 1 .. 2
+
+  test "and only that span, though another group would match":
+    # The last iteration opened the first ``n``, "a", which fails on "b";
+    # the second ``n``, "b", is not tried.  Without a level it is.
+    check not search("bab", re("(?:(?<n>a)|(?<n>b))+\\k<n+0>")).found
+    check not search("baB", re("(?i)(?:(?<n>a)|(?<n>b))+\\k<n+0>")).found
+    check search("bab", re("(?:(?<n>a)|(?<n>b))+\\k<n>")).matchSpan == 0 .. 3
+    # ``\k<n>`` reads the second ``n``, "a"; ``\k<n+0>`` then reads it too,
+    # fails at the end, and the empty first ``n`` is not tried.
+    let m = search("aa", re("(?<n>)(?<n>a)(?:\\k<n>\\k<n+0>|)"))
+    check m.matchSpan == 0 .. 1
+
+  test "opened last is when the group was entered, not where it starts":
+    # A look-ahead enters its group before the group after it, which starts
+    # earlier; a look-behind enters its group after the one before it, which
+    # starts later.
+    let ahead = search("ba", re("(?<n>)(?=.(?<n>a))(?<n>)b\\k<n+0>"))
+    check ahead.matchSpan == 0 .. 1
+    check ahead.boundaries[2] == 1 .. 2
+    check not search("x", re("(?=x(?<m>))(?<m>.)\\k<m+0>")).found
+    check not search("ab", re("(?<n>)(?<=(?<n>a))b\\k<n+0>")).found
+    check search("aba", re("(?<n>)(?<=(?<n>a))b\\k<n+0>")).matchSpan == 1 .. 3
+    # After the second ``n`` matches empty at 1, another iteration enters the
+    # first ``n`` there too.  That one is read, fails at the end, and the
+    # match backs off to the empty iteration.
+    let tie = search("aa", re("(?:(?<n>a)|(?<n>)(?=a))*\\k<n+0>"))
+    check tie.matchSpan == 0 .. 1
+    check tie.boundaries[1] == 0 .. 1
+    check tie.boundaries[2] == 1 .. 1
+
+  test "a reference with another level tries the groups in declaration order":
+    # reni reads such a level by call depth, not by Oniguruma's stack walk,
+    # so this is no rule of Oniguruma's; on this pattern the two agree.
+    let m = search("baa", re("(?<r>(?<n>a)|b(?<n>b?)\\g<r>\\k<n+1>)"))
+    check m.matchSpan == 0 .. 3
+    check m.boundaries[3] == 1 .. 1
+
+  test "a group beside the name is not compared with its groups":
+    # Only the groups of ``n`` are compared by when they opened: ``m``
+    # between them, groups before them and a name of one group, read with a
+    # level too, keep to their own spans.
+    let between = search("abcc", re("(?<n>a)(?<m>b)(?<n>c)?\\k<n+0>"))
+    check between.matchSpan == 0 .. 4
+    check between.boundaries[2] == 1 .. 2
+    check search("aba", re("(?<n>a)(?<m>b)(?<n>c)?\\k<n+0>")).matchSpan == 0 .. 3
+    let inLoop = re("(?:(?<n>a)|(?<m>x)|(?<n>b))+\\k<n+0>")
+    check search("axbb", inLoop).matchSpan == 0 .. 4
+    check not search("axba", inLoop).found
+    let alone = re("(?<m>x)(?:(?<n>a)|(?<n>b))+\\k<n+0>\\k<m+0>")
+    check search("xbaax", alone).matchSpan == 0 .. 5
+    check not search("xbabx", alone).found
+    let before = re("(?<a>.)(?<b>.)(?:(?<n>a)|(?<n>b))+\\k<n+0>\\k<a+0>")
+    check search("xybaay", before).matchSpan == 1 .. 6
+
 suite "extractFirstChar with zero-width prefixes":
   test "word boundary before literal":
     let r = re("\\babc")

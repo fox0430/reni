@@ -49,6 +49,7 @@ type
       cCapIdx: int32
       cIndex: int32
       cMyDepth: int32
+      cOpened: int32 ## [openStamp] of this entry; the close records it.
       cStartPos: int
       cSavedFlags: RegexFlags
     of ckGroup:
@@ -115,6 +116,25 @@ type
       ## skip the per-group history entirely.  The two have to stay in step:
       ## each records ``-1`` for the stack depth so ``chUndoCapture`` skips
       ## the matching restore.
+    trackOpenOrder: bool
+      ## Mirror of ``Regex.openOrder``: when true, ``captures`` also holds an
+      ## [openedSlot] for each of ``Regex.openedGroups``, written by the same
+      ## two sites.
+    openClock: int32 ## The last [openStamp] handed out this attempt.
+    trackCloses: bool
+      ## ``trackCaptureStacks or trackOpenOrder``: the loop's close tests
+      ## this once, so a pattern with neither pays one test for both.
+    openedBase: int32
+      ## [openedSlot] less the group number: ``groupSlots`` less the first of
+      ## ``Regex.openedGroups``.  In ``trackCloses``'s padding, so the fields
+      ## after it keep their offsets: moving them measured up to 0.7% on
+      ## items with no reference.
+    groupSlots: int ## The slots of ``captures`` that hold groups, the whole match first.
+    capturesLen: int
+      ## ``captures.len``: ``groupSlots``, and under ``trackOpenOrder`` the
+      ## [openedSlot]s past them.  Set once per tree in ``resetForRegex``:
+      ## working it out per bind measured up to 0.7% dearer on items with no
+      ## reference.
     absentEnd: int
       ## The end the absent operator narrows: ``(?~|absent)`` and
       ## ``(?~|absent|expr)`` move it in, the range clear ``(?~|)`` puts it
@@ -436,6 +456,8 @@ type
       ucCapIdx: int32
       ucIndex: int32
       ucMyDepth: int32
+        ## The history entry to put back, or ``-1`` for none; ``-2`` for none
+        ## but the group's [openedSlot], which ``ucSavedStackEntry`` holds.
       ucSavedCap: Span
       ucSavedStackEntry: Span
       ucFlags: RegexFlags
@@ -1558,7 +1580,7 @@ proc emptyPassProgressed(
   if groups == 0 or snap == NoCapOff:
     return false
   let base = int(snap)
-  for g in 1 ..< min(ctx.captures.len, 32):
+  for g in 1 ..< min(ctx.groupSlots, 32):
     if (groups and (1'u32 shl g)) == 0:
       continue
     let before = ctx.capSaves[base + g]
@@ -2084,6 +2106,43 @@ proc lastClosed(s: Span): Span {.inline.} =
   else:
     s
 
+proc openedSlot(ctx: MatchContext, capIdx: int): int {.inline.} =
+  ## Where ``trackOpenOrder`` keeps when group ``capIdx``'s span opened: in
+  ## ``captures`` past the groups, so every snapshot and rollback carries it
+  ## along with the span.  ``a`` holds the [openStamp], or -1 while the group
+  ## has closed no span.  A subtraction (see ``Regex.openedLast``): a table
+  ## of slots measured 5% dearer on ``(?:(?<n>a)|(?<n>\w))\k<n+0>``.
+  int(ctx.openedBase) + capIdx
+
+proc openClockSpent(ctx: MatchContext) {.noinline.} =
+  ## [openStamp]'s clock is at ``int32.high``.  Under ``trackOpenOrder`` a
+  ## wrapped stamp would lose the order, or read 0 and record no close, so
+  ## the attempt raises; without it nothing compares the stamps, and the
+  ## clock starts over.  Out of line, so the test adds no raise to the loop.
+  if ctx.trackOpenOrder:
+    raise newException(RegexLimitError, "match group entry limit exceeded")
+  ctx.openClock = 0
+
+proc openStamp(ctx: MatchContext): int32 {.inline.} =
+  ## The stamp of a group something reads, entered now ([clearOnOpen]):
+  ## later than every stamp before it in the attempt.  Only
+  ## ``trackOpenOrder`` reads it, but testing the flag here measured dearer
+  ## than the increment.  With no ``stepLimit`` to stop it, an attempt can
+  ## enter groups 2^31 times and run the clock out ([openClockSpent]); an
+  ## ``int`` stamp measured dearer than the test, up to 1.9% on items with
+  ## no reference.
+  if ctx.openClock == high(int32):
+    ctx.openClockSpent()
+  inc ctx.openClock
+  ctx.openClock
+
+proc recordOpened(ctx: MatchContext, capIdx: int, opened: int32): Span {.inline.} =
+  ## Note that group ``capIdx`` closed a span its entry stamped ``opened``,
+  ## and return the slot's old value for the caller's undo.
+  let slot = ctx.openedSlot(capIdx)
+  result = ctx.captures[slot]
+  ctx.captures[slot] = Span(a: opened, b: opened)
+
 proc resolveCapture(ctx: MatchContext, capIdx: int, level: int, leveled: bool): Span =
   ## Resolve a capture, optionally using recursion-level stack.
   ## level > 0: access the level-th entry (1-based) in the capture stack for this group.
@@ -2094,7 +2153,7 @@ proc resolveCapture(ctx: MatchContext, capIdx: int, level: int, leveled: bool): 
     if level <= stack.len:
       return stack[level - 1] # 1-based: level 1 = first entry
     return UnsetSpan
-  if capIdx >= ctx.captures.len:
+  if capIdx >= ctx.groupSlots:
     return UnsetSpan
   if leveled:
     lastClosed(ctx.captures[capIdx])
@@ -2177,11 +2236,83 @@ proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int 
         return -1
     return ctx.pos + capLen
 
-proc matchBackref(
-    ctx: MatchContext, capIdx: int, cont: ContId, level: int, leveled: bool
-): bool =
-  ## Recursive fallback only; the loop answers backrefs itself.
-  let e = backrefEnd(ctx, capIdx, level, leveled)
+proc leveledBackrefEnd(ctx: MatchContext, node: Node): int =
+  ## [namedBackrefEnd] for a ``\k<name>`` written with a level.
+  let level = node.namedBackrefLevel
+  if level != 0:
+    for i in ctx.regex[].nameRefsOf(node.backrefRefs):
+      let e = backrefEnd(ctx, int(i) + 1, level, true)
+      if e >= 0:
+        return e
+    return -1
+  if not ctx.trackOpenOrder:
+    # No ``\k<name+0>`` here reads a name two groups declare, so this one
+    # reads one group, or none; its only span is the last.
+    # ``markGroupReads`` asserts it at compile time: here the assert measured
+    # 2% on ``(?<n>\w)\k<n+0>``.
+    let first = ctx.regex[].nameRefFirst(node.backrefRefs)
+    if first < 0:
+      return -1
+    return backrefEnd(ctx, int(first) + 1, 0, true)
+  var last = -1
+  var lastOpened = 0
+  for i in ctx.regex[].nameRefsOf(node.backrefRefs):
+    let capIdx = int(i) + 1 # captures are 1-indexed in boundaries
+    if lastClosed(ctx.captures[capIdx]).a >= 0:
+      let opened = ctx.captures[ctx.openedSlot(capIdx)].a
+      # The reference marks every group of the name read, and each close of
+      # a read group records its stamp; a set group without one would drop
+      # out of the comparison unseen.
+      assert opened > 0, "a set group with no open stamp"
+      if opened > lastOpened:
+        last = capIdx
+        lastOpened = opened
+  if last < 0:
+    return -1
+  backrefEnd(ctx, last, 0, true)
+
+proc namedBackrefEnd(ctx: MatchContext, node: Node): int {.inline.} =
+  ## End position if the ``\k<name>`` ``node`` matches here, else -1.  Pure
+  ## predicate shared by the loop and the recursive fallback.  A name that
+  ## several groups declare reads one of them, and a continuation that fails
+  ## does not try another.  Which one, as Oniguruma 6.9.10 picks it:
+  ##
+  ## - Without a level (``BACKREF_MULTI``): the last-declared group that is
+  ##   set and whose text matches here ([nameRefsBackward]).
+  ## - With level 0, ``\k<name+0>`` (``BACKREF_WITH_LEVEL``): the closed span
+  ##   opened last, whether its text matches or not.
+  ##   ``backref_match_at_nested_level`` walks the stack down to the first
+  ##   group start with a group end above it: the inner group when two nest,
+  ##   and a group a look-around entered before one entered after it, though
+  ##   it starts ahead of that one.  ``Regex.openedGroups`` keep each span's
+  ##   stamp for this ([openedSlot]).
+  ##
+  ## Level 0 counts no calls, as no leveled read here does ([lastClosed]),
+  ## where Oniguruma's walk keeps to the reference's own call level and
+  ## enters a level for a called group even where it is written.  So a span a
+  ## deeper ``\g`` call closed can be the one opened last:
+  ## ``(?<r>(?<n>a)|b(?<n>b?)\g<r>\k<n+0>)`` on "bab" reads the "a" the call
+  ## matched and matches 1..2; Oniguruma reads the empty ``n`` and matches
+  ## 0..2.
+  ##
+  ## With any other level reni reads a group its own way ([resolveCapture]),
+  ## not by that walk, so no order here would be Oniguruma's.  This one takes
+  ## the first group in declaration order whose text matches.
+  ##
+  ## Inline for the common form, without a level, which the loop answers at
+  ## every step; [leveledBackrefEnd] takes the rest.
+  if node.namedBackrefLeveled:
+    return leveledBackrefEnd(ctx, node)
+  for i in ctx.regex[].nameRefsBackward(node.backrefRefs):
+    let e = backrefEnd(ctx, int(i) + 1, node.namedBackrefLevel, false)
+    if e >= 0:
+      return e
+  -1
+
+proc matchBackref(ctx: MatchContext, e: int, cont: ContId): bool =
+  ## Recursive fallback only; the loop answers backrefs itself.  Runs
+  ## ``cont`` from ``e``, the end [backrefEnd] or [namedBackrefEnd] found,
+  ## or fails when there is none.
   if e < 0:
     return false
   let savedPos = ctx.pos
@@ -2191,24 +2322,33 @@ proc matchBackref(
   ctx.pos = savedPos
   false
 
-proc clearOnOpen(ctx: MatchContext, capIdx: int) {.inline.} =
+proc clearOnOpen(
+    ctx: MatchContext, capIdx: int, leavesUndo: static bool = true
+): int32 {.inline.} =
   ## Oniguruma's ``MEM_START_PUSH``, for a group ``Regex.opensUnset`` names:
   ## until the group closes again it reads as unset, but to a reference with
   ## a level ([openSpan]).  The span it held comes back on backtracking,
-  ## through the undo a close leaves too.  For the loop's entries;
-  ## [matchCapture] puts the span back itself.
-  if ctx.regex[].opensUnset(capIdx) and ctx.captures[capIdx].a >= 0:
-    ctx.pushChoice Choice(
-      kind: chUndoCapture,
-      ucCapIdx: int32(capIdx),
-      ucIndex: int32(capIdx - 1),
-      ucMyDepth: -1,
-      ucSavedCap: ctx.captures[capIdx],
-      ucSavedStackEntry: UnsetSpan,
-      ucFlags: ctx.flags,
-    )
-    ctx.captures[capIdx] = openSpan(ctx.captures[capIdx])
-    ctx.capturesDirty = true
+  ## through the undo a close leaves too.  The loop's entries leave that
+  ## undo here; [matchCapture], the recursive fallback, passes
+  ## ``leavesUndo = false`` and puts the span back itself.
+  ##
+  ## Returns the group's [openStamp] for its frame, or 0 for a group nothing
+  ## reads: nothing compares when it opened, so its close records no stamp.
+  if ctx.regex[].opensUnset(capIdx):
+    if ctx.captures[capIdx].a >= 0:
+      when leavesUndo:
+        ctx.pushChoice Choice(
+          kind: chUndoCapture,
+          ucCapIdx: int32(capIdx),
+          ucIndex: int32(capIdx - 1),
+          ucMyDepth: -1,
+          ucSavedCap: ctx.captures[capIdx],
+          ucSavedStackEntry: UnsetSpan,
+          ucFlags: ctx.flags,
+        )
+      ctx.captures[capIdx] = openSpan(ctx.captures[capIdx])
+      ctx.capturesDirty = true
+    result = ctx.openStamp()
 
 proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool =
   let capIdx = index + 1 # boundaries[0] = overall match
@@ -2220,6 +2360,11 @@ proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool
       ctx.groupRecursionDepth[index]
     else:
       -1
+  # The stamp and the clear a loop entry takes; the clear is undone here on
+  # the way out.
+  let held = ctx.captures[capIdx]
+  let opened = ctx.clearOnOpen(capIdx, leavesUndo = false)
+  let clears = ctx.captures[capIdx] != held
   let fid = pushFrame(
     ctx,
     Frame(
@@ -2228,16 +2373,11 @@ proc matchCapture(ctx: MatchContext, index: int, body: Node, cont: ContId): bool
       cCapIdx: int32(capIdx),
       cIndex: int32(index),
       cMyDepth: int32(myDepth),
+      cOpened: opened,
       cStartPos: startPos,
       cSavedFlags: savedFlags,
     ),
   )
-  # [clearOnOpen], undone here on the way out.
-  let held = ctx.captures[capIdx]
-  let clears = ctx.regex[].opensUnset(capIdx) and held.a >= 0
-  if clears:
-    ctx.captures[capIdx] = openSpan(held)
-    ctx.capturesDirty = true
   let ok = matchWithCont(ctx, body, fid)
   ctx.framesLen = fid
   if not ok and clears:
@@ -2258,6 +2398,11 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
   let savedCap = ctx.captures[capIdx]
   ctx.captures[capIdx] = span(startPos, endPos)
   ctx.capturesDirty = true
+  let opened = ctx.frames[contId].cOpened
+  let recordsOpened = ctx.trackOpenOrder and opened != 0
+  var savedOpened: Span
+  if recordsOpened:
+    savedOpened = ctx.recordOpened(capIdx, opened)
   var savedStackEntry = UnsetSpan
   let trackStacks = ctx.trackCaptureStacks and myDepth >= 0
   if trackStacks:
@@ -2276,7 +2421,22 @@ proc runCapture(ctx: MatchContext, contId: ContId): bool =
     ctx.flags = modFlags
     if trackStacks:
       ctx.captureStacks[index][myDepth] = savedStackEntry
+    if recordsOpened:
+      ctx.captures[ctx.openedSlot(capIdx)] = savedOpened
   ok
+
+proc undoCloseRecords(ctx: MatchContext, top: int) {.noinline.} =
+  ## The rare half of popping the ``chUndoCapture`` at ``top``: put back the
+  ## history entry (``ucMyDepth >= 0``) or the [openedSlot] (``-2``) the
+  ## close wrote beside the span.  Out of line, as inline it measured up to
+  ## 0.7% dearer on items that write neither.
+  let myDepth = int(ctx.choices[top].ucMyDepth)
+  if myDepth >= 0:
+    ctx.captureStacks[int(ctx.choices[top].ucIndex)][myDepth] =
+      ctx.choices[top].ucSavedStackEntry
+  else:
+    ctx.captures[ctx.openedSlot(int(ctx.choices[top].ucCapIdx))] =
+      ctx.choices[top].ucSavedStackEntry
 
 proc endCheckFrame(targetPos: int): Frame {.inline.} =
   Frame(kind: ckEndCheckPos, parent: TrueCont, ecpTargetPos: targetPos)
@@ -2645,7 +2805,7 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
   case node.condKind
   of ckBackref:
     let capIdx = node.condRefIndex # 1-indexed capture
-    if capIdx >= 0 and capIdx < ctx.captures.len:
+    if capIdx >= 0 and capIdx < ctx.groupSlots:
       return ctx.captures[capIdx].a >= 0
     return false
   of ckNamedRef:
@@ -2653,7 +2813,7 @@ proc condHolds(ctx: MatchContext, node: Node): bool =
     # at compile time (see ``resolveNameRefs``).
     for i in ctx.regex[].nameRefsOf(node.condRefs):
       let capIdx = int(i) + 1
-      if capIdx < ctx.captures.len and ctx.captures[capIdx].a >= 0:
+      if capIdx < ctx.groupSlots and ctx.captures[capIdx].a >= 0:
         return true
     return false
   of ckAlwaysFalse:
@@ -2712,20 +2872,14 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
   case node.kind
   of nkBackreference:
     # Loop answers these itself.
-    matchBackref(ctx, node.backrefIndex, cont, node.backrefLevel, node.backrefLeveled)
+    matchBackref(
+      ctx,
+      backrefEnd(ctx, node.backrefIndex, node.backrefLevel, node.backrefLeveled),
+      cont,
+    )
   of nkNamedBackref:
     # Loop answers these itself.
-    if ctx.regex[].nameRefCount(node.backrefRefs) == 0:
-      return false
-    for i in ctx.regex[].nameRefsOf(node.backrefRefs):
-      let idx = int(i) + 1 # captures are 1-indexed in boundaries
-      let saved = save(ctx)
-      if matchBackref(ctx, idx, cont, node.namedBackrefLevel, node.namedBackrefLeveled):
-        drop(ctx, saved)
-        return true
-      restore(ctx, saved)
-    # All named groups exist but none captured → fail
-    false
+    matchBackref(ctx, namedBackrefEnd(ctx, node), cont)
   of nkSubexpCall:
     # Loop answers these itself.
     var body: Node = nil
@@ -2761,7 +2915,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
     if captureIdx >= 0 and captureIdx < ctx.regex[].groupFlags.len:
       ctx.flags = ctx.regex[].groupFlags[captureIdx]
     var ok: bool
-    if captureIdx >= 0 and captureIdx + 1 < ctx.captures.len:
+    if captureIdx >= 0 and captureIdx + 1 < ctx.groupSlots:
       ok = matchCapture(ctx, captureIdx, body, cont)
     else:
       ok = matchWithCont(ctx, body, cont)
@@ -2842,7 +2996,7 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
 proc matchNode(ctx: MatchContext, node: Node): bool =
   matchWithCont(ctx, node, TrueCont)
 
-proc writeFoundCopy(m: var Match, captures: seq[Span], startChar: int) {.inline.}
+proc writeFoundCopy(m: var Match, captures: seq[Span], n, startChar: int) {.inline.}
 
 proc runCont(ctx: MatchContext, cont: ContId): bool =
   ## Walk the continuation chain starting at ``cont``: each ``Frame``
@@ -2914,7 +3068,7 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
     let mLen = ctx.pos - sp
     if mLen > ctx.flBestLen:
       ctx.flBestLen = mLen
-      writeFoundCopy(ctx.flBestMatch, ctx.captures, sp)
+      writeFoundCopy(ctx.flBestMatch, ctx.captures, ctx.groupSlots, sp)
       ctx.flBestMatch.boundaries[0] = span(sp, ctx.pos)
       if ctx.keepStart != sp:
         ctx.flBestMatch.boundaries[0].a = min(ctx.keepStart, ctx.pos)
@@ -3523,7 +3677,7 @@ proc runMachine(
         # As ``nkGroup`` above, but the frame carries the span and stays.
         if not keepsFlags:
           ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
-        ctx.clearOnOpen(index + 1)
+        let opened = ctx.clearOnOpen(index + 1)
         # Capture recursion depth at entry time (before continuations modify it)
         let myDepth =
           if index < ctx.groupRecursionDepth.len:
@@ -3538,6 +3692,7 @@ proc runMachine(
             cCapIdx: int32(index + 1),
             cIndex: int32(index),
             cMyDepth: int32(myDepth),
+            cOpened: opened,
             cStartPos: ctx.pos,
             cSavedFlags: ctx.flags,
           ),
@@ -3976,14 +4131,8 @@ proc runMachine(
           ctx.pos = e
           mode = mCont
       of nkNamedBackref:
-        # First same-named group that matches wins.
-        var e = -1
-        for i in ctx.regex[].nameRefsOf(node.backrefRefs):
-          e = backrefEnd(
-            ctx, int(i) + 1, node.namedBackrefLevel, node.namedBackrefLeveled
-          )
-          if e >= 0:
-            break
+        # One group of the name, no choice left for the others.
+        let e = namedBackrefEnd(ctx, node)
         if e < 0:
           mode = mFail
         else:
@@ -4027,9 +4176,9 @@ proc runMachine(
           ctx.pushChoice Choice(
             kind: chSubexpScope, ssCapIdx: int32(captureIdx), ssFlags: savedFlags
           )
-          if captureIdx >= 0 and captureIdx + 1 < ctx.captures.len:
+          if captureIdx >= 0 and captureIdx + 1 < ctx.groupSlots:
             let index = captureIdx
-            ctx.clearOnOpen(index + 1)
+            let opened = ctx.clearOnOpen(index + 1)
             let myDepth =
               if index < ctx.groupRecursionDepth.len:
                 ctx.groupRecursionDepth[index]
@@ -4043,6 +4192,7 @@ proc runMachine(
                 cCapIdx: int32(index + 1),
                 cIndex: int32(index),
                 cMyDepth: int32(myDepth),
+                cOpened: opened,
                 cStartPos: ctx.pos,
                 cSavedFlags: ctx.flags,
               ),
@@ -4122,17 +4272,37 @@ proc runMachine(
         var savedStackEntry = UnsetSpan
         # ``-1`` is the established "no history entry" marker, so recording it
         # in the choice point is what makes ``chUndoCapture`` skip the restore
-        # in step with the write skipped here.
+        # in step with the write skipped here; ``-2`` puts back an
+        # [openedSlot] instead.
         var stackDepth = -1
-        if ctx.trackCaptureStacks and myDepth >= 0:
-          stackDepth = myDepth
-          if index >= ctx.captureStacks.len:
-            ctx.captureStacks.setLen(index + 1)
-          if myDepth >= ctx.captureStacks[index].len:
-            ctx.captureStacks[index].setLen(myDepth + 1)
-          savedStackEntry = ctx.captureStacks[index][myDepth]
-          ctx.captureStacks[index][myDepth] = span(startPos, ctx.pos)
-          ctx.captureStacksDirty = true
+        if ctx.trackCloses:
+          if ctx.trackCaptureStacks and myDepth >= 0:
+            stackDepth = myDepth
+            if index >= ctx.captureStacks.len:
+              ctx.captureStacks.setLen(index + 1)
+            if myDepth >= ctx.captureStacks[index].len:
+              ctx.captureStacks[index].setLen(myDepth + 1)
+            savedStackEntry = ctx.captureStacks[index][myDepth]
+            ctx.captureStacks[index][myDepth] = span(startPos, ctx.pos)
+            ctx.captureStacksDirty = true
+          if ctx.trackOpenOrder and ctx.frames[cont].cOpened != 0:
+            let heldOpened = ctx.recordOpened(capIdx, ctx.frames[cont].cOpened)
+            if stackDepth == -1:
+              # The undo below carries it, in the history entry's place.
+              stackDepth = -2
+              savedStackEntry = heldOpened
+            else:
+              # A history entry too, which only a reference with a nonzero
+              # level asks for: its own undo, popped after the one below.
+              ctx.pushChoice Choice(
+                kind: chUndoCapture,
+                ucCapIdx: int32(ctx.openedSlot(capIdx)),
+                ucIndex: int32(index),
+                ucMyDepth: -1,
+                ucSavedCap: heldOpened,
+                ucSavedStackEntry: UnsetSpan,
+                ucFlags: ctx.flags,
+              )
         ctx.pushChoice Choice(
           kind: chUndoCapture,
           ucCapIdx: int32(capIdx),
@@ -4199,7 +4369,7 @@ proc runMachine(
         let mLen = ctx.pos - sp
         if mLen > ctx.flBestLen:
           ctx.flBestLen = mLen
-          writeFoundCopy(ctx.flBestMatch, ctx.captures, sp)
+          writeFoundCopy(ctx.flBestMatch, ctx.captures, ctx.groupSlots, sp)
           ctx.flBestMatch.boundaries[0] = span(sp, ctx.pos)
           if ctx.keepStart != sp:
             ctx.flBestMatch.boundaries[0].a = min(ctx.keepStart, ctx.pos)
@@ -4452,12 +4622,12 @@ proc runMachine(
         ctx.choicesLen = top
         mode = mFail
       of chUndoCapture:
-        let index = int(ctx.choices[top].ucIndex)
         let myDepth = int(ctx.choices[top].ucMyDepth)
         ctx.captures[int(ctx.choices[top].ucCapIdx)] = ctx.choices[top].ucSavedCap
         ctx.flags = ctx.choices[top].ucFlags
-        if myDepth >= 0:
-          ctx.captureStacks[index][myDepth] = ctx.choices[top].ucSavedStackEntry
+        # One test for both rare restores, as ``trackCloses`` is for the writes.
+        if myDepth != -1:
+          ctx.undoCloseRecords(top)
         ctx.choicesLen = top
         mode = mFail
       of chUndoAbsentEnd:
@@ -4670,6 +4840,14 @@ proc resetForRegex(
     ctx.leadLeafOff = false
     ctx.leadLeafCool = 0
     ctx.trackCaptureStacks = regex[].levelBackrefs
+    ctx.trackOpenOrder = regex[].openOrder
+    ctx.trackCloses = ctx.trackCaptureStacks or ctx.trackOpenOrder
+    ctx.groupSlots = regex[].captureCount + 1
+    ctx.capturesLen = ctx.groupSlots
+    if ctx.trackOpenOrder:
+      let opened = regex[].openedGroups
+      ctx.capturesLen += opened.len
+      ctx.openedBase = int32(ctx.groupSlots - opened.a)
     # Node ids name slots in this tree only; so does the cache keyed on one.
     ctx.seqCacheNode = NoNodeId
     ctx.leadRun = if regex[].leadRun == nil: NoNodeId else: regex[].leadRun.id
@@ -4709,12 +4887,11 @@ proc resetForRegex(
   ctx.capUndosLen = 0
   ctx.stackBase = currentStackAddr()
   noteScratchUsage(ctx)
-  # ``captures`` is sized exactly on every bind (copied into
+  # ``captures`` is sized exactly on every bind (its groups copied into
   # ``Match.boundaries``): the unguarded ``captures[capIdx]`` writes must
   # survive ``-d:danger``, so no ``assert``. Re-sizing to the same length is free.
-  let capLen = regex[].captureCount + 1
-  if ctx.captures.len != capLen:
-    ctx.captures.setLen(capLen)
+  if ctx.captures.len != ctx.capturesLen:
+    ctx.captures.setLen(ctx.capturesLen)
     # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
     ctx.capturesDirty = true
 
@@ -4725,6 +4902,7 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
   ctx.searchStart = searchStart
   ctx.keepStart = startPos
   ctx.leadRunEnd = -1
+  ctx.openClock = 0
   ctx.lookLimit = NoLookLimit
   ctx.absentEnd = ctx.subject.len
   ctx.absentScan = 0
@@ -4759,8 +4937,9 @@ proc resetForPosition(ctx: MatchContext, startPos: int, searchStart: int) =
     ctx.calloutCounters.clear()
   ctx.graphemeMode = gmNone
 
-proc writeFoundCopy(m: var Match, captures: seq[Span], startChar: int) {.inline.} =
-  ## Fill ``m`` from a capture vector, reusing ``m.boundaries``' capacity.
+proc writeFoundCopy(m: var Match, captures: seq[Span], n, startChar: int) {.inline.} =
+  ## Fill ``m`` from the first ``n`` slots of a capture vector, its groups,
+  ## reusing ``m.boundaries``' capacity.
   ## Used while ``captures`` is still live (e.g. in the findLongest frame,
   ## which may re-enter and mutate ``ctx.captures``).
   ##
@@ -4769,8 +4948,8 @@ proc writeFoundCopy(m: var Match, captures: seq[Span], startChar: int) {.inline.
   ## ``captures[0].a`` off it in either direction -- see ``Match.startChar``.
   m.found = true
   m.startChar = startChar
-  m.boundaries.setLen(captures.len)
-  for i in 0 ..< captures.len:
+  m.boundaries.setLen(n)
+  for i in 0 ..< n:
     m.boundaries[i] = captures[i]
 
 proc writeNotFound(m: var Match) {.inline.} =
@@ -5100,7 +5279,7 @@ proc searchImplInto*(
           if ctx.keepStart != startPos:
             ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
           # Copy into m so that ctx.captures stays usable across calls.
-          writeFoundCopy(m, ctx.captures, startPos)
+          writeFoundCopy(m, ctx.captures, ctx.groupSlots, startPos)
           return
 
     # Advance to the next candidate start position.  Neither a plain
@@ -5124,7 +5303,10 @@ proc searchImplInto*(
   if findLongest and ctx.flBestMatch.found:
     # ctx.flBestMatch lives on the reusable context.  Copy its
     # boundaries into ``m`` so the next call may overwrite the slot.
-    writeFoundCopy(m, ctx.flBestMatch.boundaries, ctx.flBestMatch.startChar)
+    writeFoundCopy(
+      m, ctx.flBestMatch.boundaries, ctx.flBestMatch.boundaries.len,
+      ctx.flBestMatch.startChar,
+    )
 
 proc searchImpl*(
     subject: string,
@@ -5229,7 +5411,7 @@ proc searchBackwardImplInto*(
       ctx.captures[0] = span(startPos, ctx.pos)
       if ctx.keepStart != startPos:
         ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
-      writeFoundCopy(m, ctx.captures, startPos)
+      writeFoundCopy(m, ctx.captures, ctx.groupSlots, startPos)
       return
 
     if startPos == 0:
@@ -5285,7 +5467,7 @@ proc matchAtImplInto*(
     ctx.captures[0] = span(pos, ctx.pos)
     if ctx.keepStart != pos:
       ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
-    writeFoundCopy(m, ctx.captures, pos)
+    writeFoundCopy(m, ctx.captures, ctx.groupSlots, pos)
 
 proc matchAtImpl*(
     subject: string,

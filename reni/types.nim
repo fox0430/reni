@@ -928,6 +928,16 @@ type
       ## that "b" in the second iteration.  A reference with a level still
       ## reads the span the group last closed with (see ``backrefLeveled``):
       ## the cleared slot encodes it.  Empty when no group is read.
+    openedFirst: int32
+    openedLast: int32
+      ## Once a ``\k<name+0>`` reads a name several groups declare, the
+      ## groups ``openedFirst .. openedLast`` keep when their span opened, in
+      ## slots past the groups: Oniguruma reads the closed span opened last,
+      ## which neither the starts nor the declaration order tells.  The run
+      ## spans every group something reads (``opensUnset``), so each group
+      ## that takes a stamp has a slot, found by subtraction; a group inside
+      ## it that nothing reads takes one nothing writes.  ``openedFirst`` is 0
+      ## when no reference asks.  Set by ``markGroupReads``.
     flags: RegexFlags
       ## The flags the pattern was compiled under.  Read through the `flags`
       ## accessor, which carries the reason this is not a public field.
@@ -1043,6 +1053,21 @@ proc setOpensUnset*(r: var Regex, groups: sink seq[bool]) =
   ## (1-based), or empty when no group needs it.
   r.opensUnset = groups
 
+proc openOrder*(r: Regex): bool {.inline.} =
+  ## **Internal API.** Whether any group keeps when its span opened; see
+  ## ``Regex.openedLast``.
+  r.openedFirst > 0
+
+proc openedGroups*(r: Regex): Slice[int] {.inline.} =
+  ## **Internal API.** The groups that keep when their span opened, under
+  ## [openOrder]; see ``Regex.openedLast``.
+  int(r.openedFirst) .. int(r.openedLast)
+
+proc setOpenedGroups*(r: var Regex, groups: Slice[int]) =
+  ## **Internal API.** Fill in ``Regex.openedLast``: a non-empty range.
+  r.openedFirst = int32(groups.a)
+  r.openedLast = int32(groups.b)
+
 proc nameRefCount*(r: Regex, refs: NameRefs): int32 {.inline.} =
   ## **Internal API.** How many capture groups ``refs`` names.
   r.nameRefs[refs.int]
@@ -1058,9 +1083,21 @@ proc nameRefFirst*(r: Regex, refs: NameRefs): int32 {.inline.} =
 
 iterator nameRefsOf*(r: Regex, refs: NameRefs): int32 =
   ## **Internal API.** The capture groups ``refs`` names, 0-based, in
-  ## declaration order -- the order ``\k<name>`` has to try them in, since it
-  ## takes the first of them that matches.
+  ## declaration order.  A ``\k<name>`` without a level tries them through
+  ## [nameRefsBackward] instead.
   for k in 1 .. r.nameRefs[refs.int].int:
+    yield r.nameRefs[refs.int + k]
+
+iterator nameRefsBackward*(r: Regex, refs: NameRefs): int32 =
+  ## **Internal API.** The capture groups ``refs`` names, 0-based, last
+  ## declared first -- the order a ``\k<name>`` without a level tries them
+  ## in, taking the first that is set and matches.  Oniguruma's
+  ## ``compile_tree`` writes a reference's groups reversed, and
+  ## ``BACKREF_MULTI`` (``_IC`` under ``(?i)``) walks them in that order:
+  ## ``(?<n>a)(?<n>)\k<n>`` on "aa" matches 0..1, the empty group first.
+  ## The run itself stays in declaration order, as a ``\g<name>`` reading
+  ## the same run calls its first group ([nameRefFirst]).
+  for k in countdown(r.nameRefs[refs.int].int, 1):
     yield r.nameRefs[refs.int + k]
 
 proc ast*(r: Regex): lent Node {.inline.} =
@@ -1287,8 +1324,8 @@ proc resolveNameRefs*(nodes: seq[Node], namedCaptures: seq[(string, int)]): seq[
   ## visits -- a numeric ``\g<1>``, say -- names no group.
   ##
   ## A name declared twice yields a run of the groups [namedGroupsRead] gives,
-  ## which is why one index would not do: ``\k<name>`` tries each, and
-  ## ``(?(<name>)...)`` holds if any of them captured.
+  ## which is why one index would not do: ``\k<name>`` picks one of them as it
+  ## matches, and ``(?(<name>)...)`` holds if any of them captured.
   result = @[0'i32]
   if namedCaptures.len == 0:
     return

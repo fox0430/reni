@@ -709,6 +709,7 @@ type EmptyCheckEnv = object ## What [markGroupReads] reads beside the tree.
     ## group's definition, or nil.
   opensUnset: seq[bool] ## By group number: read; see ``Regex.opensUnset``.
   status: seq[uint32] ## By body [NodeId]; see ``Regex.emptyStatus``.
+  openOrder: bool ## A ``\k<name+0>`` reads a name several groups declare.
 
 proc assignEmptyOwners(node: Node, unclaimed: var seq[int], env: var EmptyCheckEnv) =
   ## Oniguruma's ``set_empty_repeat_node_trav``: give each group the innermost
@@ -792,8 +793,14 @@ proc scanGroupReads(
   of nkBackreference:
     noteGroupRead(node.backrefIndex, visible, floor, env)
   of nkNamedBackref:
+    var groups = 0
     for i in r.nameRefsOf(node.backrefRefs):
       noteGroupRead(int(i) + 1, visible, floor, env)
+      inc groups
+    # The stamps ride on the read marked just above: [clearOnOpen] stamps
+    # exactly the groups ``opensUnset`` names.
+    if groups > 1 and node.namedBackrefLeveled and node.namedBackrefLevel == 0:
+      env.openOrder = true
   else:
     if node.kind == nkConditional:
       case node.condKind
@@ -810,10 +817,10 @@ proc scanGroupReads(
 proc markGroupReads(
     r: var Regex, namedCaptures: seq[(string, int)], captureCount: int
 ) =
-  ## Fill ``Regex.emptyStatus`` and ``Regex.opensUnset`` from the references
-  ## and conditionals that read groups.  Runs on the numbered final tree, so
-  ## a repeat's body is measured once and a name reads the groups
-  ## ``resolveNameRefs`` gave it.
+  ## Fill ``Regex.emptyStatus``, ``Regex.opensUnset`` and ``Regex.openedLast``
+  ## from the references and conditionals that read groups.  Runs on the
+  ## numbered final tree, so a repeat's body is measured once and a name
+  ## reads the groups ``resolveNameRefs`` gave it.
   var env = EmptyCheckEnv(
     spans: initGroupSpans(r.ast, namedCaptures, r.nodes.len),
     owner: newSeq[Node](captureCount + 1),
@@ -832,6 +839,12 @@ proc markGroupReads(
       let id = node.quantBody.id.int
       doAssert id <= 0 or id >= env.status.len or env.status[id] == 0,
         "pure repeat body with an empty-check set"
+    # Without ``openOrder`` the matcher reads a level-0 name's first group
+    # alone (``leveledBackrefEnd``), so the walk has to have seen each one.
+    if node != nil and node.kind == nkNamedBackref and node.namedBackrefLeveled and
+        node.namedBackrefLevel == 0:
+      doAssert env.openOrder or r.nameRefCount(node.backrefRefs) <= 1,
+        "a level-0 read of several groups without openOrder"
   var watched = false
   for groups in env.status:
     if groups != 0:
@@ -839,6 +852,14 @@ proc markGroupReads(
       break
   if watched:
     r.setEmptyStatus(move env.status)
+  if env.openOrder:
+    # Every group [clearOnOpen] stamps, from the first to the last.
+    let first = env.opensUnset.find(true)
+    var last = first
+    for group in first + 1 .. captureCount:
+      if env.opensUnset[group]:
+        last = group
+    r.setOpenedGroups(first .. last)
   if true in env.opensUnset:
     r.setOpensUnset(move env.opensUnset)
 
