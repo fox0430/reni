@@ -3,6 +3,7 @@ import std/[unittest, unicode]
 import ../reni
 import ../reni/types
 import ../reni/unicode_utils
+import ./helpers
 
 suite "Step 1: Literals":
   test "single char":
@@ -739,6 +740,17 @@ suite "Bug fixes and validation":
   test "conditional group number past 32 bits raises error":
     expect RegexError:
       discard re("(a)(?(4294967297)a|b)")
+
+  test "an error in a bare-name condition gives its position in the pattern":
+    # The name is parsed on its own, so these check that the offsets are the
+    # pattern's, not the name's.  The first two run out at the ``)`` that ends
+    # the name, byte 6; the class goes through the class parser.
+    for (pattern, msg) in [
+      ("x(?([a)b)", "unterminated character class at position 6"),
+      ("x(?(a\\)b)", "unexpected end after '\\' at position 6"),
+      ("x(?(a(?(?=b)c)", "expected ')' at position 11"),
+    ]:
+      check compileError(pattern) == msg
 
   test "octal escape at max codepoint \\o{4177777} succeeds":
     let r = re("\\o{4177777}")

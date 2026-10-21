@@ -6,6 +6,10 @@ import types, charclass, unicode_utils, stackguard
 type Parser* = object
   src: string
   pos: int
+  base: int
+    ## Where ``src`` starts in the pattern.  A bare-name condition is parsed
+    ## from its own text (see ``parseConditional``), and its parser reports
+    ## ``pos + base`` so that its positions are the pattern's.
   flags: RegexFlags
   captureCount*: int
   namedCaptures*: seq[(string, int)]
@@ -25,7 +29,6 @@ type Parser* = object
     ## being the only node of the pattern -- both the scoped ``(?I:a)`` form
     ## and the isolated ``(?I)a`` one, which spans the rest of its own group
     ## but still may not have siblings outside the wrappers around it.
-  inLookbehind: bool ## true when inside lookbehind assertion
   inLiteralQuote: bool ## true when inside \Q...\E
   sawPlainGroup*: bool
     ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
@@ -83,13 +86,13 @@ proc advanceRune(p: var Parser): Rune =
   fastRuneAt(p.src, p.pos, r, true)
   r
 
+proc error(p: Parser, msg: string) {.noreturn.} =
+  raise newException(RegexError, msg & " at position " & $(p.pos + p.base))
+
 proc expect(p: var Parser, ch: char) =
   if p.peek != ch:
-    raise newException(RegexError, "expected '" & ch & "' at position " & $p.pos)
+    p.error("expected '" & ch & "'")
   p.advance()
-
-proc error(p: Parser, msg: string) {.noreturn.} =
-  raise newException(RegexError, msg & " at position " & $p.pos)
 
 proc appendDecimal(value: var int, digit: char) =
   let n = ord(digit) - ord('0')
@@ -844,6 +847,7 @@ proc parseCalloutVerb(p: var Parser): Node =
       kind: nkLookaround,
       lookKind: lkNegAhead,
       lookBody: Node(kind: nkConcat, children: @[]),
+      lookFail: true,
     )
   of "MAX":
     var tag = ""
@@ -935,6 +939,15 @@ proc resolveCondRef(
 proc parseGroup(p: var Parser): Node
 proc parseAlternation(p: var Parser): Node
 
+proc recordStart(p: Parser, node: Node, start: int) =
+  ## Write where ``node``, which starts at ``start`` in ``p.src``, starts in the
+  ## pattern into [patternPos], for the error ``validateLookbehinds`` raises.
+  ## An offset past ``high(int32)`` stays unrecorded, and the error there has
+  ## no position.
+  let offset = start + p.base
+  if offset <= high(int32):
+    node.patternPos = int32(offset)
+
 proc parseAtom(p: var Parser): Node =
   if p.atEnd:
     p.error("unexpected end of pattern")
@@ -951,11 +964,14 @@ proc parseAtom(p: var Parser): Node =
     return Node(kind: nkLiteral, rune: r)
 
   let ch = p.peek
+  let start = p.pos
   case ch
   of '\\':
     result = p.parseEscape()
+    p.recordStart(result, start)
   of '(':
     result = p.parseGroup()
+    p.recordStart(result, start)
   of '.':
     p.advance()
     result = Node(kind: nkCharType, charType: ctDot)
@@ -966,7 +982,7 @@ proc parseAtom(p: var Parser): Node =
     p.advance()
     result = Node(kind: nkAnchor, anchor: akLineEnd)
   of '[':
-    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase)
+    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase, p.base)
     p.pos = newPos
     result = node
   of ')', '|':
@@ -1176,9 +1192,11 @@ proc parseNamedCapture(p: var Parser, closeChar: char): Node =
 proc parseConditional(p: var Parser): Node =
   ## Parse a conditional group: (?(condition)yes|no).
   ## Called after '(', '?', '(' have been consumed.
+  let condStart = p.pos - 1 # the '(' a look-around condition starts with
   var condKind: ConditionalKind
   var condIndex: int
   var condName: string
+  var condNameStart = 0 # where a bare name starts, which its parser reads
   var condBodyNode: Node = nil
   # A name in ``<>`` or ``''`` reads the groups opened before it, as a
   # ``\k<name>`` does; a bare one, not Oniguruma's spelling, every group.
@@ -1288,6 +1306,7 @@ proc parseConditional(p: var Parser): Node =
       if condIndex < 1:
         p.error("invalid relative conditional reference '(?(-" & $origN & "))'")
   else:
+    condNameStart = p.pos
     var name = ""
     while not p.atEnd and p.peek != ')':
       name.add(p.peek)
@@ -1309,8 +1328,11 @@ proc parseConditional(p: var Parser): Node =
         condKind = ckRegexCond
         condName = name
 
-  if condKind == ckRegexCond and condBodyNode == nil:
+  if condBodyNode != nil:
+    p.recordStart(condBodyNode, condStart)
+  elif condKind == ckRegexCond:
     var condParser = initParser(condName, p.flags)
+    condParser.base = p.base + condNameStart
     # Shares the outer budget; runs on top of already-spent frames.
     condParser.stackBase = p.stackBase
     condBodyNode = condParser.parseRegex()
@@ -1357,8 +1379,9 @@ proc parseGroup(p: var Parser): Node =
   # Level cap is a complexity limit; this is the resource guard.
   # Parser levels are cheap, so check every level.
   if stackUsedFrom(p.stackBase) > MaxStackBytes:
-    raise
-      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
+    raise newException(
+      RegexLimitError, "parse stack budget exceeded at position " & $(p.pos + p.base)
+    )
 
   let savedFlags = p.flags
   # Only ``(?:...)`` and ``(?flags:...)`` wrap without ending the run of
@@ -1388,9 +1411,8 @@ proc parseGroup(p: var Parser): Node =
       p.sawAbsent = true
       if p.peek == '|':
         # (?~|...) forms. All three are rejected in a look-behind, unlike the
-        # absent function below.
-        if p.inLookbehind:
-          p.error("invalid pattern in look-behind")
+        # absent function below -- by ``validateLookbehinds``, after the
+        # references are checked, as Oniguruma orders its errors.
         p.advance() # skip '|'
         if p.peek == ')':
           # (?~|) - range clear
@@ -1422,17 +1444,11 @@ proc parseGroup(p: var Parser): Node =
       p.advance() # skip '<'
       if p.peek == '=':
         p.advance()
-        let savedLB = p.inLookbehind
-        p.inLookbehind = true
         let body = p.parseRegex()
-        p.inLookbehind = savedLB
         result = Node(kind: nkLookaround, lookKind: lkBehind, lookBody: body)
       elif p.peek == '!':
         p.advance()
-        let savedLB = p.inLookbehind
-        p.inLookbehind = true
         let body = p.parseRegex()
-        p.inLookbehind = savedLB
         result = Node(kind: nkLookaround, lookKind: lkNegBehind, lookBody: body)
       else:
         result = p.parseNamedCapture('>')

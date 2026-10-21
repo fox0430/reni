@@ -292,12 +292,14 @@ type
       captureBodyKeepsFlags*: bool
         ## ``groupBodyKeepsFlags`` for a capturing group: the matcher skips
         ## only the ``chUndoFlags`` push, since the frame carries the span.
+      capturePos*: int32 ## See ``lookPos``.
     of nkNamedCapture:
       captureName*: string
       namedCaptureIndex*: int
       namedCaptureBody*: Node
       namedCaptureBodyKeepsFlags*: bool
         ## ``captureBodyKeepsFlags`` for the named spelling.
+      namedCapturePos*: int32 ## See ``lookPos``.
     of nkGroup:
       groupBody*: Node
       groupBodyKeepsFlags*: bool
@@ -373,6 +375,7 @@ type
         ## under (?i) the matcher still falls back to the atoms.
     of nkAnchor:
       anchor*: AnchorKind
+      anchorPos*: int32 ## See ``lookPos``.
     of nkCharType:
       charType*: CharTypeKind
     of nkBackreference:
@@ -395,6 +398,18 @@ type
         ## reference; see [namedGroupsRead].
     of nkLookaround:
       lookKind*: LookaroundKind
+      lookPos*: int32
+        ## The byte offset in the pattern where this look-around starts, which
+        ## the error ``validateLookbehinds`` raises gives as its position.
+        ## ``anchorPos``, ``capturePos``, ``namedCapturePos``, ``callPos`` and
+        ## ``absentPos`` hold the same on the other kinds that check rejects,
+        ## and [patternPos] reads and writes whichever one a node has.
+        ## ``parseAtom`` sets it (``parseConditional`` for a look-around
+        ## condition).  ``demoteUnnamedCaptures``, the one pass before the check
+        ## that builds these nodes anew, copies them; nothing reads them after
+        ## it.  0 means not recorded, and the error then gives no position: a
+        ## node the check rejects is inside a look-behind, so it never starts
+        ## at 0.  An offset that does not fit is not recorded either.
       lookBody*: Node
       lookBounds*: LenBounds
         ## [lengthBounds] of ``lookBody`` (and of each alternative, in
@@ -418,6 +433,13 @@ type
         ## reads its body's alternation as one look-behind per branch, so a
         ## matched branch is retried once the continuation fails.  Any other
         ## look-behind commits to its first match.
+      lookFail*: bool
+        ## Set by the parser on the ``(?!)`` it reads ``(*FAIL)`` as.  In
+        ## Oniguruma ``(*FAIL)`` is a node of its own and not a look-ahead, so a
+        ## look-behind may hold it where it may not hold a ``(?!)`` the pattern
+        ## wrote (``validateLookbehinds``).  Nothing reads it after that check,
+        ## so only ``demoteUnnamedCaptures``, the one pass before it that builds
+        ## a look-around anew, copies it; ``mergeLiterals`` drops it.
     of nkAtomicGroup:
       atomicBody*: Node
     of nkConditional:
@@ -442,6 +464,7 @@ type
       callIndex*: int ## capture group index to call (-1 for named)
       callName*: string ## capture group name (empty for numeric)
       callRefs*: NameRefs ## groups ``callName`` resolves to
+      callPos*: int32 ## See ``lookPos``.
     of nkAbsent:
       absentKind*: AbsentKind
       absentEmpty*: bool
@@ -449,6 +472,7 @@ type
         ## on the compiled tree so the matcher need not walk the pattern each
         ## time it enters the function.  False on a node the pass never
         ## reached, which only costs the scan the flag lets the matcher skip.
+      absentPos*: int32 ## See ``lookPos``.
       absentBody*: Node ## absent pattern (nil for abClear)
       absentExpr*: Node ## expression to match (for abExpression only)
     of nkCalloutMax:
@@ -596,6 +620,38 @@ const NoNodeId* = NodeId(0)
   ## **Internal API.** The node table's reserved slot 0, which holds ``nil``.
   ## Real nodes are numbered from 1, so an unwritten [NodeId] reads as "no
   ## node" rather than as the root, and an optional node needs no flag.
+
+proc patternPos*(node: Node): int32 =
+  ## **Internal API.** Where ``node`` starts in the pattern, on the kinds
+  ## ``validateLookbehinds`` can reject (see ``lookPos``).  0 when the offset
+  ## was not recorded, and on every other kind.
+  case node.kind
+  of nkAnchor: node.anchorPos
+  of nkLookaround: node.lookPos
+  of nkCapture: node.capturePos
+  of nkNamedCapture: node.namedCapturePos
+  of nkSubexpCall: node.callPos
+  of nkAbsent: node.absentPos
+  else: 0
+
+proc `patternPos=`*(node: Node, pos: int32) =
+  ## **Internal API.** Record where ``node`` starts in the pattern, on the
+  ## kinds [patternPos] reads; on every other kind, do nothing.
+  case node.kind
+  of nkAnchor:
+    node.anchorPos = pos
+  of nkLookaround:
+    node.lookPos = pos
+  of nkCapture:
+    node.capturePos = pos
+  of nkNamedCapture:
+    node.namedCapturePos = pos
+  of nkSubexpCall:
+    node.callPos = pos
+  of nkAbsent:
+    node.absentPos = pos
+  else:
+    discard
 
 const
   acWord* = 0x0001'u16

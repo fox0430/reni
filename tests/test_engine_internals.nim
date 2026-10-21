@@ -1116,7 +1116,8 @@ suite "lookbehind repeats in the loop rather than on the native stack":
     check m.found
     check m.boundaries[1] == 0 .. 1
     # A negative lookbehind keeps nothing, not even a matching body's captures.
-    let n = search("ab", re("(?<!(y))ab"))
+    # It may not hold a capture itself, but a body it calls may.
+    let n = search("ab", re("(?<!\\g<1>)ab(?:(y)){0}"))
     check n.found
     check n.boundaries[1].a < 0
 

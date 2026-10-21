@@ -4,6 +4,7 @@ import ../reni
 import ../reni/engine
 import ../reni/types
 import ../reni/unicode_utils
+import ./helpers
 
 # What a pattern answers; the invariants behind it are in
 # ``test_engine_internals.nim`` and what the compiler's rewriting passes
@@ -2274,6 +2275,12 @@ suite "Lookbehind edge cases":
     for pattern in ["(?<=(?1))((?~|))", "(?<=(?1))((?~|a))", "(?<=(?&g))(?<g>(?~|a))"]:
       expect(RegexError):
         discard re(pattern)
+    # So does one inside an absent function there, as Oniguruma has it.  The
+    # absent function alone, nested or not, is fine.
+    for pattern in ["(?<=\\g<1>)((?~(?~|a)))", "(?<=\\g<1>)((?~a(?~|)))"]:
+      expect(RegexError):
+        discard re(pattern)
+    discard re("(?<=\\g<1>)((?~(?~a)))")
 
   test "so does one reached through two calls or more, unlike in Oniguruma":
     # Oniguruma checks only the first call level (``check_called_node_in_look_behind``
@@ -2287,6 +2294,122 @@ suite "Lookbehind edge cases":
     ]:
       expect(RegexError):
         discard re(pattern)
+
+  test "a look-behind body may not hold an end anchor or a look-ahead":
+    # Oniguruma 6.9.10 rejects these in ``check_node_in_look_behind``, with
+    # "invalid pattern in look-behind".  ``(*FAIL)`` is not a look-ahead
+    # there, though reni reads it as ``(?!)``.
+    for pattern in [
+      "(?<=a\\z)", "(?<!a\\z)", "(?<=a\\Z)", "(?<!a\\Z)", "(?<=a(?=b))", "(?<!a(?=b))",
+      "(?<=a(?!b))", "(?<!a(?!b))", "(?<=a(?=b)|c)", "(?<=(?!))", "(?<=(?:a\\z)+)",
+      "(?<=(?>a\\z))", "(?<=(?i)a\\z)", "(?=(?<=a\\z))", "(?<!(?~a\\z))",
+      "(?<=(?(1)a\\z|b))(a)", "(?<=(?(1)(?=a)|b))(a)",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    # A look-ahead condition is a look-ahead in the body.  Oniguruma cannot
+    # spell it, but it rejects its own ``(?((?=a))a|b)`` here.
+    for pattern in ["(?<=(?(?=a)a|b))", "(?<!(?(?!a)a|b))"]:
+      expect(RegexError):
+        discard re(pattern)
+
+  test "nor a (?~|...) form, in place or in a look-behind condition":
+    # Oniguruma accepts the absent expression ``(?~|a|b)`` here; reni does not
+    # run it inside a look-behind.  It cannot spell the conditions.
+    for pattern in [
+      "(?<=(?~|))", "(?<=(?~|a))", "(?<!(?~|a))", "(?<=(?~|a|b))", "(?<=(?<=(?~|a)))",
+      "(?<=(?~(?~|a)))", "(?(?<=(?~|a))x|y)", "(?(?<!(?~|))x|y)", "(?(?<=(?~|a|b))x|y)",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    discard re("(?(?<=(?~a))x|y)")
+
+  test "a positive look-behind may not hold a negative one":
+    # Each look-behind checks its whole body under its own polarity, nested
+    # look-behinds included, so the positive one in the middle of the last
+    # pattern rejects the negative one inside it.
+    for pattern in [
+      "(?<=(?<!a)b)", "(?<=(?<=(?<!a)))", "(?<=(?<!(?<!a)))", "(?<=(?(?<!a)a|b))",
+      "(?<!(?<=(?<!a)))",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+
+  test "a negative look-behind may not hold a capture":
+    for pattern in [
+      "(?<!(a))", "(?<!(?<n>a))", "(?<!c|(a))", "(?<!(?<=(a)))", "(?<!(?(1)(a)|b))(a)",
+      "(?<!(?~(a)))",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    # The check runs after unnamed groups are demoted, as Oniguruma's does, so
+    # a plain group next to a named one is no capture -- unless
+    # ``rfCaptureGroup`` keeps it one.
+    check search("xb", re("(?<n>x)(?<!(a))b")).matchSpan == 0 .. 2
+    expect(RegexError):
+      discard re("(?<n>x)(?<!(a))b", {rfCaptureGroup})
+    expect(RegexError):
+      discard re("(?<n>x)(?<!(?<m>a))")
+
+  test "and may hold the rest, as in Oniguruma":
+    for pattern in [
+      "(?<=a$)", "(?<=^a)", "(?<=\\Aa)", "(?<=\\Ga)", "(?<=a\\b)", "(?<=a\\B)",
+      "(?<=\\y)", "(?<=\\Ka)", "(?<=(?<=a)b)", "(?<!(?<=a)b)", "(?<!(?<!a)b)",
+      "(?<!(?<!(?<!a)))", "(?<=(a))", "(?<!(?:a))", "(?<!(?>a))", "(?<!(?i:a))",
+      "(?<=(?~a))", "(?<=(?~))", "(?<=(*FAIL))", "(?<!a(*FAIL)|b)", "(?<!(?(1)a|b))(a)",
+    ]:
+      discard re(pattern)
+    # A called body is checked only for absent operators, as there.
+    for pattern in [
+      "(?<=\\g<1>)(a\\z)", "(?<=\\g<1>)(a(?=b))", "(?<!\\g<1>)(a)",
+      "(?<=\\g<1>)((?<!a))",
+    ]:
+      discard re(pattern)
+    # Look-behind conditions, which Oniguruma cannot spell, follow the
+    # look-behind rule.
+    for pattern in ["(?<=(?(?<=a)a|b))", "(?<!(?(?<!a)a|b))"]:
+      discard re(pattern)
+    check search("bc", re("(?<=a(*FAIL)|b)c")).matchSpan == 1 .. 2
+
+  test "a bad reference is reported before the look-behind, as in Oniguruma":
+    # Oniguruma finds a bad reference while parsing and checks a look-behind
+    # body while tuning, so the reference is what it reports.
+    for (pattern, message) in [
+      ("(?<!(a))\\5", "invalid group reference"),
+      ("(?<!(a))\\k<zz>", "undefined name reference"),
+      ("(?<=a\\z)\\g<zz>", "undefined name reference"),
+      ("(?<=(?~|a))\\5", "invalid group reference"),
+      ("(?<=(?~|))\\g<zz>", "undefined name reference"),
+    ]:
+      check message in compileError(pattern)
+
+  test "the look-behind error gives where the rejected node starts":
+    # A byte offset, as the parser's errors give.  A named group demotes the
+    # unnamed ones, which builds the look-arounds, calls and absent operators
+    # anew, so those rows check that their positions survive it.  An absent
+    # operator reached through a call is reported at the call.  A bare-name
+    # condition is parsed from its own text, and its rows check that the
+    # offset is still the pattern's, even for a node at the start of the name.
+    # The last row calls a clean group again before a group that is not, so
+    # the answer kept for the first call does not stand in for the second.
+    for (pattern, pos) in [
+      ("(?<=a\\z)", 5),
+      ("(?<!a(?=b))", 5),
+      ("(?<=(?<!a)b)", 4),
+      ("(?<!c|(a))", 6),
+      ("(?<!(?<n>a))(?<m>b)", 4),
+      ("(?<=(?~|a))", 4),
+      ("(?<=\\g<1>)((?~|a))", 4),
+      ("(?<=(?(?=a)a|b))", 6),
+      ("(?<=日本\\z)", 10),
+      ("(?<n>x)(?<!c(?=a))", 12),
+      ("(?<n>x)(?<=c(?~|a))", 12),
+      ("(?<n>(?~|a))(?<=c\\g<n>)", 17),
+      ("(?<=xyz(?(a\\z)b|c))", 11),
+      ("(?<=xyz(?(\\z)b|c))", 10),
+      ("(?<=\\g<1>)(?<=\\g<1>\\g<2>)(a)((?~|b))", 19),
+    ]:
+      check compileError(pattern) == "invalid pattern in look-behind at position " & $pos
 
   test "lookahead with subroutine call containing absent is ok":
     discard re("(?=(?1))((?~x))")
@@ -2471,9 +2594,11 @@ suite "look-behind body window":
   test "the end anchors read past the clip":
     # Oniguruma answers ``$``, ``\z``, ``\Z`` and ``\b`` inside a look-behind
     # from the real subject, so the window's edge is no end of string and no
-    # word boundary.
+    # word boundary.  ``\z`` and ``\Z`` are rejected in a look-behind body but
+    # not in a body it calls, so they are reached through a call.
     check not search("aab", re("(?<=\\w{1,2}$)b")).found
-    check not search("aab", re("(?<=\\w{1,2}\\Z)b")).found
+    check not search("aab", re("(?<=\\g<1>)b(?:(\\w{1,2}\\Z)){0}")).found
+    check not search("aab", re("(?<=\\g<1>)b(?:(\\w{1,2}\\z)){0}")).found
     check not search("aab", re("(?<=\\w{1,2}\\b)b")).found
 
     # The same position is inside a word, which is what ``\B`` wants.
@@ -2686,10 +2811,12 @@ suite "look-behind body window":
     # an unbounded repeat answered -1 without looking at what it repeats --
     # and so was ``(?(...)\b|\b)``, a conditional answering -1 with two
     # branches of the same length.  Oniguruma compiles none of these, so they
-    # are reni's own rule followed through.
+    # are reni's own rule followed through.  The conditions are look-behinds: a
+    # look-ahead condition is a look-ahead in the body, which a look-behind may
+    # not hold.
     for pattern in [
       "(?<=a*\\b)a", # the shape they all have to match
-      "(?<=a*(?(?=a)\\b|\\b))a", "(?<=a*(?(?=z)\\b|\\b))a", "(?<=a*(?:\\b){1,2})a",
+      "(?<=a*(?(?<=a)\\b|\\b))a", "(?<=a*(?(?<=z)\\b|\\b))a", "(?<=a*(?:\\b){1,2})a",
       "(?<=a*(?:\\b){1})a", "(?<=a*(?:\\b){2})a", "(?<=a*(?:\\b)+)a",
       "(?<=a*(?:(?:\\b){1,2}){1,2})a",
     ]:
@@ -2702,10 +2829,10 @@ suite "look-behind body window":
 
     # Branches of *different* lengths leave the body variable, and it is then
     # clipped like any other -- no exemption for the zero-width branch.
-    check not search("abcd", re("(?<=a*(?(?=a)(?:\\b){1,2}|zz))a")).found
+    check not search("abcd", re("(?<=a*(?(?<=a)(?:\\b){1,2}|zz))a")).found
 
     # The negative reads the same body, so the two stay complements.
-    check not search("abcd", re("(?<!a*(?(?=a)\\b|\\b))a")).found
+    check not search("abcd", re("(?<!a*(?(?<=a)\\b|\\b))a")).found
     check not search("abcd", re("(?<!a*(?:\\b){1,2})a")).found
 
     # A repeat that can consume is not zero-width: a later iteration runs
@@ -2820,30 +2947,36 @@ suite "look-behind body window":
     check search("ab", re("(?~(?<=a))")).boundaries[0] == 0 .. 1
     check search("ab", re("(?~(?!a))")).boundaries[0] == 0 .. 1
 
-  test "a nested look-ahead reads past the clip":
+  test "a called look-ahead reads past the clip, unlike in Oniguruma":
     # The clip bounds what the body may consume, not what an assertion inside
     # it may look at -- the same line the end anchors are on.  A trailing
-    # ``(?=...)`` wants exactly the bytes the window took away, and
-    # Oniguruma rejects the shape outright, so reni follows PCRE, Perl and
-    # Python here: the look-ahead sees the real subject.
-    for pattern in ["(?<=ab(?=c))c", "(?<=a?b(?=c))c", "(?<=ab(?=c)|zz)c"]:
+    # ``(?=...)`` wants exactly the bytes the window took away.  A look-behind
+    # body may not hold a look-ahead, but a body it calls may, and there reni
+    # follows PCRE, Perl and Python: the look-ahead sees the real subject.
+    # Oniguruma answers it from the window instead, so the two variable-length
+    # bodies, ``a?b(?=c)`` and ``a?a(?!c)``, differ there: no match, and (1,2).
+    for pattern in [
+      "(?<=\\g<1>)c(?:(ab(?=c))){0}", "(?<=\\g<1>)c(?:(a?b(?=c))){0}",
+      "(?<=\\g<1>|zz)c(?:(ab(?=c))){0}",
+    ]:
       let m = search("abc", re(pattern))
       check m.found
       check m.boundaries[0] == 2 .. 3
 
     # ...so an assertion and its negation do not both hold at one position.
-    check not search("abc", re("(?<!ab(?=c))c")).found
-    check not search("ac", re("(?<=a(?!c))c")).found
-    check not search("ac", re("(?<=a?a(?!c))c")).found
+    check not search("abc", re("(?<!\\g<1>)c(?:(ab(?=c))){0}")).found
+    check not search("ac", re("(?<=\\g<1>)c(?:(a(?!c))){0}")).found
+    check not search("ac", re("(?<=\\g<1>)c(?:(a?a(?!c))){0}")).found
 
-  test "every alternative of a look-behind shares the one window":
+  test "every alternative reads a called look-ahead past one window, unlike in Oniguruma":
     # The fixed-length and the variable-length alternative have to agree, on
-    # the clip and on the look-ahead reading past it.
-    let m = search("abc", re("(?<=a?b(?=c)|zz)c"))
+    # the clip and on the look-ahead reading past it.  Oniguruma answers the
+    # variable-length rows from the window: no match, then (2,3).
+    let m = search("abc", re("(?<=\\g<1>|zz)c(?:(a?b(?=c))){0}"))
     check m.found
     check m.boundaries[0] == 2 .. 3
-    check not search("abc", re("(?<!ab(?=c)|zz)c")).found
-    check not search("abc", re("(?<!a?b(?=c)|zz)c")).found
+    check not search("abc", re("(?<!\\g<1>|zz)c(?:(ab(?=c))){0}")).found
+    check not search("abc", re("(?<!\\g<1>|zz)c(?:(a?b(?=c))){0}")).found
 
   test "a grapheme cluster ends at the window too":
     # ``\X`` resolves its cluster forward, so it is one more shape that will
@@ -4055,10 +4188,11 @@ suite "MatchContext-based API":
 
   test "negative lookbehind with capture leaves outer captures intact":
     # Body captures inside a negative lookbehind must not be exposed when
-    # the lookbehind succeeds (since negative => body did not match).
+    # the lookbehind succeeds (since negative => body did not match).  A
+    # negative look-behind may not hold a capture, but a body it calls may.
     let ctx = newMatchContext()
     var m: Match
-    let r = re("(?<!(\\d))[a-z]")
+    let r = re("(?<!\\g<1>)[a-z](?:(\\d)){0}")
     check searchIntoCtx(ctx, "9a b", r, m)
     # At pos 0 ('9'): not a-z, skip. pos 1 ('a'): preceded by '9', neg fails.
     # pos 2 (' '): not a-z. pos 3 ('b'): preceded by ' ', neg succeeds.

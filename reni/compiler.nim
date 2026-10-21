@@ -18,6 +18,7 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
       captureName: node.captureName,
       namedCaptureIndex: newIdx,
       namedCaptureBody: demoteUnnamedCaptures(node.namedCaptureBody, indexMap),
+      namedCapturePos: node.namedCapturePos,
     )
   of nkConcat:
     var children = newSeq[Node](node.children.len)
@@ -55,7 +56,9 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     Node(
       kind: nkLookaround,
       lookKind: node.lookKind,
+      lookPos: node.lookPos,
       lookBody: demoteUnnamedCaptures(node.lookBody, indexMap),
+      lookFail: node.lookFail,
     )
   of nkAtomicGroup:
     Node(
@@ -95,11 +98,17 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
       let oldIdx = node.callIndex - 1
       if oldIdx in indexMap:
         newCallIndex = indexMap[oldIdx] + 1
-    Node(kind: nkSubexpCall, callIndex: newCallIndex, callName: node.callName)
+    Node(
+      kind: nkSubexpCall,
+      callIndex: newCallIndex,
+      callName: node.callName,
+      callPos: node.callPos,
+    )
   of nkAbsent:
     Node(
       kind: nkAbsent,
       absentKind: node.absentKind,
+      absentPos: node.absentPos,
       absentBody: demoteUnnamedCaptures(node.absentBody, indexMap),
       absentExpr: demoteUnnamedCaptures(node.absentExpr, indexMap),
     )
@@ -207,6 +216,21 @@ proc canMatchEmpty(node: Node): bool =
   of nkSubexpCall:
     true # conservative: assume it can match empty
 
+proc callTarget(node: Node, bodies: seq[Node], namedCaptures: seq[(string, int)]): int =
+  ## The 0-based group the call ``node`` runs, or -1 when there is no body to
+  ## follow: a call to the whole pattern (``\g<0>``, ``(?R)``), a number
+  ## [validateNumericRefs] has yet to reject, or a group with no body.  A name
+  ## resolves to the first group declared with it.
+  var idx = -1
+  if node.callIndex > 0:
+    idx = node.callIndex - 1
+  elif node.callName.len > 0:
+    for (name, i) in namedCaptures:
+      if name == node.callName:
+        idx = i
+        break
+  if idx >= 0 and idx < bodies.len and bodies[idx] != nil: idx else: -1
+
 proc hasRecursiveCycle(
     startIdx: int,
     node: Node,
@@ -221,14 +245,7 @@ proc hasRecursiveCycle(
     return false
   case node.kind
   of nkSubexpCall:
-    var callIdx = -1
-    if node.callIndex > 0:
-      callIdx = node.callIndex - 1
-    elif node.callName.len > 0:
-      for (name, i) in namedCaptures:
-        if name == node.callName:
-          callIdx = i
-          break
+    let callIdx = callTarget(node, bodies, namedCaptures)
     if callIdx < 0:
       return false
     if callIdx == startIdx:
@@ -239,10 +256,7 @@ proc hasRecursiveCycle(
       return false
     visiting.incl(callIdx)
     let hit =
-      if callIdx < bodies.len and bodies[callIdx] != nil:
-        hasRecursiveCycle(startIdx, bodies[callIdx], bodies, namedCaptures, visiting)
-      else:
-        false
+      hasRecursiveCycle(startIdx, bodies[callIdx], bodies, namedCaptures, visiting)
     visiting.excl(callIdx)
     hit
   of nkConcat:
@@ -299,34 +313,36 @@ proc containsAbsent(
     namedCaptures: seq[(string, int)],
     visited: var HashSet[int],
 ): bool =
-  ## Check if a node transitively contains a ``(?~|...)`` form, which the
-  ## parser already rejects when written in a look-behind directly.  The
+  ## Check if a node transitively contains a ``(?~|...)`` form, which
+  ## [validateLookbehinds] rejects when written in a look-behind directly.  The
   ## absent function ``(?~pattern)`` -- ``(?~)`` included -- is allowed
-  ## there, as in Oniguruma.
+  ## there, as in Oniguruma, but its pattern is searched like any other body:
+  ## ``(?<=\g<1>)((?~(?~|a)))`` is rejected, as it is written in place.
   ##
   ## Calls are followed to any depth.  Oniguruma follows only the first
   ## (``check_called_node_in_look_behind`` has no case for a call), so it
   ## compiles ``(?<=\g<1>)(\g<2>)((?~|))``, and the range clear then escapes
   ## the look-behind.  reni rejects that on purpose.
+  ##
+  ## A call to the whole pattern (``\g<0>``, ``(?R)``) is not followed, here
+  ## or in [validateLookbehinds].  Oniguruma follows no recursive call, and a
+  ## ``\g<0>`` in a look-behind always is one, so it compiles
+  ## ``(?~|a)|(?<=x\g<0>)`` as reni does.  In the shapes checked, a stopper or
+  ## a range clear run through it stays inside the look-behind in both
+  ## engines, so following it would only reject what Oniguruma accepts.  A
+  ## recursive call through a group, ``((?~|a)|(?<=x\g<1>))``, is followed and
+  ## rejected, which Oniguruma does not do.
   if node == nil:
     return false
   case node.kind
   of nkAbsent:
-    return node.absentKind != abFunction
+    if node.absentKind != abFunction:
+      return true
   of nkSubexpCall:
-    # Resolve the call target and check its body
-    var idx = -1
-    if node.callIndex > 0:
-      idx = node.callIndex - 1
-    elif node.callName.len > 0:
-      for (name, i) in namedCaptures:
-        if name == node.callName:
-          idx = i
-          break
-    if idx >= 0 and idx < bodies.len and bodies[idx] != nil:
-      if idx notin visited:
-        visited.incl(idx)
-        return containsAbsent(bodies[idx], bodies, namedCaptures, visited)
+    let idx = callTarget(node, bodies, namedCaptures)
+    if idx >= 0 and idx notin visited:
+      visited.incl(idx)
+      return containsAbsent(bodies[idx], bodies, namedCaptures, visited)
     return false
   else:
     discard
@@ -336,35 +352,100 @@ proc containsAbsent(
   false
 
 proc validateLookbehinds(
-    node: Node, bodies: seq[Node], namedCaptures: seq[(string, int)], inLookbehind: bool
+    node: Node,
+    bodies: seq[Node],
+    namedCaptures: seq[(string, int)],
+    inPosBehind, inNegBehind: bool,
+    calledAbsent: var seq[int8],
 ) =
-  ## Check that lookbehinds don't contain absent expressions through subexp calls.
+  ## Reject what Oniguruma's ``check_node_in_look_behind`` rejects in a
+  ## look-behind body: ``\z``, ``\Z`` and look-aheads in any, a negative
+  ## look-behind inside a positive one, and a capturing group inside a negative
+  ## one.  ``inPosBehind`` and ``inNegBehind`` say whether some look-behind of
+  ## that polarity encloses the node.  Oniguruma checks each look-behind's whole
+  ## body, nested look-behinds included, under that look-behind's own polarity,
+  ## so a node is rejected when any look-behind around it rejects it:
+  ## ``(?<!(?<=(?<!a)))`` fails on the positive one in the middle.
+  ##
+  ## Every ``(?~|...)`` form is rejected as well, in place or through a call.
+  ## Oniguruma rejects only the two with side effects, the range clear and the
+  ## stopper, and accepts the absent expression ``(?~|a|b)``, which reni does
+  ## not run inside a look-behind.
+  ##
+  ## Runs after unnamed captures are demoted, as Oniguruma's check runs after
+  ## ``disable_noname_group_capture``: ``(?<n>a)(?<!(b))`` compiles there.  A
+  ## look-around condition counts as a look-around in the body.  Oniguruma
+  ## cannot spell ``(?(?=a)...)``, but it rejects ``(?((?=a))...)``, its own
+  ## form, in a look-behind.  ``(*FAIL)`` is not a look-ahead there, so it
+  ## passes ([lookFail]).
+  ##
+  ## A called body is checked only for absent operators ([containsAbsent]), as
+  ## ``check_called_node_in_look_behind`` does, so ``(?<=\g<1>)(a\z)``
+  ## compiles.  ``calledAbsent`` keeps that answer for each group called (0
+  ## until asked, 1 when it holds one, -1 when not), so a group called from
+  ## many look-behinds is walked once.  Only an answer asked from here is
+  ## kept: inside [containsAbsent], a group reached again through a cycle
+  ## reads as clean, so the answer for a group it passes through may be
+  ## partial.
+  ##
+  ## The error gives the position where the rejected node starts, as a parser
+  ## error does.  For an absent operator reached through a call, that is the
+  ## call.
   if node == nil:
     return
+  template reject() =
+    var msg = "invalid pattern in look-behind"
+    let pos = node.patternPos
+    if pos > 0:
+      msg.add " at position " & $pos
+    raise newException(RegexError, msg)
+
+  let inBehind = inPosBehind or inNegBehind
   case node.kind
-  of nkLookaround:
-    let isLB = node.lookKind in {lkBehind, lkNegBehind}
-    validateLookbehinds(node.lookBody, bodies, namedCaptures, inLookbehind or isLB)
+  of nkAnchor:
+    if inBehind and node.anchor in {akStringEnd, akStringEndOrNewline}:
+      reject()
     return
+  of nkLookaround:
+    case node.lookKind
+    of lkAhead, lkNegAhead:
+      if inBehind and not node.lookFail:
+        reject()
+    of lkBehind:
+      validateLookbehinds(
+        node.lookBody, bodies, namedCaptures, true, inNegBehind, calledAbsent
+      )
+      return
+    of lkNegBehind:
+      if inPosBehind:
+        reject()
+      validateLookbehinds(
+        node.lookBody, bodies, namedCaptures, inPosBehind, true, calledAbsent
+      )
+      return
+  of nkCapture, nkNamedCapture:
+    if inNegBehind:
+      reject()
+  of nkAbsent:
+    if inBehind and node.absentKind != abFunction:
+      reject()
   of nkSubexpCall:
-    if inLookbehind:
-      var idx = -1
-      if node.callIndex > 0:
-        idx = node.callIndex - 1
-      elif node.callName.len > 0:
-        for (name, i) in namedCaptures:
-          if name == node.callName:
-            idx = i
-            break
-      if idx >= 0 and idx < bodies.len and bodies[idx] != nil:
-        var visited = initHashSet[int]()
-        if containsAbsent(bodies[idx], bodies, namedCaptures, visited):
-          raise newException(RegexError, "invalid pattern in look-behind")
+    if inBehind:
+      let idx = callTarget(node, bodies, namedCaptures)
+      if idx >= 0:
+        if calledAbsent[idx] == 0:
+          var visited = initHashSet[int]()
+          calledAbsent[idx] =
+            if containsAbsent(bodies[idx], bodies, namedCaptures, visited): 1 else: -1
+        if calledAbsent[idx] > 0:
+          reject()
     return
   else:
     discard
   for child in node.childNodes:
-    validateLookbehinds(child, bodies, namedCaptures, inLookbehind)
+    validateLookbehinds(
+      child, bodies, namedCaptures, inPosBehind, inNegBehind, calledAbsent
+    )
 
 proc validateNoNumberedRefs(node: Node) =
   ## Oniguruma: when named captures exist, numbered backrefs/calls are forbidden.
@@ -2355,10 +2436,13 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     visiting.incl(i)
     if hasRecursiveCycle(i, body, bodies, namedCaptures, visiting):
       raise newException(RegexError, "never ending recursion")
-  # Check for absent expressions in lookbehinds (including via subexp calls)
-  validateLookbehinds(ast, bodies, namedCaptures, false)
   # Validate that every numeric / named reference points to an existing group.
   validateNumericRefs(ast, captureCount, namedCaptures)
+  # What a look-behind body may hold, and absent operators reached through
+  # calls.  After the reference checks, as Oniguruma reports those while
+  # parsing and this one while tuning: ``(?<!(a))\5`` is a bad reference there.
+  var calledAbsent = newSeq[int8](bodies.len)
+  validateLookbehinds(ast, bodies, namedCaptures, false, false, calledAbsent)
   # Merge consecutive literals into nkString nodes
   ast = mergeLiterals(ast)
   # Must run before any analysis that reads a quantifier's bounds or kind.
