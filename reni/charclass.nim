@@ -16,6 +16,11 @@ const MaxCcNestingDepth = 256
   ## Same limit as `MaxNestingDepth` in `parser.nim` (separate to avoid import cycle).
 
 const HexDigits* = {'0' .. '9', 'a' .. 'f', 'A' .. 'F'}
+const PropertyLetters* = {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}
+  ## The major Unicode categories ``\pX`` and ``\PX`` name without braces,
+  ## as Oniguruma master does.  After any other character, ``\p`` and ``\P``
+  ## are the letters themselves, as in every Oniguruma release; master,
+  ## never released, rejects them there.
 
 proc parseHexInt*(s: string): int =
   for ch in s:
@@ -364,14 +369,12 @@ proc parseCcEscape(p: var CcParser): CcAtom =
         )
       else:
         CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+    elif p.atEnd or p.peek notin PropertyLetters:
+      # Oniguruma reads ``[\s\d\p]`` (VS Code's log grammar) as holding ``p``.
+      CcAtom(kind: ccLiteral, rune: Rune(ord('p')))
     else:
-      if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
-        p.error("invalid Unicode property name")
-      var name = ""
-      name.add(p.peek)
+      let name = $p.peek
       p.advance()
-      if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
-        p.error("invalid Unicode property '" & name & "'")
       CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
   of 'P':
     p.advance()
@@ -391,14 +394,11 @@ proc parseCcEscape(p: var CcParser): CcAtom =
         )
       else:
         CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+    elif p.atEnd or p.peek notin PropertyLetters:
+      CcAtom(kind: ccLiteral, rune: Rune(ord('P')))
     else:
-      if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
-        p.error("invalid Unicode property name")
-      var name = ""
-      name.add(p.peek)
+      let name = $p.peek
       p.advance()
-      if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
-        p.error("invalid Unicode property '" & name & "'")
       CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
   else:
     # Literal escape: \], \-, \\, \[, etc.

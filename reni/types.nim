@@ -215,9 +215,11 @@ type
   ConditionalKind* = enum
     ckBackref ## (?(n)...) - numeric backref condition
     ckNamedRef ## (?(<name>)...) or (?('name')...) - named ref condition
-    ckAlwaysFalse ## (?(*FAIL)...) etc.
+    ckAlwaysFalse ## (?(*FAIL)...)
     ckAlwaysTrue ## (?()...) empty condition, (?({...})...) code condition
-    ckRegexCond ## (?(regex)...) - bare name that's not a capture group
+    ckRegexCond
+      ## (?(regex)...) - bare name that's not a capture group, a look-around,
+      ## or a callout other than (*FAIL)
 
   NameRefs* = distinct int32
     ## **Internal API.** Offset into ``Regex``'s name-reference table of the

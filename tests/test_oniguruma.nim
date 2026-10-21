@@ -51,6 +51,33 @@ proc loadTests(filename: string): seq[OnigTestCase] =
       tc.errorName = t["error"].getStr
     result.add tc
 
+const ReleaseReadings = [
+  # Oniguruma master (30534b4d, ee93c100, after 6.9.10 and never released)
+  # rejects a brace-less ``\p`` that names no category.  Every release reads it
+  # as the letter, and the TextMate grammars written against them rely on it:
+  # VS Code's log grammar has ``[\s\d\p]``.  reni keeps master's ``\pL``.
+  (line: 1194, pattern: "\\p", subject: "p", fromPos: 0, toPos: 1),
+  (line: 1196, pattern: "\\pQ", subject: "pQ", fromPos: 0, toPos: 2),
+  (line: 1200, pattern: "[\\p]", subject: "p", fromPos: 0, toPos: 1),
+  (line: 1201, pattern: "[\\pU]", subject: "U", fromPos: 0, toPos: 1),
+]
+
+proc applyReleaseReadings(tests: var seq[OnigTestCase]) =
+  ## Replace the ``test_utf8.c`` error cases [ReleaseReadings] lists with the
+  ## match a release gives.
+  for tc in tests.mitems:
+    for r in ReleaseReadings:
+      if tc.line == r.line:
+        doAssert tc.kind == tkError and tc.pattern == r.pattern
+        tc = OnigTestCase(
+          kind: tkMatch,
+          pattern: r.pattern,
+          subject: r.subject,
+          fromPos: r.fromPos,
+          toPos: r.toPos,
+          line: r.line,
+        )
+
 proc safeDisplay(s: string, maxLen: int = 20): string =
   ## Create a safe display string for test names
   result = ""
@@ -63,7 +90,9 @@ proc safeDisplay(s: string, maxLen: int = 20): string =
       result.add "\\x" & toHex(ord(ch), 2)
 
 proc runTestFile(filename: string, suiteName: string, backward: bool = false) =
-  let tests = loadTests(filename)
+  var tests = loadTests(filename)
+  if filename.extractFilename == "oniguruma_utf8.json":
+    applyReleaseReadings(tests)
 
   var passed, failed: int
 

@@ -1,5 +1,5 @@
 import std/unicode
-from std/strutils import toUpperAscii, find
+from std/strutils import find
 
 import types, charclass, unicode_utils, stackguard
 
@@ -264,7 +264,7 @@ proc isQuantifiable(node: Node): bool =
   of nkFlagGroup:
     node.flagBody != nil # scoped (?i:...) is quantifiable; isolated (?i) is not
   of nkLookaround:
-    true
+    true # (?=abc){0}, (?=(a))?
   else:
     true
 
@@ -591,14 +591,11 @@ proc parseEscape(p: var Parser): Node =
       if name.len == 0:
         p.error("empty Unicode property name")
       p.expect('}')
+    elif p.atEnd or p.peek notin PropertyLetters:
+      return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('p')))
     else:
-      if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
-        p.error("invalid Unicode property name")
       name.add(p.peek)
       p.advance()
-      # Single-char \pX: only valid for major Unicode category letters
-      if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
-        p.error("invalid Unicode property '" & name & "'")
     # \p{^Prop} = negated property
     if name.len > 1 and name[0] == '^':
       result = Node(
@@ -625,13 +622,11 @@ proc parseEscape(p: var Parser): Node =
       if name.len == 0:
         p.error("empty Unicode property name")
       p.expect('}')
+    elif p.atEnd or p.peek notin PropertyLetters:
+      return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('P')))
     else:
-      if p.atEnd or p.peek notin {'A' .. 'Z', 'a' .. 'z'}:
-        p.error("invalid Unicode property name")
       name.add(p.peek)
       p.advance()
-      if name[0] notin {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}:
-        p.error("invalid Unicode property '" & name & "'")
     # \P{^Prop} = double negation = positive
     if name.len > 1 and name[0] == '^':
       result = Node(
@@ -838,8 +833,8 @@ proc parseCalloutVerb(p: var Parser): Node =
   while not p.atEnd and p.peek notin {')', '{', '[', '}', ']'}:
     verbName.add(p.peek)
     p.advance()
-  let upperVerb = verbName.toUpperAscii()
-  case upperVerb
+  # Oniguruma matches the names with case: ``(*fail)`` is an undefined callout.
+  case verbName
   of "FAIL":
     while not p.atEnd and p.peek != ')':
       p.advance()
@@ -906,11 +901,10 @@ proc parseCalloutVerb(p: var Parser): Node =
   else:
     while not p.atEnd and p.peek != ')':
       p.advance()
-    const KnownVerbs = [
-      "FAIL", "MAX", "COUNT", "CMP", "TOTAL_COUNT", "SKIP", "MISMATCH", "ACCEPT",
-      "PRUNE", "COMMIT", "THEN", "ERROR",
-    ]
-    if upperVerb notin KnownVerbs:
+    # PCRE's ``(*ACCEPT)``, ``(*PRUNE)``, ``(*COMMIT)`` and ``(*THEN)`` are
+    # not Oniguruma callouts either.
+    const KnownVerbs = ["TOTAL_COUNT", "SKIP", "MISMATCH", "ERROR"]
+    if verbName notin KnownVerbs:
       p.error("undefined callout name '" & verbName & "'")
     Node(kind: nkGroup, groupBody: Node(kind: nkConcat, children: @[]))
 
@@ -994,6 +988,24 @@ proc parseAtom(p: var Parser): Node =
     let r = p.advanceRune()
     result = Node(kind: nkLiteral, rune: r)
 
+proc repeatApplies(p: var Parser, body: Node): bool =
+  ## Whether the repeat operator at ``p.pos`` applies to ``body``.  A ``{``
+  ## that opens no interval does not: it is a literal after anything, and
+  ## Oniguruma matches ``\G{a`` (the sassdoc grammar) and ``(?i){a`` against
+  ## ``{a``.  Any other repeat of an anchor or an isolated option group is an
+  ## error, whether it follows at once or after a ``(?#...)`` comment.
+  if isQuantifiable(body):
+    return true
+  if p.peek == '{':
+    let bracePos = p.pos
+    discard p.parseQuantifier(body)
+    if p.pos == bracePos:
+      return false
+    p.pos = bracePos
+  if body.kind == nkFlagGroup and body.flagBody == nil:
+    p.error("target of repeat operator not specified")
+  p.error("target of repeat operator is not repeatable")
+
 proc parseQuantified(p: var Parser): Node =
   var body = p.parseAtom()
   if p.inLiteralQuote:
@@ -1009,13 +1021,8 @@ proc parseQuantified(p: var Parser): Node =
       break
     if first:
       first = false
-      if not isQuantifiable(body):
-        if body.kind == nkFlagGroup and body.flagBody == nil:
-          p.error("target of repeat operator not specified")
-        elif body.kind == nkAnchor:
-          p.error("target of repeat operator is not repeatable")
-        elif body.kind == nkLookaround:
-          discard # lookarounds can be quantified (e.g., (?=abc){0}, (?=(a))?)
+      if not p.repeatApplies(body):
+        break
     let posBefore = p.pos
     body = p.parseQuantifier(body)
     if p.pos == posBefore:
@@ -1048,7 +1055,8 @@ proc parseConcat(p: var Parser): Node =
       # If a quantifier follows and there's a previous atom, re-quantify it
       if not p.inLiteralQuote:
         p.skipWhitespaceAndComments()
-      if nodes.len > 0 and not p.atEnd and p.peek in {'*', '+', '?', '{'}:
+      if nodes.len > 0 and not p.atEnd and p.peek in {'*', '+', '?', '{'} and
+          p.repeatApplies(nodes[^1]):
         var lastNode = nodes.pop()
         p.concatNodeCount = nodes.len
         lastNode = p.parseQuantifier(lastNode)
@@ -1238,18 +1246,21 @@ proc parseConditional(p: var Parser): Node =
       condIndex = -1
       condBodyNode = Node(kind: nkLookaround, lookKind: lookKind, lookBody: lookBody)
     else:
-      while not p.atEnd and p.peek != ')':
-        p.advance()
-      condKind = ckAlwaysTrue
-      condIndex = -1
-      p.expect(')')
+      # Oniguruma reads this ``?`` as a repeat with nothing before it, as it
+      # does the ``(?(?=`` and ``(?(?<=`` reni keeps above.
+      p.error("target of repeat operator not specified")
   elif p.peek == '*':
+    # The callout is the condition: ``(?(*FAIL)b|c)`` takes ``c``, and
+    # ``(?(*MAX{1})b|c)`` takes ``b`` once.
     p.advance()
-    while not p.atEnd and p.peek != ')':
-      p.advance()
-    condKind = ckAlwaysFalse
-    condIndex = -1
+    let verb = p.parseCalloutVerb()
     p.expect(')')
+    condIndex = -1
+    if verb.kind == nkLookaround: # (*FAIL)
+      condKind = ckAlwaysFalse
+    else:
+      condKind = ckRegexCond
+      condBodyNode = verb
   elif p.peek == '{':
     p.advance()
     var depth = 1

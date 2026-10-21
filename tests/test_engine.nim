@@ -158,6 +158,32 @@ suite "Step 2: Anchors":
     let m = search("ba", re("\\Ga"))
     check not m.found
 
+  test "a { after an anchor that opens no interval is a literal":
+    # As anywhere else in Oniguruma 6.9.10: the sassdoc grammar's
+    # ``\G{(?:[^}*]|\*[^/}])+$`` compiles there.
+    check search("{a", re("\\G{a")).matchSpan == 0 .. 2
+    check not search("x{a", re("^{a")).found
+    check search("{a", re("^{a")).matchSpan == 0 .. 2
+    check search("a{", re("a\\b{")).matchSpan == 0 .. 2
+    check search("a{g}", re("a\\b{g}")).matchSpan == 0 .. 4
+    check search("{a", re("(?x)^ {a")).matchSpan == 0 .. 2
+    check search("{}{,}", re("^{}{,}")).matchSpan == 0 .. 5
+    check search("{A", re("(?i){a")).matchSpan == 0 .. 2
+    check not search("{}", re("\\G{(?:[^}*]|\\*[^/}])+$")).found
+    check search("{x", re("\\G{(?:[^}*]|\\*[^/}])+$")).matchSpan == 0 .. 2
+    check search("{a", re("\\G(?#c){a")).matchSpan == 0 .. 2
+    # An interval there is still an error, and so is any repeat that a
+    # comment parts from the anchor.
+    for pattern in [
+      "^{2}", "^{2,3}", "^{,2}", "\\G{1}", "\\b{2,}", "(?x)^ {2}", "^(?#c){2}",
+      "^(?#c)*", "^(?#c)(?#d)?", "$(?#c)+", "(?x)^ (?#c) {2}",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    expect(RegexError):
+      discard re("(?i){2}")
+    check search("aa", re("a(?#c){2}")).matchSpan == 0 .. 2
+
 suite "Step 3: Dot and character types":
   test ". matches any char except newline":
     let m = search("a", re("."))
@@ -514,6 +540,29 @@ suite "Step 5: Character classes":
   test "&& intersection with outer negation rejects":
     let m = search("f", re("[^[^abc]&&[^cde]]"))
     check not m.found
+
+  test "a \\p that names no category is the letter":
+    # As in every Oniguruma release, VS Code's log grammar's
+    # ``(?<=^[\s\d\p]*)\bV\b`` included; master would reject it.  ``\pL`` and
+    # the other category letters stay properties, as there.
+    check search("1 p V", re("(?<=^[\\s\\d\\p]*)\\bV\\b")).matchSpan == 4 .. 5
+    check not search("1 q V", re("(?<=^[\\s\\d\\p]*)\\bV\\b")).found
+    check search("\\p", re("[\\p]")).matchSpan == 1 .. 2
+    check search("xP", re("[\\P]")).matchSpan == 1 .. 2
+    check search("xpQ", re("\\pQ")).matchSpan == 1 .. 3
+    check search("U", re("[\\pU]")).matchSpan == 0 .. 1
+    check search("pp", re("\\p+")).matchSpan == 0 .. 2
+    check search("P", re("(?i)\\p")).matchSpan == 0 .. 1
+    check search("z", re("[\\p-z]")).matchSpan == 0 .. 1
+    check not search("o", re("[\\p-z]")).found
+    check search("m", re("[a-\\p]")).matchSpan == 0 .. 1
+    check search("a", re("[^\\p]")).matchSpan == 0 .. 1
+    check not search("p", re("[^\\p]")).found
+    check search("é", re("\\pL")).matchSpan == 0 .. 2
+    check not search("é", re("[\\PL]")).found
+    for pattern in ["\\p{", "\\p{L", "[\\p{]", "\\p{}"]:
+      expect(RegexError):
+        discard re(pattern)
 
 suite "Step 6: Capture groups":
   test "simple capture":
@@ -1202,6 +1251,32 @@ suite "Conditionals":
     check m.found
     check m.boundaries[0] == 0 .. 3
 
+  test "a callout condition holds as the callout does":
+    # Read off Oniguruma 6.9.10: the callout is the condition, so only
+    # ``(*FAIL)`` takes the no branch.
+    check search("c", re("(?(*FAIL[t])b|c)")).matchSpan == 0 .. 1
+    check search("b", re("(?(*MAX{1})b|c)")).matchSpan == 0 .. 1
+    check not search("c", re("(?(*MAX{1})b|c)")).found
+    check search("ab", re("(?(*MAX{1})b|c)")).matchSpan == 1 .. 2
+    check search("bb", re("(?(*MAX{1})b|c)(?(*MAX{1})b|c)")).matchSpan == 0 .. 2
+    check search("bbb", re("(?(*MAX{2})b|c)+")).matchSpan == 0 .. 2
+    check search("bc", re("(?(*COUNT)b|c)")).matchSpan == 0 .. 1
+    check search("bc", re("(?(*SKIP)b|c)")).matchSpan == 0 .. 1
+    check search("ac", re("(?<=(?(*MAX{1})a|b))c")).matchSpan == 1 .. 2
+    check not search("bc", re("(?<=(?(*COUNT)a|b))c")).found
+
+  test "a condition Oniguruma cannot read is an error":
+    # ``(?(?`` other than reni's own look-around conditions is a ``?`` with
+    # nothing to repeat there.  The callout one fails as the callout would.
+    for pattern in [
+      "(?(?x)b|c)", "(?(?i)b|c)", "(?(?#x)b|c)", "(?(?:a)b|c)", "(?(?>a)b|c)",
+      "(?(?<n>a)b|c)", "(?(?~a)b|c)", "(?(?~|a)b|c)", "(?(?)b|c)", "(?<=(?(?~|a)b|c))",
+      "(?<=(?(?x)a|b))", "(?(*FOO)b|c)", "(?(*fail)b|c)", "(?(*)b|c)", "(?(*ACCEPT)b|c)",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    discard re("(?(?{x})b|c)")
+
 suite "Subroutine calls and recursion":
   test "numeric call (?1)":
     let m = search("aa", re("(a)(?1)"))
@@ -1462,6 +1537,23 @@ suite "Callout verbs":
   test "CMP fails when condition not met":
     let m = search("", re("(?:a(*COUNT[X]{X}))*(*CMP{X,>,Y})"))
     check not m.found
+
+  test "a verb name matches with case, and PCRE's verbs are not callouts":
+    # Oniguruma 6.9.10 answers each with ONIGERR_UNDEFINED_CALLOUT_NAME.  A
+    # lower-case ``(*fail)`` was read as ``(*FAIL)``, which may sit in a
+    # look-behind.
+    for pattern in [
+      "(*fail)", "(*Fail)", "(*fail)a", "(*max{1})", "(*count[A]{X})", "(*skip)",
+      "(?<=(*fail))", "(?<!(*fail))", "(?<=a(*fail)|b)", "(*ACCEPT)", "(*PRUNE)",
+      "(*COMMIT)", "(*THEN)",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    for pattern in [
+      "(*FAIL)", "(*MAX{1})", "(*COUNT[A]{X})", "(*TOTAL_COUNT)", "(*SKIP)",
+      "(*MISMATCH)", "(*ERROR)", "(?<=(*FAIL))",
+    ]:
+      discard re(pattern)
 
 suite "Grapheme features":
   test "\\X matches single ASCII char":
