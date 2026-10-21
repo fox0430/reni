@@ -4,8 +4,8 @@ import reni/types
 import reni/unicode_utils
 
 suite "POSIX property Oniguruma alignment":
-  test "OtherAlphabeticRanges contains U+05B0":
-    check inRangeTable(0x05B0'i32, OtherAlphabeticRanges)
+  test "Other_Alphabetic contains U+05B0":
+    check matchUnicodeProp(Rune(0x05B0), resolveUnicodeProp("Other_Alphabetic"))
     check isAlphaChar(Rune(0x05B0))
     check matchPosixClass(Rune(0x05B0), pcAlpha, false)
 

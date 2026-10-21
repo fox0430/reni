@@ -15,7 +15,8 @@ This project aims to implement a tmLanguage parser.
 - Conditionals `(?(cond)yes|no)`
 - Subexpression calls `\g<name>`, `\g<n>`
 - Absent operator `(?~...)`
-- POSIX character classes, Unicode properties `\p{...}`
+- POSIX character classes, and every Unicode property Oniguruma names in
+  `\p{...}`: general categories, scripts, blocks and binary properties
 - Greedy, lazy, and possessive quantifiers
 - Grapheme cluster mode `(?y{g})`, word mode `(?y{w})`
 - Flags: `(?i)`, `(?m)`, `(?x)`, `(?W)`, `(?D)`, `(?S)`, `(?P)`, `(?I)`, `(?L)`

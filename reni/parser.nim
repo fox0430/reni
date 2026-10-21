@@ -86,8 +86,11 @@ proc advanceRune(p: var Parser): Rune =
   fastRuneAt(p.src, p.pos, r, true)
   r
 
+proc error(p: Parser, msg: string, at: int) {.noreturn.} =
+  raise newException(RegexError, msg & " at position " & $(at + p.base))
+
 proc error(p: Parser, msg: string) {.noreturn.} =
-  raise newException(RegexError, msg & " at position " & $(p.pos + p.base))
+  p.error(msg, p.pos)
 
 proc expect(p: var Parser, ch: char) =
   if p.peek != ch:
@@ -582,14 +585,13 @@ proc parseEscape(p: var Parser): Node =
   of 'p':
     p.advance()
     var name = ""
+    var at = p.pos
     if p.peek == '{':
       p.advance()
+      at = p.pos
       while p.peek != '}' and not p.atEnd:
-        if p.peek != ' ':
-          name.add(p.peek)
+        name.add(p.peek)
         p.advance()
-      if name.len == 0:
-        p.error("empty Unicode property name")
       p.expect('}')
     elif p.atEnd or p.peek notin PropertyLetters:
       return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('p')))
@@ -597,30 +599,30 @@ proc parseEscape(p: var Parser): Node =
       name.add(p.peek)
       p.advance()
     # \p{^Prop} = negated property
-    if name.len > 1 and name[0] == '^':
+    if name.len > 0 and name[0] == '^':
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms:
-          @[CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1]))],
+        atoms: @[
+          CcAtom(kind: ccNegUnicodeProp, prop: p.propertyNamed(name[1 ..^ 1], at + 1))
+        ],
       )
     else:
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name))],
+        atoms: @[CcAtom(kind: ccUnicodeProp, prop: p.propertyNamed(name, at))],
       )
   of 'P':
     p.advance()
     var name = ""
+    var at = p.pos
     if p.peek == '{':
       p.advance()
+      at = p.pos
       while p.peek != '}' and not p.atEnd:
-        if p.peek != ' ':
-          name.add(p.peek)
+        name.add(p.peek)
         p.advance()
-      if name.len == 0:
-        p.error("empty Unicode property name")
       p.expect('}')
     elif p.atEnd or p.peek notin PropertyLetters:
       return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('P')))
@@ -628,17 +630,18 @@ proc parseEscape(p: var Parser): Node =
       name.add(p.peek)
       p.advance()
     # \P{^Prop} = double negation = positive
-    if name.len > 1 and name[0] == '^':
+    if name.len > 0 and name[0] == '^':
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1]))],
+        atoms:
+          @[CcAtom(kind: ccUnicodeProp, prop: p.propertyNamed(name[1 ..^ 1], at + 1))],
       )
     else:
       result = Node(
         kind: nkCharClass,
         negated: false,
-        atoms: @[CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name))],
+        atoms: @[CcAtom(kind: ccNegUnicodeProp, prop: p.propertyNamed(name, at))],
       )
   of 'k':
     p.advance()

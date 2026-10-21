@@ -107,16 +107,16 @@ type
 
   UniPropKind* = enum
     ## How a ``\p{...}`` property, resolved at compile time, is evaluated.
-    upNever ## unknown name: matches nothing
+    upNever ## unknown name, which the parsers reject: matches nothing
     upAlways ## \p{Any}
     upCategory ## ``unicodeCategory(r)`` intersects ``catBits``
     upTypeMask ## ``unicodeTypes(r)`` shares *any* bit with ``typeBits``
     upPosix ## ``matchPosixClass(r, posixCls, false)``
     upWord ## bare ``\w`` / ``\p{Word}``: ``isWordChar(r, false)``
     upAscii ## code point <= U+007F
-    upEmoji
-    upExtPict
-    upBlock ## code point inside ``blockRanges[blockIdx]``
+    upRanges
+      ## code point inside ``PropertyRanges[rangeFirst ..< rangeLast]`` of
+      ## ``unicode_props_data``: a block or a binary property
     upScript ## ``unicodeScript(r)`` equals ``scriptId``
 
   UniAsciiRestrict* = enum
@@ -136,7 +136,7 @@ type
     catBits*: int32
     typeBits*: int32 ## OR, not AND: matches a rune having *any* of these bits.
     posixCls*: PosixClassName
-    blockIdx*: int32
+    rangeFirst*, rangeLast*: int32
     scriptId*: int32
     restrict*: UniAsciiRestrict
     restrictCls*: PosixClassName

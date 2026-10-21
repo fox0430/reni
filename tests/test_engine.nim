@@ -792,8 +792,7 @@ suite "Isolated flags and chaining":
     check m.found
 
   test "\\p{Inherited} script property":
-    # "In"-prefixed names try the block table first, but Inherited is a script
-    # name, not a block, so it must fall through instead of matching nothing.
+    # Inherited starts like a block name ("In..."), but it is a script.
     let m = search("\u0301", re("\\p{Inherited}"))
     check m.found
     check not search("a", re("\\p{Inherited}")).found
@@ -803,6 +802,64 @@ suite "Isolated flags and chaining":
     check search("\u3099", re("\\p{InHiragana}")).found
     check not search("\u3099", re("\\p{Hiragana}")).found
     check search("\u3042", re("\\p{Hiragana}")).found
+
+  test "every property name Oniguruma knows":
+    # Binary properties, scripts by either name, long category names, and
+    # spellings that differ in case, `_`, `-` or ` `.  A LaTeX grammar's
+    # ``[\p{Alphabetic}\p{Number}:.]+`` used to match nothing.
+    check search("x \u00e9t\u00e9:2 y", re("[\\p{Alphabetic}\\p{Number}:.]+")).matchSpan ==
+      0 .. 1
+    check search(" \u00e9t\u00e9:2 y", re("[\\p{Alphabetic}\\p{Number}:.]+")).matchSpan ==
+      1 .. 8
+    for (pattern, yes, no) in [
+      ("\\p{Alphabetic}", "\u00e9", "1"),
+      ("\\p{Alpha}", "\u00e9", "1"),
+      ("\\p{Uppercase}", "\u2160", "a"),
+      ("\\p{Math}", "+", "a"),
+      ("\\p{ID_Start}", "\u6f22", "1"),
+      ("\\p{IDS}", "a", "-"),
+      ("\\p{Hex_Digit}", "\uff21", "g"),
+      ("\\p{Dash}", "-", "+"),
+      ("\\p{White_Space}", "\u3000", "a"),
+      ("\\p{Emoji_Presentation}", "\u{1F600}", "#"),
+      ("\\p{InCB}", "\u094d", "a"),
+      # Oniguruma's generator folds the ranges below the last Linker away.
+      ("\\p{InCB}", "\u{E0100}", "\u0300"),
+      # The last Linker is U+11F42 in UCD 17, so U+0D57 is folded away too;
+      # libonig 6.9.10, on UCD 16, still has it.
+      ("\\p{InCB}", "\u{11F42}", "\u0d57"),
+      ("\\p{Latn}", "a", "\u03b1"),
+      ("\\p{Hira}", "\u3042", "\u30a2"),
+      ("\\p{Anatolian_Hieroglyphs}", "\u{14400}", "a"),
+      ("\\p{Zyyy}", "1", "a"),
+      ("\\p{Unknown}", "\u0378", "a"),
+      ("\\p{LowercaseLetter}", "a", "A"),
+      ("\\p{lowercase-letter}", "a", "A"),
+      ("\\p{Lowercase Letter}", "a", "A"),
+      ("\\p{LC}", "A", "\u02b0"),
+      ("\\p{Cased_Letter}", "A", "\u02b0"),
+      ("\\p{Combining_Mark}", "\u0301", "a"),
+      ("\\p{Assigned}", "a", "\u0378"),
+      ("\\p{NEWLINE}", "\n", "\r"),
+      ("\\p{In_Basic_Latin}", "a", "\u00e9"),
+      ("\\p{In_No_Block}", "\u2fe0", "a"),
+      ("\\P{Alphabetic}", "1", "a"),
+      ("\\p{^Latin}", "1", "a"),
+      ("\\p{^ Latin}", "1", "a"),
+      ("\\p{ Latin }", "a", "1"),
+      ("[\\p{Latn}]", "a", "\u03b1"),
+      ("[^\\p{Alphabetic}]", "1", "a"),
+    ]:
+      check search(yes, re(pattern)).found
+      check not search(no, re(pattern)).found
+
+  test "an ASCII option restricts only the POSIX names":
+    # Oniguruma narrows the ctypes, not the properties with the same members.
+    check not search("\u0085", re("(?S)\\p{Space}")).found
+    check search("\u0085", re("(?S)\\p{White_Space}")).found
+    check not search("\u00e9", re("(?P)\\p{Alpha}")).found
+    check search("\u00e9", re("(?P)\\p{Alphabetic}")).found
+    check search("\uff21", re("(?P)\\p{Hex_Digit}")).found
 
   test "\\p{PosixPunct}":
     let m = search("$", re("\\p{PosixPunct}"))
@@ -3115,10 +3172,35 @@ suite "Error handling":
     expect(RegexError):
       discard re("\\")
 
-  test "invalid Unicode property name matches nothing":
-    # Unknown property names don't raise - they simply never match
-    let m = search("a", re("\\p{InvalidPropName}"))
-    check not m.found
+  test "an unknown Unicode property name is an error":
+    # As in Oniguruma (ONIGERR_INVALID_CHAR_PROPERTY_NAME).  It used to match
+    # nothing, which hid every name reni lacked.
+    for pattern in [
+      "\\p{InvalidPropName}", "\\P{Foo}", "\\p{^Foo}", "[\\p{Foo}]", "[\\P{Foo}]",
+      "\\p{L&}", "\\p{Lat\u00edn}", "\\p{2}", "\\p{In_Nowhere}",
+    ]:
+      expect(RegexError):
+        discard re(pattern)
+    # Spaces do not count, but only a leading ``^`` negates.
+    for pattern in ["\\p{ ^Latin}", "\\P{ ^Latin}", "[\\p{ ^Latin}]", "\\p{ }"]:
+      expect(RegexError):
+        discard re(pattern)
+    check compileError("\\p{Foo}").startsWith("invalid character property name {Foo}")
+    check compileError("\\p{Fo o}").startsWith("invalid character property name {Fo o}")
+    # The error points at the name, past a ``^``, in a class or not.
+    for (pattern, at) in [
+      ("x\\p{Foo}y", 4),
+      ("x\\P{^Foo}y", 5),
+      ("[\\p{L|}]", 4),
+      ("x[\\P{^Foo}]", 6),
+      ("[a[\\p{Foo}]]", 6),
+    ]:
+      check compileError(pattern).endsWith(" at position " & $at)
+    # The empty name, with or without ``^``, gets the same error.
+    for pattern in ["\\p{}", "\\P{}", "\\p{^}", "[\\p{}]", "[\\P{^}]"]:
+      check compileError(pattern).startsWith("invalid character property name {}")
+    # reni's own \p{Posix*} spellings stay.
+    check search("a", re("\\p{PosixAlnum}")).found
 
 suite "replace edge cases":
   test "replace ${name with missing closing brace":

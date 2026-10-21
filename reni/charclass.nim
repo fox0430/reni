@@ -22,6 +22,14 @@ const PropertyLetters* = {'L', 'M', 'N', 'P', 'S', 'Z', 'C'}
   ## are the letters themselves, as in every Oniguruma release; master,
   ## never released, rejects them there.
 
+proc propertyNamed*[P](p: P, name: string, at: int, inClass = false): UniProp =
+  ## ``name``, which starts at ``at``, resolved; an unknown name is an error
+  ## there, as in Oniguruma (ONIGERR_INVALID_CHAR_PROPERTY_NAME).
+  mixin error
+  result = resolveUnicodeProp(name, inClass)
+  if result.kind == upNever:
+    p.error("invalid character property name {" & name & "}", at)
+
 proc parseHexInt*(s: string): int =
   for ch in s:
     result = result * 16
@@ -75,8 +83,11 @@ proc advance(p: var CcParser) =
   if not p.atEnd:
     inc p.pos
 
+proc error(p: CcParser, msg: string, at: int) {.noreturn.} =
+  raise newException(RegexError, msg & " at position " & $(at + p.base))
+
 proc error(p: CcParser, msg: string) {.noreturn.} =
-  raise newException(RegexError, msg & " at position " & $(p.pos + p.base))
+  p.error(msg, p.pos)
 
 proc expect(p: var CcParser, ch: char) =
   if p.peek != ch:
@@ -354,52 +365,53 @@ proc parseCcEscape(p: var CcParser): CcAtom =
     p.advance()
     if p.peek == '{':
       p.advance()
+      let at = p.pos
       var name = ""
       while p.peek != '}' and not p.atEnd:
         name.add(p.peek)
         p.advance()
-      if name.len == 0:
-        p.error("empty Unicode property name")
       p.expect('}')
       # \p{^Prop} = negated property
-      if name.len > 1 and name[0] == '^':
+      if name.len > 0 and name[0] == '^':
         CcAtom(
           kind: ccNegUnicodeProp,
-          prop: resolveUnicodeProp(name[1 ..^ 1], inClass = true),
+          prop: p.propertyNamed(name[1 ..^ 1], at + 1, inClass = true),
         )
       else:
-        CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+        CcAtom(kind: ccUnicodeProp, prop: p.propertyNamed(name, at, inClass = true))
     elif p.atEnd or p.peek notin PropertyLetters:
       # Oniguruma reads ``[\s\d\p]`` (VS Code's log grammar) as holding ``p``.
       CcAtom(kind: ccLiteral, rune: Rune(ord('p')))
     else:
+      let at = p.pos
       let name = $p.peek
       p.advance()
-      CcAtom(kind: ccUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+      CcAtom(kind: ccUnicodeProp, prop: p.propertyNamed(name, at, inClass = true))
   of 'P':
     p.advance()
     if p.peek == '{':
       p.advance()
+      let at = p.pos
       var name = ""
       while p.peek != '}' and not p.atEnd:
         name.add(p.peek)
         p.advance()
-      if name.len == 0:
-        p.error("empty Unicode property name")
       p.expect('}')
       # \P{^Prop} = double negation = positive
-      if name.len > 1 and name[0] == '^':
+      if name.len > 0 and name[0] == '^':
         CcAtom(
-          kind: ccUnicodeProp, prop: resolveUnicodeProp(name[1 ..^ 1], inClass = true)
+          kind: ccUnicodeProp,
+          prop: p.propertyNamed(name[1 ..^ 1], at + 1, inClass = true),
         )
       else:
-        CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+        CcAtom(kind: ccNegUnicodeProp, prop: p.propertyNamed(name, at, inClass = true))
     elif p.atEnd or p.peek notin PropertyLetters:
       CcAtom(kind: ccLiteral, rune: Rune(ord('P')))
     else:
+      let at = p.pos
       let name = $p.peek
       p.advance()
-      CcAtom(kind: ccNegUnicodeProp, prop: resolveUnicodeProp(name, inClass = true))
+      CcAtom(kind: ccNegUnicodeProp, prop: p.propertyNamed(name, at, inClass = true))
   else:
     # Literal escape: \], \-, \\, \[, etc.
     let r = p.advanceRune()
