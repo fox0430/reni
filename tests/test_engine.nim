@@ -3158,6 +3158,94 @@ suite "look-behind body window":
     check m3.found
     check m3.boundaries[0] == 1 .. 3
 
+suite "look-around bodies that write nothing":
+  # A body of one class or type is tested in place at each start the
+  # look-behind tries, and any other body that writes no group rolls back
+  # without a copy of the captures.  Every answer here is libonig 6.9.10's.
+
+  test "a class or type body steps back one character, not one byte":
+    check search("\xC3\xA9x", re("(?<=\\w)x")).matchSpan == 2 .. 3
+    check not search("-x", re("(?<=\\w)x")).found
+    check search("\xE6\x97\xA51", re("(?<=\\p{L})1")).matchSpan == 3 .. 4
+    check search("\xE6\x97\xA5z z", re("(?<!\\S)z")).matchSpan == 5 .. 6
+    check search("\xC3\xA9foo foo", re("(?<![\\w-])foo")).matchSpan == 6 .. 9
+    check search("\xC3\xA9let let", re("(?<![_$[:alnum:]])let")).matchSpan == 6 .. 9
+    check search("Fg", re("(?<=[0-9a-fA-F])g")).matchSpan == 1 .. 2
+
+  test "a class body reaches a multi-character fold":
+    # Under ``(?i)``, ``[ß]`` stands for "ss" too, two bytes against its own
+    # two: the in-place test tries every way the matcher would.
+    check search("ssx", re("(?i)(?<=[\xC3\x9F])x")).matchSpan == 2 .. 3
+    check search("\xC3\x9Fx", re("(?i)(?<=[\xC3\x9F])x")).matchSpan == 2 .. 3
+
+  test "a divided look-behind tries a class branch in place":
+    check search("x", re("(?<=^|[\\s@])x")).matchSpan == 0 .. 1
+    check search("a@x", re("(?<=^|[\\s@])x")).matchSpan == 2 .. 3
+    check not search("ax", re("(?<=^|[\\s@])x")).found
+    check search("\xC3\xAFz", re("(?<=\\d|[\xC3\xA9-\xC3\xAF])z")).matchSpan == 2 .. 3
+    check search("...y", re("(?<=\\.\\.\\.|\\w)y")).matchSpan == 3 .. 4
+
+  test "a leaf body's scan has no start at the subject start":
+    # A leaf consumes a character, so its scan opens one character back and
+    # at position 0 tries nothing: a negative look-behind holds there.
+    check search("x", re("(?<!\\w)x")).matchSpan == 0 .. 1
+    check not search("x", re("(?<=\\w)x")).found
+    check search("z", re("(?<!\\S)z")).matchSpan == 0 .. 1
+    check search("let", re("(?<![_$[:alnum:]])let")).matchSpan == 0 .. 3
+    check search("1", re("(?<!\\p{L})1")).matchSpan == 0 .. 1
+    check search("z", re("(?<!\\d|[\xC3\xA9-\xC3\xAF])z")).matchSpan == 0 .. 1
+    check not search("\xC3\xA9z", re("(?<!\\d|[\xC3\xA9-\xC3\xAF])z")).found
+    check not search("z", re("(?<=\\d|[\xC3\xA9-\xC3\xAF])z")).found
+    check not search("sx", re("(?i)(?<=[\xC3\x9F])x")).found
+
+  test "a one-character body is tried where a character ends at the target":
+    # One character back is the only start well-formed text offers, whatever
+    # its width; an alternative branch and a (?i) literal get the same.
+    check search("ab z", re("(?<!\\S)z")).matchSpan == 3 .. 4
+    check search("\xE6\x97\xA5 x", re("(?<!\\w)x")).matchSpan == 4 .. 5
+    check not search("\xE6\x97\xA5x", re("(?<!\\w)x")).found
+    check search("a\xE6\x97\xA5x", re("(?<=\\p{Han})x")).matchSpan == 4 .. 5
+    check search("abx ax -x", re("(?<!ab|\\w)x")).matchSpan == 8 .. 9
+    check search("\xE2\x84\xAAx", re("(?i)(?<=k)x")).matchSpan == 3 .. 4
+    check search("a\xE2\x84\xAAx", re("(?i)(?<![^k])x")).matchSpan == 4 .. 5
+
+  test "a start further back is still tried over malformed bytes":
+    # Not libonig's answers, which are no match: ``\xC3`` declares two bytes,
+    # so from it ``"\xC3-"`` reads as one word character ending at ``x``.
+    # Only malformed bytes put such a start behind the character before the
+    # target, and the scan still tries it, as the full scan did.
+    check search("\xC3-x", re("(?<=\\w)x")).matchSpan == 2 .. 3
+    check search("\xE6\x97-x", re("(?<=\\w)x")).matchSpan == 3 .. 4
+
+  test "a body of several pieces rolls back without the captures":
+    check search("foobar xfoobar -foobar", re("(?<!\\Wfoo|^foo)bar")).matchSpan ==
+      11 .. 14
+    check search("abde", re("(?<=(?:ab|c)d)e")).matchSpan == 3 .. 4
+    check search("acd ab ae", re("a(?!b|cd)")).matchSpan == 7 .. 8
+    check search("acd", re("a(?=b|cd)")).matchSpan == 0 .. 1
+
+  test "the groups around a body that writes nothing keep their spans":
+    let m1 = search("ab", re("(a)(?<=\\w)(b)"))
+    check m1.matchSpan == 0 .. 2
+    check m1.boundaries[1] == 0 .. 1
+    check m1.boundaries[2] == 1 .. 2
+    # The first way, group 1 = "a", passes the look-behind and fails at
+    # "c"; the second passes it again and keeps its own span.
+    let m2 = search("abc", re("(a|ab)(?<!xb)c"))
+    check m2.matchSpan == 0 .. 3
+    check m2.boundaries[1] == 0 .. 2
+    let m3 = search("abc ac", re("(a|ab)(?<!a\\w)c"))
+    check m3.matchSpan == 4 .. 6
+    check m3.boundaries[1] == 4 .. 5
+    let m4 = search("ab...", re("(\\w+)(?<=\\.\\.\\.|\\w)(?!\\w)"))
+    check m4.matchSpan == 0 .. 2
+    check m4.boundaries[1] == 0 .. 2
+
+  test "a body that writes a group still keeps it":
+    let m = search("bcd", re("(?<=(a|bc))d"))
+    check m.matchSpan == 2 .. 3
+    check m.boundaries[1] == 0 .. 2
+
 suite "Extended mode edge cases":
   test "(?x) whitespace in character class is literal":
     let m = search(" ", re("(?x)[ ]"))

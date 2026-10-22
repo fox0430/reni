@@ -870,8 +870,9 @@ const TrueCont*: ContId = -1'i32 ## Sentinel "no further continuation, succeed".
 
 proc enterLookaroundBody(ctx: MatchContext, limit: int) {.inline.} =
   ## Set the window a lookaround body runs under -- the general path's only
-  ## move of ``lookLimit`` during a match ([leafBodyMatchesHere] lifts it in
-  ## place for a leaf look-ahead):
+  ## move of ``lookLimit`` during a match, which a leaf look-behind
+  ## ([leafWaysEndAt]) makes through here as well ([leafBodyMatchesHere] lifts
+  ## it in place for a leaf look-ahead):
   ##
   ## * ``lkAhead`` / ``lkNegAhead`` (and the ``(?(...)...)`` test): no window
   ##   (``NoLookLimit``). A look-ahead reads forward, outside the enclosing
@@ -1212,9 +1213,10 @@ proc restoreScalarsKeepingStart(ctx: MatchContext, s: ScalarState) {.inline.} =
   ## lookaround the way it keeps the captures: the assertion is zero-width, yet
   ## the match start it moved survives.  The caller's rollback still carries the
   ## old ``keepStart``, so backtracking past the lookaround undoes this along
-  ## with the captures -- except on the ``lookBodyPure`` path, which pushes
-  ## none, and is safe only because ``markQuantBodyPure`` calls ``akKeep``
-  ## impure.
+  ## with the captures.  A ``lookBodyPure`` body pushes no rollback and never
+  ## comes here: the look-arounds roll it back with ``restoreScalars``, and the
+  ## conditional passes ``keepKeptStart = false`` to [keepLookCaptures].  That
+  ## is safe only because ``markQuantBodyPure`` calls ``akKeep`` impure.
   ##
   ## A body may run past where the outer match ends, so the kept start can sit
   ## ahead of it.  Every site that reports it clamps to the match end, the way
@@ -1298,6 +1300,8 @@ proc keepLookCaptures(
   else:
     restoreScalars(ctx, s.scalars)
   if node.lookBodyPure:
+    # Only the ``(?(?!...)...)`` condition gets here with a pure body; the
+    # look-arounds proper answer one without a capture snapshot.
     releaseTo(ctx, s.capOff)
   else:
     keepCaptures(ctx, s)
@@ -2030,19 +2034,58 @@ proc lazyScanAdvance(
       return false # zero-width: a single-way leaf cannot vary, so stop
     inc count
 
-proc isLeafLookbehindBody(node: Node): bool {.inline.} =
-  ## Whether a lookbehind body is a single leaf, and so answerable in place by
-  ## [leafBodyEndsAt].  Only the kinds [lengthBounds] gives a fixed width are
-  ## listed, since a fixed width is what every caller gates on.
-  node != nil and node.kind in {nkString, nkLiteral, nkEscapedLiteral}
+const LeafKinds = {nkString, nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType}
+  ## The nodes that are one leaf: the matcher answers one by advancing over the
+  ## subject, by one of its ways, and writes nothing else.
 
-proc leafBodyEndsAt(ctx: MatchContext, body: Node, targetEnd: int, fbl: int): bool =
-  ## Whether leaf ``body`` matches the ``fbl`` bytes ending at ``targetEnd``.
+proc isLeafBody(node: Node): bool {.inline.} =
+  ## Whether a look-around body is a single leaf, and so answerable in place:
+  ## by [leafBodyMatchesHere] for a look-ahead, and by [leafBodyEndsAt] at
+  ## each start a look-behind tries.  A class or a type is one character of
+  ## one to four bytes, so it usually has no fixed width, and the
+  ## variable-length scans ask at every start they reach.
+  node != nil and node.kind in LeafKinds
+
+proc leafWaysEndAt(
+    ctx: MatchContext, body: Node, targetEnd: int, window: bool
+): bool {.noinline.} =
+  ## [leafBodyEndsAt]'s answer from ``ctx.pos`` by every way of the leaf, for
+  ## any leaf under a window.  A class or a type always comes with one:
+  ## [lengthBounds] gives neither a fixed width, so [bodyWindow] grants it.
+  ## Out of line, so the fixed-width string or literal stays a short call.
+  let savedLimit = ctx.lookLimit
+  if window:
+    ctx.enterLookaroundBody(targetEnd)
+  case body.kind
+  of nkString:
+    result = stringAdvance(ctx, body) == targetEnd
+  of nkCharType:
+    result = charTypeAdvance(ctx, body.charType) == targetEnd
+  else:
+    let lastVariant = if body.kind == nkCharClass: ClassVariants else: LiteralVariants
+    var v =
+      if body.kind == nkCharClass:
+        classFirstVariant(ctx, body)
+      else:
+        0
+    result = false
+    while v < lastVariant:
+      if leafVariantAdvance(ctx, body, v) == targetEnd:
+        result = true
+        break
+      inc v
+  ctx.lookLimit = savedLimit
+
+proc leafBodyEndsAt(
+    ctx: MatchContext, body: Node, st, targetEnd: int, window: bool
+): bool =
+  ## Whether leaf ``body`` matches from ``st`` and ends exactly at
+  ## ``targetEnd``: [lookbehindBodyEndsAt]'s answer, by any of the leaf's
+  ## ways, as the matcher would backtrack through them.
   ##
   ## The general path's frame, matcher re-entry and save/restore roll back
-  ## what a leaf never writes: ``ctx.pos`` is all of it, restored here.  The
-  ## caller must have checked [isLeafLookbehindBody].
-  let st = targetEnd - fbl
+  ## what a leaf never writes: ``ctx.pos`` and the window are all of it,
+  ## restored here.  The caller must have checked [isLeafBody].
   if st < 0:
     return false
   inc ctx.steps
@@ -2050,29 +2093,23 @@ proc leafBodyEndsAt(ctx: MatchContext, body: Node, targetEnd: int, fbl: int): bo
     raise newException(RegexLimitError, "match step limit exceeded")
   let entryPos = ctx.pos
   ctx.pos = st
-  # Only the first way need be tried: a literal's second is the
-  # multi-character fold, and one that has it carries no fixed width.
-  let matched =
-    if body.kind == nkString:
+  result =
+    if window or body.kind in {nkCharClass, nkCharType}:
+      leafWaysEndAt(ctx, body, targetEnd, window)
+    elif body.kind == nkString:
       stringAdvance(ctx, body) == targetEnd
     else:
+      # Without a window the body has a fixed width ([bodyWindow]), and a
+      # literal's second way is the multi-character fold, which carries none.
       leafVariantAdvance(ctx, body, 0) == targetEnd
   ctx.pos = entryPos
-  matched
-
-proc isLeafLookaheadBody(node: Node): bool {.inline.} =
-  ## Whether a look-ahead body is a single leaf, and so answerable in place by
-  ## [leafBodyMatchesHere].  Wider than [isLeafLookbehindBody], which needs a
-  ## fixed width to compare an end offset against; a look-ahead has none.
-  node != nil and
-    node.kind in {nkString, nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType}
 
 proc leafBodyMatchesHere(ctx: MatchContext, body: Node): bool =
   ## Whether leaf ``body`` matches at ``ctx.pos``.  The general path's frame,
   ## re-entry and save/restore roll back what a leaf never writes: it holds no
   ## capture, no ``\K``, no flag group and no absent operator -- the whole of
   ## what ``markQuantBodyPure`` reads -- and the advances leave ``ctx.pos``
-  ## alone.  The caller must have checked [isLeafLookaheadBody].
+  ## alone.  The caller must have checked [isLeafBody].
   inc ctx.steps
   if ctx.steps > ctx.stepLimit:
     raise newException(RegexLimitError, "match step limit exceeded")
@@ -2086,9 +2123,10 @@ proc leafBodyMatchesHere(ctx: MatchContext, body: Node): bool =
   of nkCharType:
     result = charTypeAdvance(ctx, body.charType) >= 0
   else:
-    # Every way, not just the first: [leafBodyEndsAt] may stop there because a
-    # multi-character fold carries no fixed width, and this has no width to
-    # gate on -- under ``(?i)``, ``(?=ß)`` has to reach "ss".
+    # Every way, not just the first, as [leafWaysEndAt] tries them: under
+    # ``(?i)``, ``(?=ß)`` has to reach "ss" by the multi-character fold.  Only
+    # [leafBodyEndsAt]'s fixed-width literal stops at the first, since a fold
+    # carries no fixed width.
     let lastVariant = if body.kind == nkCharClass: ClassVariants else: LiteralVariants
     var v =
       if body.kind == nkCharClass:
@@ -2102,6 +2140,18 @@ proc leafBodyMatchesHere(ctx: MatchContext, body: Node): bool =
         break
       inc v
   ctx.lookLimit = savedLimit
+
+proc pureLookaheadMatches(ctx: MatchContext, body: Node): bool =
+  ## Whether a look-ahead body that is ``lookBodyPure`` matches at ``ctx.pos``.
+  ## Restores ``ctx`` either way, from the scalars alone: such a body writes
+  ## no capture, and the nested machine trims every stack it grew before it
+  ## returns (see [lookbehindBodyMatches]).
+  let scalars = saveScalars(ctx)
+  # A look-ahead reads forward, outside the enclosing body's span, so a
+  # running look-behind window does not bound it.
+  ctx.enterLookaroundBody(NoLookLimit)
+  result = matchDiscardedBody(ctx, body, TrueCont)
+  restoreScalars(ctx, scalars)
 
 proc altBranchPossible(node: Node, i: int, b: uint8, hasByte: bool): bool {.inline.} =
   ## Whether alternative ``i`` can start on the byte in front of the matcher.
@@ -2663,21 +2713,101 @@ proc lookbehindBodyEndsAt(
   ctx.lookLimit = savedLimit
 
 proc lookbehindBodyMatches(
-    ctx: MatchContext, body: Node, targetEnd: int, fbl: int, window: bool
+    ctx: MatchContext, body: Node, st, targetEnd: int, window, pure: bool
 ): bool =
-  ## Whether ``body`` matches ending at ``targetEnd`` from ``fbl`` bytes
-  ## before it. Restores ``ctx`` either way.
-  if isLeafLookbehindBody(body):
-    return leafBodyEndsAt(ctx, body, targetEnd, fbl)
-  let st = targetEnd - fbl
+  ## Whether ``body`` matches from ``st`` and ends exactly at ``targetEnd``.
+  ## Restores ``ctx`` either way.
+  ##
+  ## ``pure`` is the look-behind's ``lookBodyPure``: the body writes no
+  ## capture, no ``\K``, no flag and no absent range.  The nested machine
+  ## trims every stack it grew before it returns, so the scalars are all such
+  ## a body leaves to roll back, and the capture vector is not copied.
+  if isLeafBody(body):
+    return leafBodyEndsAt(ctx, body, st, targetEnd, window)
   if st < 0:
     return false
+  if pure:
+    let scalars = saveScalars(ctx)
+    result = lookbehindBodyEndsAt(ctx, body, st, targetEnd, window)
+    restoreScalars(ctx, scalars)
+    return
   let stackSnap = saveStackLens(ctx)
   let saved = save(ctx)
   let matched = lookbehindBodyEndsAt(ctx, body, st, targetEnd, window)
   restore(ctx, saved)
   restoreStackLens(ctx, stackSnap)
   matched
+
+proc oneCharLeaf(ctx: MatchContext, body: Node): bool =
+  ## Whether leaf ``body`` ([isLeafBody]) matches one character and only one
+  ## way, however many bytes the character takes.  Not a class whose
+  ## multi-character folds apply, a literal with a multi-character fold,
+  ## ``\X``, ``\R`` (``"\r\n"`` is two) or ``.`` running as a cluster.  A
+  ## string never reaches a scan as one.
+  case body.kind
+  of nkCharClass:
+    not classFoldsApply(ctx, body)
+  of nkLiteral, nkEscapedLiteral:
+    singleWayLeaf(body, ctx.flags)
+  of nkCharType:
+    case body.charType
+    of ctGraphemeCluster, ctNewlineSeq:
+      false
+    of ctDot:
+      ctx.graphemeMode notin {gmGrapheme, gmWord}
+    else:
+      true
+  else:
+    false
+
+proc leafScanHolds(
+    ctx: MatchContext, body: Node, targetEnd, minPos: int, window: bool
+): bool {.noinline.} =
+  ## Whether leaf ``body`` matches ending at ``targetEnd`` from a start at or
+  ## after ``minPos``: the shortest-first scan of a variable-length
+  ## look-behind, for a body of one leaf.  A leaf consumes a character, so
+  ## the scan opens one character back, not at ``targetEnd``.
+  ##
+  ## A leaf of one character ([oneCharLeaf]) read from ``st`` ends at
+  ## ``st + encLen`` of the byte there, window or not, so a start whose lead
+  ## byte declares another length is passed over without running the leaf,
+  ## none lies more than [MaxCharByteLen] back, and the walk stops once no
+  ## byte below declares the length.  On well-formed text that leaves the one
+  ## start a character back; a start further back reaches ``targetEnd`` only
+  ## over malformed bytes (``"\xC3-"`` read as one character), and is still
+  ## tried, so every answer stays the full scan's.  Over the TextMate grammar
+  ## corpus this took 1.1% off the instructions; the full scan ran 2.5 leaf
+  ## tests a scan.
+  ##
+  ## Out of line, as the four scans' leaf branch: inline, the first-start
+  ## step alone measured up to 0.9% more ``Ir`` on bench items with no
+  ## look-behind, as gcc spent its inlining budget differently in
+  ## ``runMachine``.
+  if targetEnd == 0:
+    return false
+  var st = prevCharStart(ctx.subject.oa, targetEnd)
+  if oneCharLeaf(ctx, body):
+    let floor = max(minPos, targetEnd - MaxCharByteLen)
+    while st >= floor:
+      if st + encLen(ctx.subject[st].uint8) == targetEnd and
+          leafBodyEndsAt(ctx, body, st, targetEnd, window):
+        return true
+      # Walk on only while some byte below declares the length to
+      # ``targetEnd``: a byte read is cheaper than a step back.
+      var p = st - 1
+      while p >= floor and p + encLen(ctx.subject[p].uint8) != targetEnd:
+        dec p
+      if p < floor:
+        return false
+      st = prevCharStart(ctx.subject.oa, st)
+    return false
+  while st >= minPos:
+    if leafBodyEndsAt(ctx, body, st, targetEnd, window):
+      return true
+    if st == 0:
+      break
+    st = prevCharStart(ctx.subject.oa, st)
+  false
 
 proc lookbehindVarHolds(ctx: MatchContext, node: Node, bodyLen: LenBounds): bool =
   ## Whether variable-length positive lookbehind matches ending at ``ctx.pos``.
@@ -2691,17 +2821,25 @@ proc lookbehindVarHolds(ctx: MatchContext, node: Node, bodyLen: LenBounds): bool
       max(0, targetEnd - mbl)
     else:
       0
+  if isLeafBody(body):
+    return leafScanHolds(ctx, body, targetEnd, minPos, window)
+  let pure = node.lookBodyPure
   var startTry = targetEnd
   while startTry >= minPos:
-    let stackSnap = saveStackLens(ctx)
-    let saved = save(ctx)
-    let bodyMatch = lookbehindBodyEndsAt(ctx, body, startTry, targetEnd, window)
-    if bodyMatch:
-      keepLookCaptures(ctx, node, saved)
+    if pure:
+      # A pure body keeps nothing, so a match needs no rollback entry either.
+      if lookbehindBodyMatches(ctx, body, startTry, targetEnd, window, true):
+        return true
+    else:
+      let stackSnap = saveStackLens(ctx)
+      let saved = save(ctx)
+      let bodyMatch = lookbehindBodyEndsAt(ctx, body, startTry, targetEnd, window)
+      if bodyMatch:
+        keepLookCaptures(ctx, node, saved)
+        restoreStackLens(ctx, stackSnap)
+        return true
+      restore(ctx, saved)
       restoreStackLens(ctx, stackSnap)
-      return true
-    restore(ctx, saved)
-    restoreStackLens(ctx, stackSnap)
     if startTry == 0:
       break
     startTry = prevCharStart(ctx.subject.oa, startTry)
@@ -2717,9 +2855,10 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
     for i, alt in body.alternatives.view:
       let altLen = ctx.altBounds(node, i, alt)
       let altFbl = altLen.fixedLen
+      let window = ctx.altWindow(node, i, alt)
       if altFbl >= 0:
         if lookbehindBodyMatches(
-          ctx, alt, targetEnd, altFbl, ctx.altWindow(node, i, alt)
+          ctx, alt, targetEnd - altFbl, targetEnd, window, node.lookBodyPure
         ):
           return false
       else:
@@ -2729,16 +2868,15 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
             max(0, targetEnd - altMbl)
           else:
             0
+        if isLeafBody(alt):
+          if leafScanHolds(ctx, alt, targetEnd, altMinPos, window):
+            return false
+          continue
         var startTry = targetEnd
         while startTry >= altMinPos:
-          let stackSnap = saveStackLens(ctx)
-          let saved = save(ctx)
-          let matched = lookbehindBodyEndsAt(
-            ctx, alt, startTry, targetEnd, ctx.altWindow(node, i, alt)
-          )
-          restore(ctx, saved)
-          restoreStackLens(ctx, stackSnap)
-          if matched:
+          if lookbehindBodyMatches(
+            ctx, alt, startTry, targetEnd, window, node.lookBodyPure
+          ):
             return false
           if startTry == 0:
             break
@@ -2748,7 +2886,12 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
   if bodyLen.fixedLen >= 0:
     # Fixed length: one starting position, so one attempt decides it.
     return not lookbehindBodyMatches(
-      ctx, body, targetEnd, bodyLen.fixedLen, ctx.bodyWindow(node)
+      ctx,
+      body,
+      targetEnd - bodyLen.fixedLen,
+      targetEnd,
+      ctx.bodyWindow(node),
+      node.lookBodyPure,
     )
   # Variable-length (non-alternation): scan from right to left
   let negMbl = bodyLen.maxLen
@@ -2757,15 +2900,12 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
       max(0, targetEnd - negMbl)
     else:
       0
+  let window = ctx.bodyWindow(node)
+  if isLeafBody(body):
+    return not leafScanHolds(ctx, body, targetEnd, negMinPos, window)
   var startTry = targetEnd
   while startTry >= negMinPos:
-    let stackSnap = saveStackLens(ctx)
-    let saved = save(ctx)
-    let matched =
-      lookbehindBodyEndsAt(ctx, body, startTry, targetEnd, ctx.bodyWindow(node))
-    restore(ctx, saved)
-    restoreStackLens(ctx, stackSnap)
-    if matched:
+    if lookbehindBodyMatches(ctx, body, startTry, targetEnd, window, node.lookBodyPure):
       return false
     if startTry == 0:
       break
@@ -2802,21 +2942,35 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): bool =
         max(0, targetEnd - altLen.maxLen)
       else:
         0
-    var startTry = if altFbl >= 0: altMinPos else: targetEnd
-    while startTry >= max(altMinPos, 0):
-      let stackSnap = saveStackLens(ctx)
-      let saved = save(ctx)
-      let bodyMatch =
-        lookbehindBodyEndsAt(ctx, alt, startTry, targetEnd, ctx.altWindow(node, k, alt))
-      if bodyMatch:
-        # Keep captures (and ``\K``); retry replays the entry snapshot.
-        restoreScalarsKeepingStart(ctx, saved.scalars)
-        restoreStackLens(ctx, stackSnap)
-        drop(ctx, saved)
+    let window = ctx.altWindow(node, k, alt)
+    if altFbl < 0 and isLeafBody(alt):
+      if leafScanHolds(ctx, alt, targetEnd, altMinPos, window):
         ctx.choices[top].lbaNext = int32(k + 1)
         return true
-      restore(ctx, saved)
-      restoreStackLens(ctx, stackSnap)
+      inc k
+      continue
+    # A leaf branch is pure whatever its siblings write.
+    let pure = node.lookBodyPure or isLeafBody(alt)
+    var startTry = if altFbl >= 0: altMinPos else: targetEnd
+    while startTry >= max(altMinPos, 0):
+      if pure:
+        # Nothing written for the entry snapshot to undo.
+        if lookbehindBodyMatches(ctx, alt, startTry, targetEnd, window, true):
+          ctx.choices[top].lbaNext = int32(k + 1)
+          return true
+      else:
+        let stackSnap = saveStackLens(ctx)
+        let saved = save(ctx)
+        let bodyMatch = lookbehindBodyEndsAt(ctx, alt, startTry, targetEnd, window)
+        if bodyMatch:
+          # Keep captures (and ``\K``); retry replays the entry snapshot.
+          restoreScalarsKeepingStart(ctx, saved.scalars)
+          restoreStackLens(ctx, stackSnap)
+          drop(ctx, saved)
+          ctx.choices[top].lbaNext = int32(k + 1)
+          return true
+        restore(ctx, saved)
+        restoreStackLens(ctx, stackSnap)
       if startTry == 0:
         break
       startTry = prevCharStart(ctx.subject.oa, startTry)
@@ -4095,9 +4249,11 @@ proc runMachine(
         # rollback. A divided look-behind retries via ``chLookbehindAlt``.
         case node.lookKind
         of lkAhead:
-          if isLeafLookaheadBody(node.lookBody):
+          if isLeafBody(node.lookBody):
             # Leaf body: tested in place, without a frame or a re-entry.
             mode = if leafBodyMatchesHere(ctx, node.lookBody): mCont else: mFail
+          elif node.lookBodyPure:
+            mode = if pureLookaheadMatches(ctx, node.lookBody): mCont else: mFail
           else:
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
@@ -4115,8 +4271,10 @@ proc runMachine(
               restoreStackLens(ctx, stackSnap)
               mode = mFail
         of lkNegAhead:
-          if isLeafLookaheadBody(node.lookBody):
+          if isLeafBody(node.lookBody):
             mode = if leafBodyMatchesHere(ctx, node.lookBody): mFail else: mCont
+          elif node.lookBodyPure:
+            mode = if pureLookaheadMatches(ctx, node.lookBody): mFail else: mCont
           else:
             let stackSnap = saveStackLens(ctx)
             let saved = save(ctx)
@@ -4149,10 +4307,20 @@ proc runMachine(
             let fbl = bodyLen.fixedLen
             if fbl < 0:
               mode = if lookbehindVarHolds(ctx, node, bodyLen): mCont else: mFail
-            elif isLeafLookbehindBody(node.lookBody):
+            elif isLeafBody(node.lookBody):
               # Leaf body: tested in place, without a frame or a re-entry.
               mode =
-                if leafBodyEndsAt(ctx, node.lookBody, ctx.pos, fbl): mCont else: mFail
+                if leafBodyEndsAt(ctx, node.lookBody, ctx.pos - fbl, ctx.pos, false):
+                  mCont
+                else:
+                  mFail
+            elif node.lookBodyPure:
+              # Nothing to keep: one call answers and rolls back.  A fixed
+              # width runs without a window ([bodyWindow]).
+              mode =
+                if lookbehindBodyMatches(
+                  ctx, node.lookBody, ctx.pos - fbl, ctx.pos, false, true
+                ): mCont else: mFail
             elif ctx.pos - fbl < 0:
               mode = mFail
             else:
@@ -4881,7 +5049,7 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
   # Leaf under ``TrueCont`` is the whole answer; no loop bookkeeping applies.
   if cont == TrueCont:
     case node.kind
-    of nkString, nkCharType, nkLiteral, nkEscapedLiteral, nkCharClass:
+    of LeafKinds:
       inc ctx.steps
       if ctx.steps > ctx.stepLimit:
         raise newException(RegexLimitError, "match step limit exceeded")
