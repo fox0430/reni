@@ -1055,10 +1055,17 @@ type
       ## steps through).  PCRE2 splits the two the same way, as ``ovector[0]``
       ## and ``pcre2_get_startchar``.
 
-const DefaultStepLimit* = 1_000_000
+const DefaultStepLimit* = 10_000_000
   ## Steps one attempt -- the match tried at one start position -- may take
   ## before it raises ``RegexLimitError``; see ``SearchStepsPerByte`` for the
-  ## search as a whole.
+  ## search as a whole.  The number is Oniguruma's default retry limit
+  ## (``onig_get_retry_limit_in_match``), but not the unit: Oniguruma counts
+  ## backtracks, and a backtrack costs 1.6 to 10 steps on the three TextMate
+  ## grammar patterns that come near the limit.  Over the 6,030 patterns of
+  ## 131 grammars, searched on 383 lines of source code, this limit gives up
+  ## exactly where Oniguruma does; anything from 6.4 to 22 million would, and
+  ## 1,000,000 stopped on lines Oniguruma answers.  Other patterns can still
+  ## differ.
 const SearchStepsPerByte* = 100
   ## Steps a search earns, on top of the step limit, for every byte its start
   ## position moves, which keeps a search's work linear in the subject.  The

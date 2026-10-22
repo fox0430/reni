@@ -927,19 +927,22 @@ suite "ReDoS protection (stepLimit)":
       discard search(subject & "a".repeat(20), re("(a+)+\\d"), stepLimit = 100)
 
   test "a search's work stays linear in the subject":
-    # Each attempt runs to the end of the subject and back, well inside the
-    # limit, so the search costs quadratic time: 12 s here with no bound on
-    # the search as a whole.  The per-byte budget stops it after a few
-    # million steps.
+    # Each attempt runs to the end of the subject and back, at most 80,000
+    # steps, so the search costs quadratic time: 12 s here with no bound on
+    # the search as a whole.  The search's budget stops it after about a
+    # million steps.  The limit is spelled out because the default lets each
+    # search run ten times as long; below one attempt, the attempt's own limit
+    # would raise instead of the budget.
+    const limit = 1_000_000
     let subject = "a".repeat(20_000)
     for pattern in ["(?:a|b)*[!?]", "(?:a|ab)*?[!?]", "\\w*?[!?]"]:
       checkpoint pattern
       expect RegexLimitError:
-        discard search(subject, re(pattern))
+        discard search(subject, re(pattern), stepLimit = limit)
       expect RegexLimitError:
-        discard searchBackward(subject, re(pattern))
+        discard searchBackward(subject, re(pattern), stepLimit = limit)
       # A single attempt is bounded by the limit alone, and fits in it.
-      check not matchAt(subject, re(pattern), 0).found
+      check not matchAt(subject, re(pattern), 0, stepLimit = limit).found
 
 suite "search with start position":
   test "search from middle of string":

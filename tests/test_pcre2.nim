@@ -85,7 +85,7 @@ proc runTestFile(filename: string, suiteName: string) =
           case tc.kind
           of ptkMatch:
             let r = re(tc.pattern, flags)
-            let m = search(tc.subject, r, stepLimit = 1_000_000)
+            let m = search(tc.subject, r)
             if not m.found:
               inc failed
               skip()
@@ -119,17 +119,14 @@ proc runTestFile(filename: string, suiteName: string) =
                 skip()
           of ptkNoMatch:
             let r = re(tc.pattern, flags)
-            let m = search(tc.subject, r, stepLimit = 1_000_000)
+            let m = search(tc.subject, r)
             if not m.found:
               inc passed
               check true
             else:
               inc failed
               skip()
-        except RegexError:
-          inc errors
-          skip()
-        except RegexLimitError:
+        except RegexError: # RegexLimitError too
           inc errors
           skip()
         except Exception:

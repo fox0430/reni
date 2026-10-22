@@ -150,7 +150,14 @@ except RegexLimitError:
 
 An attempt is the match tried at one start position. All the attempts of one
 search together may take `stepLimit` steps plus `SearchStepsPerByte` (100)
-for every byte the start position has moved, and raise past that.
+for every byte the start position has moved, and raise past that. An attempt
+can run a second time and be charged once, so a search can do up to about
+twice that work.
+
+The default, `DefaultStepLimit`, is 10,000,000, the number Oniguruma's retry
+limit defaults to. Oniguruma counts backtracks rather than steps, so the two
+limits are not the same amount of work; where they were measured to give up
+alike is in the documentation of `DefaultStepLimit`.
 
 ### Stack budget (stack-overflow protection)
 

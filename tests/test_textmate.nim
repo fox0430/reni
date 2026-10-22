@@ -161,3 +161,19 @@ suite "per-call anchor options":
     check search("xyz", regex).matchSpan == 0 .. 3
     check search("xyz", regex, options = {moNotBeginString, moNotBeginPosition}).matchSpan ==
       0 .. 2
+
+suite "default step limit":
+  test "a line Oniguruma answers inside its retry limit gets an answer":
+    # ``struct_variables_types_fields`` from VS Code's Go grammar, on a
+    # shortened line of Python.  The attempt after the brace takes about 4
+    # million steps; Oniguruma answers it in 1.1 million of its 10 million
+    # retries.
+    let regex = re(
+      """(?:(?<=\{)((?:\s*(?:(?:(?:\w+\,\s*)+)?(?:\w+\s+))?(?:(?:(?:\s*(?:[\*\[\]]+)?(?:\<\-\s*)?\bchan\b(?:\s*\<\-)?\s*)+)?(?:[^\s/\`"]+)(?:\;)?))+)\s*(?=\}))""",
+      {rfCaptureGroup},
+    )
+    let line = "{}, 'foo', 'foo.py', 0)"
+    check not search(line, regex).found
+    const previousDefault = 1_000_000
+    expect RegexLimitError:
+      discard search(line, regex, stepLimit = previousDefault)
