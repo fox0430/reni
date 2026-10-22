@@ -770,7 +770,9 @@ const
   OtherAlphabeticSet = propertySet("otheralphabetic")
   OtherAlphabeticStart = PropertyRanges[OtherAlphabeticSet.first][0]
 
-template rangesOf(s: tuple[first, last: int32]): untyped =
+template rangesOf(s: untyped): untyped =
+  # ``untyped``: Nim 2.0 drops the field names of a const tuple passed as a
+  # typed template argument.
   PropertyRanges.toOpenArray(s.first, s.last - 1)
 
 proc isOtherAlphabetic(r: Rune): bool {.inline.} =
