@@ -935,6 +935,24 @@ type
       ## Bytes consumable before ``byte``; a superset moves the bound left,
       ## a missing byte is unsound.
 
+  RequiredLiteralKind* = enum
+    rlNone
+    rlString ## ``str`` occurs.
+    rlSet ## One of the bytes in ``set`` occurs.
+
+  RequiredLiteral* = object
+    ## What every match holds at or after the position its search starts
+    ## from, beyond [RequiredByteInfo]'s one byte: a byte string, or failing
+    ## that a set of bytes one of which occurs.  Oniguruma's ``exact`` and
+    ## ``map`` with an unbounded ``dist_max``: the search tests that it occurs
+    ## before it tries a position.
+    kind*: RequiredLiteralKind
+    str*: string ## Under ``rlString``.
+    at*: int
+      ## Under ``rlString``: where in ``str`` its least likely byte stands,
+      ## which the search looks for first.
+    set*: set[uint8] ## Two or more bytes, under ``rlSet``.
+
   LeadBehindInfo* = object
     ## Leading ``(?<=lit)`` over a case-sensitive ASCII literal: every match
     ## starts ``offset`` bytes past ``byte``, the literal's first byte.
@@ -1034,6 +1052,9 @@ type
       ## Leaf every match starts with twice running (``(leaf)\1``), or nil.
       ## Replaces ``leadLeaf`` where set.
     leadBehind: LeadBehindInfo ## Leading look-behind literal, or invalid.
+    requiredLit: RequiredLiteral
+      ## Tested after ``requiredByte``; at the end so the fields the scan
+      ## reads keep their offsets.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1066,6 +1087,13 @@ const DefaultStepLimit* = 10_000_000
   ## exactly where Oniguruma does; anything from 6.4 to 22 million would, and
   ## 1,000,000 stopped on lines Oniguruma answers.  Other patterns can still
   ## differ.
+  ##
+  ## A search that finds the subject lacks what every match holds -- the
+  ## ``b`` of ``(a+)+b`` -- answers "no match" without trying a position, so
+  ## it does not raise there.  Oniguruma does the same only when that literal
+  ## is the one its optimizer picked to search for: over a run of ``a``, it
+  ## answers ``(\w+)+z`` at once and gives up on ``(a+)+b``, whose search
+  ## hint is the leading ``a``.  Both have no match to give up on here.
 const SearchStepsPerByte* = 100
   ## Steps a search earns, on top of the step limit, for every byte its start
   ## position moves, which keeps a search's work linear in the subject.  The
@@ -1202,6 +1230,10 @@ proc firstCharInfo*(r: Regex): FirstCharInfo {.inline.} =
 proc requiredByte*(r: Regex): lent RequiredByteInfo {.inline.} =
   ## Borrowed; the set is wide.
   r.requiredByte
+
+proc requiredLit*(r: Regex): lent RequiredLiteral {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.requiredLit
 
 proc literalScan*(r: Regex): bool {.inline.} =
   r.literalScan
@@ -1447,6 +1479,7 @@ proc initRegex*(
     firstCharInfo: FirstCharInfo,
     literalScan: bool = false,
     requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
+    requiredLit: RequiredLiteral = RequiredLiteral(),
     semiEndAnchored: bool = false,
     semiEndDMax: int = -1,
     levelBackrefs: bool = true,
@@ -1477,6 +1510,7 @@ proc initRegex*(
     firstCharInfo: firstCharInfo,
     literalScan: literalScan,
     requiredByte: requiredByte,
+    requiredLit: requiredLit,
     semiEndAnchored: semiEndAnchored,
     semiEndDMax: semiEndDMax,
     levelBackrefs: levelBackrefs,

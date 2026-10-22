@@ -1829,6 +1829,331 @@ proc requiredByteRegion(
     result.regionOk = true
     result.prefix = prefix
 
+proc foldedLeadBytes(cp: int32): set[uint8] =
+  ## The lead byte of every subject character that can stand where the ASCII
+  ## ``cp`` stands under ``(?i)``: its simple-fold variants (``ſ`` for ``s``,
+  ## ``K`` for ``k``), and every character whose multi-character fold holds
+  ## it (``ß`` for ``s``, ``ﬁ`` for ``i``), which [stringAdvance] matches
+  ## against a run of pattern characters at once.  Taken from the tables the
+  ## matcher reads, so it cannot drift from them.
+  var buf: array[4, char]
+  for v in caseFoldVariants(Rune(cp)):
+    discard utf8Encode(int32(v), buf)
+    result.incl uint8(buf[0])
+  result.incl uint8(cp)
+  for f in MultiCharFolds:
+    for j in 0 ..< f.len:
+      if caseInsensitiveMatch(Rune(f.expansion[j]), Rune(cp), {rfIgnoreCase}):
+        discard utf8Encode(f.source, buf)
+        result.incl uint8(buf[0])
+
+const FoldedLeadBytes = block:
+  ## [foldedLeadBytes] for every ASCII character, worked out once.
+  var t: array[128, set[uint8]]
+  for c in 0 .. 127:
+    t[c] = foldedLeadBytes(int32(c))
+  t
+
+const ByteWeight = block:
+  ## Rough frequency of each byte in source text, for choosing what is
+  ## least likely to be present.  Only the order matters.
+  var t: array[256, int]
+  for b in 0 .. 255:
+    t[b] = 1
+  t[ord(' ')] = 30
+  for c in "etaoinsrl":
+    t[ord(c)] = 12
+  for c in "cdumphfgywb_":
+    t[ord(c)] = 6
+  for c in "vkxjqz0123456789\t":
+    t[ord(c)] = 3
+  for c in "ETAOINSRLCDUMPHFGYWB":
+    t[ord(c)] = 3
+  t
+
+proc setWeight(bs: set[uint8]): int =
+  for b in bs:
+    result += ByteWeight[b]
+
+const FoldedWeight = block:
+  ## [setWeight] of each [FoldedLeadBytes] entry.
+  var t: array[128, int]
+  for c in 0 .. 127:
+    t[c] = setWeight(FoldedLeadBytes[c])
+  t
+
+func folds(flags: RegexFlags): bool {.inline.} =
+  (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card != 0
+
+type
+  ReqSet = object
+    ## The least likely byte set some node requires, for an alternation
+    ## branch.  Any one required byte will do, so no run is kept.
+    weight: int ## -1 while nothing is required.
+    bs: set[uint8]
+
+  ReqWalk = object
+    ## [requiredLiteral]'s walk, which keeps the best string and set as it
+    ## goes.  ``run`` holds the bytes read since the last node that was not a
+    ## literal: the subject holds them back to back.
+    run: string
+    runAtStart: bool
+    atStart: bool ## Nothing a match must consume has been passed yet.
+    skipStart: bool
+      ## Leave out what begins at the match start: the first-byte scan
+      ## already looks for it.
+    skipByte: int ## The byte ``requiredByte`` tests, or -1.
+    str: string ## Longest required string of two or more bytes.
+    set: ReqSet
+
+proc offer(s: var ReqSet, bs: set[uint8], weight: int) =
+  if s.weight < 0 or weight < s.weight:
+    s.weight = weight
+    s.bs = bs
+
+proc offerByte(s: var ReqSet, cp: int32, flags: RegexFlags) =
+  ## A literal character's lead byte, or under folding what may stand for it.
+  if not flags.folds:
+    var buf: array[4, char]
+    discard utf8Encode(cp, buf)
+    let b = uint8(buf[0])
+    s.offer({b}, ByteWeight[b])
+  elif cp < 0x80:
+    s.offer(FoldedLeadBytes[cp], FoldedWeight[cp])
+
+proc offerSet(w: var ReqWalk, bs: set[uint8], weight: int, atStart: bool) =
+  if atStart and w.skipStart:
+    return
+  if w.skipByte >= 0 and bs == {uint8(w.skipByte)}:
+    return
+  w.set.offer(bs, weight)
+
+proc flushRun(w: var ReqWalk) =
+  if w.run.len == 0:
+    return
+  if w.run.len == 1:
+    let b = uint8(w.run[0])
+    w.offerSet({b}, ByteWeight[b], w.runAtStart)
+  elif not (w.runAtStart and w.skipStart) and w.run.len > w.str.len:
+    w.str = w.run
+  w.run.setLen(0)
+
+proc reqBreak(w: var ReqWalk) =
+  ## A node that may consume, but whose bytes are not known: what follows is
+  ## neither next to the run nor at the match start.
+  w.flushRun()
+  w.atStart = false
+
+proc reqRune(w: var ReqWalk, cp: int32, flags: RegexFlags) =
+  ## A literal character the match consumes here.
+  if w.run.len == 0:
+    w.runAtStart = w.atStart
+  if not flags.folds:
+    # Compared byte for byte ([matchBytes]).
+    var buf: array[4, char]
+    let n = utf8Encode(cp, buf)
+    for i in 0 ..< n:
+      w.run.add buf[i]
+  elif cp >= 0x80:
+    # A fold reaches other encodings; nothing is stated.
+    w.reqBreak()
+    return
+  elif FoldedLeadBytes[cp] == {uint8(cp)}:
+    # No other character folds to it: still its own byte, next to the run.
+    w.run.add char(cp)
+  else:
+    w.flushRun()
+    w.offerSet(FoldedLeadBytes[cp], FoldedWeight[cp], w.atStart)
+  w.atStart = false
+
+proc reqUnion(node: Node, flags: RegexFlags): ReqSet
+
+proc reqBest(s: var ReqSet, node: Node, flags: RegexFlags) =
+  ## The least likely byte set ``node`` requires, into ``s``.
+  if node == nil:
+    return
+  case node.kind
+  of nkLiteral:
+    s.offerByte(int32(node.rune), flags)
+  of nkEscapedLiteral:
+    s.offerByte(int32(node.escapedRune), flags)
+  of nkString:
+    for r in node.runes:
+      s.offerByte(int32(r), flags)
+  of nkConcat:
+    var cur = flags
+    for child in node.children.view:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        cur = cur + child.flagsOn - child.flagsOff
+      else:
+        s.reqBest(child, cur)
+  of nkCapture:
+    s.reqBest(node.captureBody, flags)
+  of nkNamedCapture:
+    s.reqBest(node.namedCaptureBody, flags)
+  of nkGroup:
+    s.reqBest(node.groupBody, flags)
+  of nkAtomicGroup:
+    s.reqBest(node.atomicBody, flags)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      s.reqBest(node.flagBody, flags + node.flagsOn - node.flagsOff)
+  of nkLookaround:
+    if node.lookKind == lkAhead:
+      s.reqBest(node.lookBody, flags)
+  of nkQuantifier:
+    if node.quantMin >= 1:
+      s.reqBest(node.quantBody, flags)
+  of nkAlternation:
+    let u = reqUnion(node, flags)
+    if u.weight >= 0:
+      s.offer(u.bs, u.weight)
+  else:
+    discard
+
+proc reqUnion(node: Node, flags: RegexFlags): ReqSet =
+  ## One least likely set from each branch of the alternation ``node``,
+  ## joined; ``weight`` -1 when some branch requires nothing.
+  result.weight = -1
+  var bs: set[uint8]
+  for alt in node.alternatives.view:
+    var b = ReqSet(weight: -1)
+    b.reqBest(alt, flags)
+    if b.weight < 0:
+      return
+    bs = bs + b.bs
+  if node.alternatives.len > 0:
+    result.weight = setWeight(bs)
+    result.bs = bs
+
+proc reqWalk(w: var ReqWalk, node: Node, flags: RegexFlags) =
+  if node == nil:
+    return
+  case node.kind
+  of nkLiteral:
+    w.reqRune(int32(node.rune), flags)
+  of nkEscapedLiteral:
+    w.reqRune(int32(node.escapedRune), flags)
+  of nkString:
+    if not flags.folds:
+      # [stringAdvance] compares ``bytes``.
+      if w.run.len == 0:
+        w.runAtStart = w.atStart
+      w.run.add node.bytes
+      w.atStart = false
+    else:
+      for r in node.runes:
+        w.reqRune(int32(r), flags)
+  of nkConcat:
+    var cur = flags
+    for child in node.children.view:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        cur = cur + child.flagsOn - child.flagsOff
+      else:
+        w.reqWalk(child, cur)
+  of nkCapture:
+    w.reqWalk(node.captureBody, flags)
+  of nkNamedCapture:
+    w.reqWalk(node.namedCaptureBody, flags)
+  of nkGroup:
+    w.reqWalk(node.groupBody, flags)
+  of nkAtomicGroup:
+    w.reqWalk(node.atomicBody, flags)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      w.reqWalk(node.flagBody, flags + node.flagsOn - node.flagsOff)
+  of nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    discard # Zero-width: the run goes on past it.
+  of nkLookaround:
+    # Zero-width too.  A look-ahead reads from where the match stands, so
+    # its body goes on from the run, but the match goes on from before it.
+    # A look-behind reads before the search start, and a negative form
+    # needs nothing.
+    if node.lookKind == lkAhead:
+      # ``var``, so a copy: under refc a ``let`` shares the buffer the body
+      # goes on to append to.
+      var run = w.run
+      let runAtStart = w.runAtStart
+      let atStart = w.atStart
+      w.reqWalk(node.lookBody, flags)
+      w.flushRun()
+      w.run = run
+      w.runAtStart = runAtStart
+      w.atStart = atStart
+  of nkQuantifier:
+    # The first iteration is mandatory and follows the run; what comes after
+    # it is neither.
+    if node.quantMin >= 1:
+      w.reqWalk(node.quantBody, flags)
+    w.reqBreak()
+  of nkAlternation:
+    # Every branch requires something, or nothing is stated: then one byte
+    # set from each, joined.
+    w.flushRun()
+    let u = reqUnion(node, flags)
+    if u.weight >= 0:
+      w.offerSet(u.bs, u.weight, false)
+    w.reqBreak()
+  else:
+    # Classes, references, calls, conditions and absent operators state no
+    # byte here.
+    w.reqBreak()
+
+proc requiredLiteral(
+    ast: Node,
+    flags: RegexFlags,
+    fc: FirstCharInfo,
+    rb: RequiredByteInfo,
+    leadAnchors: set[AnchorKind],
+    semiEnd: bool,
+): RequiredLiteral =
+  ## What every match holds at or after the search start, for the search to
+  ## test before it tries a position: the longest byte string, or else the
+  ## byte set least likely to occur.  What opens every match is left out
+  ## while ``fc`` scans for its first byte anyway, and so is the byte ``rb``
+  ## already tests.  Nothing is taken where ``\A``, ``\G`` or ``\Z`` leaves
+  ## one start to try: reading the subject for it would cost more than the
+  ## attempt it might save.
+  if fc.kind == fcAnchorStart or akSearchBegin in leadAnchors or semiEnd:
+    return
+  var w = ReqWalk(
+    atStart: true,
+    skipStart: fc.kind in {fcByte, fcByteSet},
+    skipByte:
+      if rb.valid:
+        int(rb.byte)
+      else:
+        -1,
+    set: ReqSet(weight: -1),
+  )
+  w.reqWalk(ast, flags)
+  w.flushRun()
+  if w.str.len > 0:
+    result.kind = rlString
+    result.str = w.str
+    for i in 1 ..< w.str.len:
+      if ByteWeight[uint8(w.str[i])] < ByteWeight[uint8(w.str[result.at])]:
+        result.at = i
+  elif w.set.weight >= 0:
+    # A set no less likely than the first-byte scan's own only reads the
+    # subject a second time.
+    if w.skipStart:
+      let scan =
+        if fc.kind == fcByte:
+          {fc.byte}
+        else:
+          fc.bytes
+      if w.set.weight >= setWeight(scan):
+        return
+    if w.set.bs.card == 1:
+      # A string of one, which the search hands to ``memchr``.
+      result.kind = rlString
+      for b in w.set.bs:
+        result.str = $char(b)
+    else:
+      result.kind = rlSet
+      result.set = w.set.bs
+
 type LeadBehindStep = enum
   lbsNone ## Zero-width; the walk may look past it.
   lbsFound
@@ -2506,6 +2831,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       nil
     else:
       leadFirstLeaf(ast, finalFlags)
+  let firstChar = extractFirstChar(ast, finalFlags)
+  let requiredByte =
+    requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags))
+  let leadAnchors = leadAnchorSet(ast, finalFlags)
+  let semiEnd = semiEndAnchored(ast)
   result = initRegex(
     pattern = pattern,
     ast = ast,
@@ -2514,11 +2844,12 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     namedCaptures = namedCaptures,
     groupBodies = bodies,
     groupFlags = groupFlags,
-    firstCharInfo = extractFirstChar(ast, finalFlags),
+    firstCharInfo = firstChar,
     literalScan = hasLiteralPrefix(ast, finalFlags),
-    requiredByte =
-      requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags)),
-    semiEndAnchored = semiEndAnchored(ast),
+    requiredByte = requiredByte,
+    requiredLit =
+      requiredLiteral(ast, finalFlags, firstChar, requiredByte, leadAnchors, semiEnd),
+    semiEndAnchored = semiEnd,
     # [anchorDMax] parts from [maxByteLen] only over an absent operator.
     semiEndDMax =
       if p.sawAbsent:
@@ -2534,7 +2865,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
         let q = leadSimpleRepeat(ast, finalFlags)
         if q != nil and leadRunSkipSafe(ast): q else: nil,
     leadLeaf = leadLeaf,
-    leadAnchors = leadAnchorSet(ast, finalFlags),
+    leadAnchors = leadAnchors,
     leadRepeat = leadRepeat,
     leadBehind = leadBehindLiteral(ast, finalFlags),
   )

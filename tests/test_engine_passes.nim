@@ -550,6 +550,206 @@ suite "required-byte region":
     check got.len == 1000
     check got[0 .. 4] == @["the", "eel", "eats", "every", "egg"]
 
+suite "required literal":
+  # What every match holds at or after the search start, tested before any
+  # position is tried; pin what is taken and that the matches stay.
+  proc lit(pattern: string): RequiredLiteral =
+    re(pattern).requiredLit
+
+  proc str(pattern: string): string =
+    let r = lit(pattern)
+    if r.kind == rlString:
+      r.str
+    else:
+      "<" & $r.kind & ">"
+
+  proc found(pattern, subject: string): string =
+    let m = search(subject, re(pattern))
+    if m.found:
+      subject[m.boundaries[0].a ..< m.boundaries[0].b]
+    else:
+      "<none>"
+
+  test "a string is taken from past what the first-byte scan cannot read":
+    check str("(?:\\b|(?=\\W))(?<!\\w)typename(?!\\w)") == "typename"
+    check found("(?:\\b|(?=\\W))(?<!\\w)typename(?!\\w)", "a typename b") == "typename"
+    check str("\\w+abc") == "abc"
+    # Literals in groups next to each other are one run in the subject.
+    check str("x?(\\$)(foo)") == "$foo"
+    check found("x?(\\$)(foo)", "a $foo") == "$foo"
+    # Zero-width nodes consume nothing, so the run goes on past them.
+    check str("\\w+ab\\bcd") == "abcd"
+    # The longest wins.
+    check str("\\w+ab\\w+cde") == "cde"
+    # A repeat's first iteration follows what precedes it; the next one does
+    # not follow the first.
+    check str("\\w+ab(?:cd)+") == "abcd"
+    check str("\\w+(?:ab)+cde") == "cde"
+    # A look-ahead's body follows the run, and the match resumes before it.
+    check str("\\w+ab(?=cd)\\w") == "abcd"
+    check str("\\w+ab(?=c)de") == "abde"
+
+  test "nothing behind the start or under a negation counts":
+    check lit("(?<=abc)\\w+").kind == rlNone
+    check lit("(?<!abc)\\w+").kind == rlNone
+    check lit("(?!abc)\\w+").kind == rlNone
+    check lit("\\w+(?:abc)?").kind == rlNone
+    check lit("\\w+(?:ab|\\d)").kind == rlNone
+    check lit("(x)?\\w+(?(1)ab|ab)").kind == rlNone
+    # A positive look-ahead reads at or after the start.
+    check str("\\w+(?=ab)") == "ab"
+
+  test "an item the scan already looks for is left to it":
+    # The first-byte scan lands on ``abc`` anyway; the presence test would
+    # read the subject twice.
+    check lit("abc").kind == rlNone
+    check lit("(?<!\\w)typename").kind == rlNone
+    # ``requiredByte`` already tests ``=``.
+    check lit("(\\w+)\\s*=").kind == rlNone
+    # One start to try: the attempt costs less than reading the subject.
+    check lit("\\A\\w+cd").kind == rlNone
+    check lit("\\G\\w+cd").kind == rlNone
+    check lit("\\w+cd\\Z").kind == rlNone
+    check str("^\\w+cd") == "cd"
+    # A set no rarer than the scan's own byte adds nothing to it.
+    check lit("\\{a|\\{b").kind == rlNone
+    check lit("\\$\\w+\\}").kind == rlNone
+    check str("\\s\\w+\\}\\w+\\]") == "]"
+
+  test "a folded letter stands for every character that can match it":
+    let s = lit("\\w+(?i)ss")
+    check s.kind == rlSet
+    # ``ſ`` (C5), ``ß`` (C3), ``ẞ`` (E1), ``ﬅ``/``ﬆ`` (EF).
+    check s.set == {uint8('s'), uint8('S'), 0xC3'u8, 0xC5'u8, 0xE1'u8, 0xEF'u8}
+    check lit("\\w+(?i)k").set == {uint8('k'), uint8('K'), 0xE2'u8}
+    for (p, subject) in [
+      ("(?i)\\d+ss", "12ß"),
+      ("(?i)\\d+ss", "12ẞ"),
+      ("(?i)\\d+s", "1ſ"),
+      ("(?i)\\d+k", "1K"),
+      ("(?i)\\d+fi", "1ﬁ"),
+      ("(?i)\\d+st", "1ﬆ"),
+      ("(?i)\\d+ffi", "1ﬃ"),
+    ]:
+      check found(p, subject) == subject
+    # A character no fold reaches stays its own byte, string and all.
+    check str("(?i)([a-z0-9_\\x{7f}-\\x{10ffff}\\\\]+)(\\[\\])") == "[]"
+    check found("(?i)([a-z0-9_\\x{7f}-\\x{10ffff}\\\\]+)(\\[\\])", "int A[]") == "A[]"
+
+  test "an alternation states one byte of each branch":
+    let r = lit("\\s(?:struct|class|union)\\b")
+    check r.kind == rlSet
+    check uint8('$') notin r.set
+    check found("\\s(?:struct|class|union)\\b", "a union") == " union"
+    check lit("\\s(?:struct|\\w)").kind == rlNone
+
+  test "the subject is read for the literal once per scan":
+    # The ``z`` stands far past every match; a scan does not walk to it again
+    # for each one.
+    let subject = repeat("a ", 2000) & "z"
+    var n = 0
+    for m in findAll(subject, re("a(?=.*z)")):
+      inc n
+    check n == 2000
+    check found("a(?=.*z)", "aa") == "<none>"
+
+  test "a scan past the last occurrence ends without trying the rest":
+    # Each start past the ``x`` found last reads on to the next one, and the
+    # one past the last ``x`` ends the scan.
+    let rx = re("\\d(?i)x")
+    check lit("\\d(?i)x").kind == rlSet
+    var got: seq[string]
+    for m in findAll("1x 2X 3x 4 5 6", rx):
+      got.add captureText(m, 0, "1x 2X 3x 4 5 6").get("")
+    check got == @["1x", "2X", "3x"]
+    # Another subject searched through the same context mid-scan does not
+    # answer for the first one.
+    let a = "1x 2x 9 9x"
+    let b = "9"
+    let ctx = newMatchContext()
+    var sc = initMatchScanner(a)
+    var m: Match
+    check scanNext(sc, ctx, a, rx, m)
+    var spans = @[m.matchSpan]
+    var other: Match
+    check not searchIntoCtx(ctx, b, rx, other)
+    while scanNext(sc, ctx, a, rx, m):
+      spans.add m.matchSpan
+    check spans == @[Span(a: 0, b: 2), Span(a: 3, b: 5), Span(a: 8, b: 10)]
+
+  test "a scan past the occurrence it holds finds the next one":
+    # Past the occurrence it holds a string is read forward from the start,
+    # a byte set back from the end; the occurrences here lie far apart and
+    # close to both ends.
+    var subject = repeat('.', 20_000)
+    let at = [10, 5_000, 12_000, 15_900, 17_000, 19_990]
+    for p in at:
+      subject[p] = '1'
+      subject[p + 1 .. p + 4] = "€u"
+    for (pattern, kind) in [("\\d€u", rlString), ("\\d(?i)€u", rlSet)]:
+      check lit(pattern).kind == kind
+      var starts: seq[int]
+      for m in findAll(subject, re(pattern)):
+        starts.add m.boundaries[0].a
+      check starts == @at
+
+  test "a scan reads its refusal from the subject, not from what it noted":
+    # The scanner does not tell a subject rewritten in place apart; the bytes
+    # it then reads decide, and the last ``x`` noted before does not.
+    let rx = re("\\d(?i)x")
+    var s = "1x 2x " & repeat(' ', 6)
+    let ctx = newMatchContext()
+    var sc = initMatchScanner(s)
+    var m: Match
+    check scanNext(sc, ctx, s, rx, m)
+    check scanNext(sc, ctx, s, rx, m)
+    check m.matchSpan == Span(a: 3, b: 5)
+    let data = cast[pointer](addr s[0])
+    s[8] = '3'
+    s[9] = 'x'
+    check cast[pointer](addr s[0]) == data
+    check scanNext(sc, ctx, s, rx, m)
+    check m.matchSpan == Span(a: 8, b: 10)
+    check not scanNext(sc, ctx, s, rx, m)
+
+  test "a string is found past places that hold only its least likely byte":
+    # The search looks for the string's least likely byte, ``.`` here, and
+    # compares the string around the first few places that hold it; the rest
+    # of the subject is left to ``memmem``.
+    check str("\\d+eg\\.") == "eg."
+    check lit("\\d+eg\\.").at == 2
+    check found("\\d+eg\\.", "1. 2. 3. 4. 5. 6. 7eg.") == "7eg."
+    check found("\\d+eg\\.", "1. 2. 3eg.") == "3eg."
+    check found("\\d+eg\\.", "1. 2. 3eg") == "<none>"
+    check found("\\d+eg\\.", "1. 2. 3. 4. 5. 6. 7eg") == "<none>"
+    check found("\\d+eg\\.", ".1eg.") == "1eg."
+
+  test "a held occurrence answers only while the bytes still hold it":
+    # Any search through a context looks first where the literal was found
+    # last in the same buffer, and compares it there: the buffer may have
+    # been rewritten in place since.  The attempts this lets through would
+    # run out of steps, so a stale answer raises.
+    let rx = re("(a+)+€u")
+    check str("(a+)+€u") == "€u"
+    var s = repeat('a', 30) & "€u"
+    let ctx = newMatchContext()
+    var m: Match
+    check searchIntoCtx(ctx, s, rx, m, stepLimit = 10_000)
+    s[^1] = 'v'
+    check not searchIntoCtx(ctx, s, rx, m, stepLimit = 10_000)
+    check not searchBackwardIntoCtx(ctx, s, rx, m, stepLimit = 10_000)
+    s[^1] = 'u'
+    check searchBackwardIntoCtx(ctx, s, rx, m, stepLimit = 10_000)
+    s[^1] = 'v'
+    check not searchBackwardIntoCtx(ctx, s, rx, m, stepLimit = 10_000)
+    check not searchIntoCtx(ctx, s, rx, m, start = 5, stepLimit = 10_000)
+
+  test "a backward search reads the whole subject":
+    # The match starts before ``start`` and ends past it.
+    let m = searchBackward("xaayz", re("x\\w*yz"), start = 1)
+    check m.found and m.boundaries[0] == Span(a: 0, b: 5)
+    check not searchBackward("xaay", re("x\\w*yz"), start = 1).found
+
 suite "inverted range normalisation":
   # ``{n,m}`` with ``n > m`` is Oniguruma's spelling for the swapped range
   # taken possessively.  The compiler rewrites it once, so everything below

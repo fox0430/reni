@@ -323,6 +323,15 @@ type
       ## The flags ``gates`` was derived under. A scoped ``(?i:...)`` moves
       ## ``ctx.flags`` under a node the compiler already answered, so every
       ## reader compares the two first.
+    reqHit: int
+      ## Where ``requiredLit`` was found, in the buffer at ``reqHitData`` for
+      ## the tree at ``reqHitFor``.  A search over that buffer from at or
+      ## before it compares the literal there instead of reading up to it.
+      ## The bytes decide, not the key: a caller may have rewritten them, or
+      ## freed them and handed their address to another subject, so the key
+      ## is a pointer, held by nothing.
+    reqHitData: pointer
+    reqHitFor: pointer
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -521,6 +530,96 @@ proc indexOfByte(s: string, start: int, b: uint8): int {.inline.} =
     -1
   else:
     find(s, char(b), start)
+
+proc indexOfAnyByte(s: string, start: int, bs: set[uint8]): int =
+  ## Index of the first byte of ``bs`` at or after ``start``, or -1.
+  for i in start ..< s.len:
+    if uint8(s[i]) in bs:
+      return i
+  -1
+
+proc lastIndexOfAnyByte(s: string, start: int, bs: set[uint8]): int =
+  ## Index of the last byte of ``bs`` at or after ``start``, or -1.
+  for i in countdown(s.high, start):
+    if uint8(s[i]) in bs:
+      return i
+  -1
+
+const ReqCandidates = 4
+  ## Places [findString] compares before it hands the rest to ``memmem``.
+
+proc findString(s: string, lit: RequiredLiteral, start: int): int =
+  ## Index of the first ``lit.str`` at or after ``start``, or -1.  A scan
+  ## asks once per match, and glibc's ``memmem`` builds a shift table on
+  ## every call, as costly as a small match; ``memchr`` for the string's
+  ## least likely byte and a compare around it cost nothing to set up.  After
+  ## a few places that fail, the rest goes to ``memmem``, so the search stays
+  ## linear in the subject.
+  let n = lit.str.len
+  let k = lit.at
+  var c = start # The first place not yet ruled out.
+  for _ in 0 ..< ReqCandidates:
+    let p = indexOfByte(s, c + k, uint8(lit.str[k]))
+    if p < 0 or p - k > s.len - n:
+      return -1
+    c = p - k
+    if equalMem(unsafeAddr s[c], unsafeAddr lit.str[0], n):
+      return c
+    inc c
+  find(s, lit.str, c)
+
+proc findRequired(s: string, lit: RequiredLiteral, start: int): int {.inline.} =
+  ## Index of the first occurrence of ``lit`` at or after ``start``, or -1.
+  if lit.kind == rlString:
+    findString(s, lit, start)
+  else:
+    indexOfAnyByte(s, start, lit.set)
+
+proc requiredAt(s: string, lit: RequiredLiteral, p: int): bool {.inline.} =
+  ## Whether ``lit`` occurs at ``p``.
+  if lit.kind == rlString:
+    p + lit.str.len <= s.len and
+      equalMem(unsafeAddr s[p], unsafeAddr lit.str[0], lit.str.len)
+  else:
+    p < s.len and uint8(s[p]) in lit.set
+
+proc requiredLitRead(
+    ctx: MatchContext, subject: string, regex: Regex, start: int, held: bool
+): bool {.noinline.} =
+  ## [requiredLitAbsent] where the occurrence it holds does not answer:
+  ## reads the subject, and holds what it finds.
+  var q: int
+  if held and start > ctx.reqHit and regex.requiredLit.kind == rlSet:
+    # Past the occurrence it holds, a scan wants the last one, which answers
+    # every start up to it; a byte set is read back from the end for it,
+    # once.  A string is read forward from the start, so a scan reads each
+    # stretch once: ``rfind`` compares the whole string at every position,
+    # and tails read from the end would read a tail that lacks it again on
+    # every step through occurrences close together.
+    q = lastIndexOfAnyByte(subject, start, regex.requiredLit.set)
+  else:
+    q = findRequired(subject, regex.requiredLit, start)
+  if q < 0:
+    return true
+  ctx.reqHit = q
+  ctx.reqHitData = cast[pointer](unsafeAddr subject[0])
+  ctx.reqHitFor = cast[pointer](regex.ast)
+  false
+
+proc requiredLitAbsent(
+    ctx: MatchContext, subject: string, regex: Regex, start: int
+): bool {.noinline.} =
+  ## Whether ``subject`` lacks ``regex.requiredLit`` at or after ``start``,
+  ## so that no match can begin there.  Off the hot path: the caller tests
+  ## the kind first.
+  if start >= subject.len:
+    return true
+  let held =
+    ctx.reqHitData == cast[pointer](unsafeAddr subject[0]) and
+    ctx.reqHitFor == cast[pointer](regex.ast)
+  if held and start <= ctx.reqHit and requiredAt(subject, regex.requiredLit, ctx.reqHit):
+    return false
+  requiredLitRead(ctx, subject, regex, start, held)
 
 const RepeatPairStride = 8
   ## Positions a word step of [nextRepeatPairPos] answers at once.
@@ -5158,6 +5257,11 @@ proc searchImplInto*(
   if rbValid and indexOfByte(subject, start, rbByte) < 0:
     noteScratchUsage(ctx)
     return
+  # The same for a string or a byte set from anywhere in the pattern, the
+  # case-folded included.  Every match holds it at or after ``start``.
+  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, start):
+    noteScratchUsage(ctx)
+    return
   ctx.matchOptions = options
   resetForRegex(
     ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth, sameSubject
@@ -5507,6 +5611,10 @@ proc searchBackwardImplInto*(
   # literal, and such a literal is compared byte for byte, so the byte has to
   # occur literally for any match to exist.
   if regex.requiredByte.valid and indexOfByte(subject, 0, regex.requiredByte.byte) < 0:
+    noteScratchUsage(ctx)
+    return
+  # A match may run past ``start`` to the end, so the whole subject counts.
+  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, 0):
     noteScratchUsage(ctx)
     return
   ctx.matchOptions = options

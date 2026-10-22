@@ -159,6 +159,11 @@ limit defaults to. Oniguruma counts backtracks rather than steps, so the two
 limits are not the same amount of work; where they were measured to give up
 alike is in the documentation of `DefaultStepLimit`.
 
+A search that finds the subject lacks something every match needs, such as
+the `b` of `(a+)+b`, answers no match without trying any position, so it
+does not raise there. A search that does not raise has not shown the pattern
+safe from catastrophic backtracking.
+
 ### Stack budget (stack-overflow protection)
 
 Matching keeps its backtrack state on the heap, so native stack usage does

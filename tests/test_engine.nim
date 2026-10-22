@@ -879,10 +879,12 @@ suite "Isolated flags and chaining":
 
 suite "ReDoS protection (stepLimit)":
   test "stepLimit triggers on catastrophic backtracking":
+    # The ``b`` is there, so the search cannot refuse the subject up front;
+    # the ``!`` keeps every attempt from reaching it.
     let r = re("(a+)+b")
     var raised = false
     try:
-      discard search("aaaaaaaaaaaaaaaaaa", r, stepLimit = 10_000)
+      discard search("aaaaaaaaaaaaaaaaaa!b", r, stepLimit = 10_000)
     except RegexLimitError:
       raised = true
     check raised
@@ -901,7 +903,14 @@ suite "ReDoS protection (stepLimit)":
   test "default stepLimit prevents ReDoS":
     let r = re("(a+)+b")
     expect RegexLimitError:
-      discard search("a".repeat(100), r)
+      discard search("a".repeat(100) & "!b", r)
+
+  test "a subject without a required literal is refused before any step":
+    # Every match holds a ``b``, so none is found without trying a position.
+    # libonig takes the leading ``a`` as its search hint instead and gives up
+    # here (ONIGERR_RETRY_LIMIT_IN_MATCH_OVER); there is no match to give up on.
+    let m = search("a".repeat(100), re("(a+)+b"), stepLimit = 100)
+    check not m.found
 
   test "explicit unlimited stepLimit":
     let m = search("aab", re("(a+)+b"), stepLimit = 0)
@@ -3356,11 +3365,11 @@ suite "UTF-8 validation":
 suite "Step limit":
   test "catastrophic backtracking hits step limit":
     expect(RegexLimitError):
-      discard search("a".repeat(30), re("(a+)+b"))
+      discard search("a".repeat(30) & "!b", re("(a+)+b"))
 
   test "custom step limit":
     expect(RegexLimitError):
-      discard search("a".repeat(10), re("(a+)+b"), stepLimit = 100)
+      discard search("a".repeat(10) & "!b", re("(a+)+b"), stepLimit = 100)
 
 suite "Match accessors":
   test "matchSpan returns overall match":
