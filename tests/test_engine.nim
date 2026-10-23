@@ -4689,6 +4689,37 @@ suite "a case-sensitive literal compared in place":
   test "(?i) turned on and off partway":
     check search("aBcabC", re("(?:a(?i)b(?-i)c)+")).matchSpan == 0 .. 3
 
+suite "a class under (?i) answered from what it holds":
+  # The compiler derives, for each class read under ``(?i)``, the ASCII bytes
+  # its atoms accept folding and which multi-character fold sources it
+  # holds; the matcher reads both instead of walking the atoms at each test.
+  # Every answer here is libonig 6.9.10's.
+
+  test "an ASCII byte through a member that folds to it":
+    check search("k", re("(?i)[\xE2\x84\xAA]")).matchSpan == 0 .. 1
+    check search("K", re("(?i)[\xE2\x84\xAA]")).matchSpan == 0 .. 1
+    check not search("k", re("(?I)[\xE2\x84\xAA]")).found
+    check search("s", re("(?i)[\xC5\xBF]")).matchSpan == 0 .. 1
+    check search("Ab_9-", re("(?i)[_$[:alnum:]]+")).matchSpan == 0 .. 4
+    check search("xK", re("(?i)[^k]")).matchSpan == 0 .. 1
+    check not search("K", re("(?i)[^k]")).found
+
+  test "a fold source keeps its expansion, and a class without one its way":
+    check search("ss", re("(?i)[\xC3\x9F]")).matchSpan == 0 .. 2
+    check search("aSSb", re("(?i)[a-z\xC3\x9F]+")).matchSpan == 0 .. 4
+    check search("AbC1", re("(?i)[a-z]+")).matchSpan == 0 .. 3
+    check search("\xE2\x84\xAA", re("(?i)[k]")).matchSpan == 0 .. 3
+
+  test "the flags in force decide, not the pattern's":
+    check not search("AA", re("(?i:[a-z])[a-z]")).found
+    check search("Aa", re("(?i:[a-z])[a-z]")).matchSpan == 0 .. 2
+
+  test "a look-behind on a class without a fold source":
+    check not search("Ax", re("(?i)(?<![a-z])x")).found
+    check search("-x", re("(?i)(?<![a-z])x")).matchSpan == 1 .. 2
+    check not search("\xE2\x84\xAAx", re("(?i)(?<![a-z])x")).found
+    check search("ssx", re("(?i)(?<=[\xC3\x9F])x")).matchSpan == 2 .. 3
+
 suite "an alternation takes no capture snapshot":
   # Backtracking into an alternation does not copy the capture vector back:
   # every capture written after its choice point carries an undo of its own,

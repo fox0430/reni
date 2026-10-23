@@ -4,6 +4,7 @@ import ../reni
 import ../reni/engine
 import ../reni/types
 import ../reni/unicode_utils
+import ../reni/leafgate {.all.}
 
 # What the compiler's rewriting passes leave behind: the first-character
 # prefilter, the leading-run skip, auto-possessification, the range and
@@ -1247,3 +1248,55 @@ suite "leading look-behind scan":
     check all("\xE0.a", "(?<=\\.)\\w+").len == 0
     check all(".\xE0\xE0a", "(?<=\\.)\\w+").len == 1
     check all("a\xC3.b", "(?<=\\.)\\w+") == @["b"]
+
+suite "(?i) class table":
+  # ``classFoldOf`` reads a class's ``(?i)`` answers off its plain ASCII set
+  # where every atom folds by its fold class; ``classFoldExhaustive`` asks
+  # every atom about every byte, as the matcher would.  They have to agree
+  # whichever atoms and ASCII-restriction flags are in play.
+
+  proc classIds(r: Regex): seq[NodeId] =
+    for node in r.nodes:
+      if node != nil and node.kind == nkCharClass:
+        result.add node.id
+
+  test "the shortcut answers what every atom answers":
+    const bodies = [
+      "a-z", "A-Z", "kK", "s", "\xE2\x84\xAA", "\xC5\xBF", "\xC3\x9F", "\xE1\xBA\x9E",
+      "_$[:alnum:]", "[:upper:]", "[:^lower:]", "[:^word:]", "[:punct:]", "\\w\\-",
+      "\\W", "\\d", "\\S", "\\h", "\\p{Lu}", "\\P{Ll}", "\\p{Greek}", "\\p{Alpha}",
+      "\\p{^Lower}", "\\p{ASCII}", "x-\xC3\xBF", "A-\\x{17f}", "\\x{7f}-\\x{10ffff}",
+      "a-z0-9_\\x{7f}-\\x{10ffff}\\\\", "\xEF\xAC\x80-\xEF\xAC\x86", "\xCE\x90\xCE\xB0",
+      "\xE1\xBE\x80-\xE1\xBF\xBC", "\xD6\x87\xC5\x89\xC7\xB0", "\xCE\x91-\xCF\x89",
+      "\xC4\xB0\xC4\xB1", "[^a]b", "a-z&&[^k]", "\\x00-\\x7f", "^a-z", "^\\p{Lu}",
+    ]
+    const restrict =
+      [rfIgnoreCaseAscii, rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix]
+    var compared = 0
+    for body in bodies:
+      let r = re("[" & body & "]")
+      for id in classIds(r):
+        let node = r.nodes[id.int]
+        for mask in 0 ..< (1 shl restrict.len):
+          var flags = {rfIgnoreCase}
+          for k, f in restrict:
+            if (mask and (1 shl k)) != 0:
+              flags.incl f
+          let fast = classFoldOf(node, flags)
+          let slow = classFoldExhaustive(node, flags)
+          check fast.ascii == slow.ascii
+          check fast.folds == slow.folds
+          inc compared
+    check compared >= bodies.len * 32
+
+  test "a pattern without (?i) carries no table, one with it does":
+    var r = re("[a-z]x")
+    check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) == nil
+    r = re("[k]", {rfIgnoreCase})
+    check classFoldAt(addr r, classIds(r)[0], r.flags) != nil
+    r = re("x(?i)[k]")
+    check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) != nil
+    r = re("(?i:x|[k])")
+    check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) != nil
+    r = re("(?i)x")
+    check classIds(r).len == 0

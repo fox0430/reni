@@ -971,6 +971,22 @@ type
     runnable*: bool
     graphemeDep*: bool ## ``.`` alone: the answers hold while grapheme mode is off.
 
+  ClassFold* = object
+    ## What a class answers under ``(?i)`` without reading the subject,
+    ## derived once under ``flags``.  Without it the matcher walks the atoms,
+    ## folding each, for both answers at every test: the plain bitmap
+    ## (``asciiSet``) is exact only with folding off.
+    ascii*: set[uint8]
+      ## The ASCII bytes the atoms accept under ``flags``, before negation:
+      ## what ``classHasByte`` answers below 0x80.
+    folds*: uint32
+      ## Bit ``i`` set when ``MultiCharFolds[i]``'s source is a member, the
+      ## test each fold variant opens with.  0 rules every fold variant out.
+    flags*: RegexFlags
+      ## The flags in force at the class, as the pattern reads; a reader
+      ## under any others answers the long way.
+    derived*: bool ## False in a slot no class under ``(?i)`` fills.
+
   Regex* = object
     pattern: string
     ast: Node
@@ -1055,6 +1071,10 @@ type
     requiredLit: RequiredLiteral
       ## Tested after ``requiredByte``; at the end so the fields the scan
       ## reads keep their offsets.
+    classFolds: seq[ClassFold]
+      ## One entry per ``NodeId``, filled for each class the pattern reads
+      ## under ``(?i)``; see [ClassFold].  Empty when there is none.  Last,
+      ## for the reason ``requiredLit`` gives.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1130,6 +1150,20 @@ proc setLeafGates*(r: var Regex, gates: sink seq[LeafGate]) {.inline.} =
   ## needs the node table that constructor builds, and fold tables it must not
   ## depend on.
   r.leafGates = gates
+
+proc classFoldAt*(
+    r: ptr Regex, id: NodeId, flags: RegexFlags
+): ptr ClassFold {.inline.} =
+  ## **Internal API.** The [ClassFold] of the class ``id`` names when it was
+  ## derived under ``flags``, else nil.
+  if id.int < r[].classFolds.len:
+    result = addr r[].classFolds[id.int]
+    if not result.derived or result.flags != flags:
+      result = nil
+
+proc setClassFolds*(r: var Regex, folds: sink seq[ClassFold]) {.inline.} =
+  ## **Internal API.** Fill in [ClassFold]s, as [setLeafGates] does gates.
+  r.classFolds = folds
 
 proc emptyStatus*(r: Regex, body: NodeId): uint32 {.inline.} =
   ## **Internal API.** The empty-check set of the repeat over ``body``; see
@@ -1862,7 +1896,7 @@ proc classCrossesAsciiBoundary*(node: Node): bool =
       return true
   false
 
-proc atomsReachNonAscii(atoms: seq[CcAtom]): bool =
+proc atomsReachNonAscii*(atoms: seq[CcAtom]): bool =
   ## Whether a member of ``atoms`` can be a character at or above U+0080.
   ## Only answers false when every atom is provably ASCII-only, so
   ## [classFirstChar] dropping the lead bytes on that answer stays a superset.

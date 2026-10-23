@@ -2873,6 +2873,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # under ``result.flags`` rather than ``finalFlags`` because the runtime
   # validity check is against the flags the ``Regex`` carries.
   result.setLeafGates(buildLeafGates(result.nodes, result.flags))
+  # Same numbering; from ``result.flags`` for the same reason, since the
+  # matcher's flags start there and move through the flag groups.
+  result.setClassFolds(buildClassFolds(result.ast, result.nodes, result.flags))
   # Same numbering, same flags: an element names its leaf by ``NodeId``.
   buildSeqRuns(result.nodes, result.flags)
   # Same numbering: a repeat's frame names its body by ``NodeId``.  Oniguruma

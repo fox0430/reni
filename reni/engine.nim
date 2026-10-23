@@ -1801,9 +1801,28 @@ proc classFoldsApply(ctx: MatchContext, node: Node): bool {.inline.} =
   ## [leafgate.classFoldsApply] under the flags in force.
   classFoldsApply(node, ctx.flags)
 
+proc classFoldOf(ctx: MatchContext, node: Node): ptr ClassFold {.inline.} =
+  ## The class's [ClassFold] when it was derived under the flags in force,
+  ## else nil.
+  classFoldAt(ctx.regex, node.id, ctx.flags)
+
+proc foldSourceHeld(ctx: MatchContext, node: Node): bool {.noinline.} =
+  ## Whether the class may hold a multi-character fold source: false only
+  ## when its [ClassFold] says it holds none.  Out of line: inline in
+  ## [classFirstVariant], the read measured up to 1% more ``Ir`` on bench
+  ## items without ``(?i)``, through ``runMachine`` and ``matchWithCont``.
+  let cf = classFoldOf(ctx, node)
+  cf == nil or cf.folds != 0
+
+proc classFoldsLive(ctx: MatchContext, node: Node): bool {.inline.} =
+  ## [classFoldsApply], narrowed by the [ClassFold]: a class holding no
+  ## multi-character fold source has the plain way alone, though ``(?i)``
+  ## applies to it.
+  classFoldsApply(ctx, node) and foldSourceHeld(ctx, node)
+
 proc classFirstVariant(ctx: MatchContext, node: Node): int {.inline.} =
   ## First variant for ``classAdvance``: folds first, else plain match.
-  if classFoldsApply(ctx, node): 0 else: MultiCharFolds.len
+  if classFoldsLive(ctx, node): 0 else: MultiCharFolds.len
 
 const ClassVariants = MultiCharFolds.len + 1 ## Fold variants plus the plain match.
 
@@ -1832,16 +1851,21 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
     # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss".
     if not classFoldsApply(ctx, node):
       return -1
+    let cf = classFoldOf(ctx, node)
+    if cf != nil and (cf.folds and (1'u32 shl variant)) == 0:
+      return -1
     let (srcCP, expCP, expLen) = MultiCharFolds[variant]
     let srcRune = Rune(srcCP)
-    # Check if the source rune matches any atom in the class
-    var atomMatch = false
-    for atom in node.atoms:
-      if matchCcAtomWithFold(srcRune, atom, ctx.flags):
-        atomMatch = true
-        break
-    if not atomMatch:
-      return -1
+    # Check if the source rune matches any atom in the class, unless the
+    # ``ClassFold`` already answered.
+    if cf == nil:
+      var atomMatch = false
+      for atom in node.atoms:
+        if matchCcAtomWithFold(srcRune, atom, ctx.flags):
+          atomMatch = true
+          break
+      if not atomMatch:
+        return -1
     # Check if the expansion matches at the current position (case-insensitively)
     var p = start
     for i in 0 ..< expLen:
@@ -1853,6 +1877,16 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
       if subjRune != expRune and simpleFold(subjRune) != simpleFold(expRune):
         return -1
     return p
+
+  if lead < 0x80:
+    # Under ``(?i)`` the plain bitmap is out, but the folded one may answer.
+    let cf = classFoldOf(ctx, node)
+    if cf != nil:
+      return
+        if (lead in cf.ascii) != node.negated:
+          start + 1
+        else:
+          -1
 
   var code: int32
   var next: int
@@ -2746,7 +2780,7 @@ proc oneCharLeaf(ctx: MatchContext, body: Node): bool =
   ## string never reaches a scan as one.
   case body.kind
   of nkCharClass:
-    not classFoldsApply(ctx, body)
+    not classFoldsLive(ctx, body)
   of nkLiteral, nkEscapedLiteral:
     singleWayLeaf(body, ctx.flags)
   of nkCharType:
