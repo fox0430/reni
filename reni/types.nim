@@ -1661,6 +1661,8 @@ const MultiCharFolds*:
 const MultiCharFoldStarts* = block:
   ## The code points a fold expansion can begin with.  Hot-path lookups reject
   ## through this first: one set test instead of a walk of the table.
+  ## ``unicode_utils.MultiCharFoldLeadMasks`` answers per subject byte, folds
+  ## included.
   var cps: set[uint16]
   for f in MultiCharFolds:
     cps.incl(uint16(f.expansion[0]))

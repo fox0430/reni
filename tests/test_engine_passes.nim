@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, unicode]
+import std/[unittest, options, importutils, sequtils, strutils, unicode]
 
 import ../reni
 import ../reni/engine
@@ -1260,20 +1260,21 @@ suite "(?i) class table":
       if node != nil and node.kind == nkCharClass:
         result.add node.id
 
+  const classBodies = [
+    "a-z", "A-Z", "kK", "s", "\xE2\x84\xAA", "\xC5\xBF", "\xC3\x9F", "\xE1\xBA\x9E",
+    "_$[:alnum:]", "[:upper:]", "[:^lower:]", "[:^word:]", "[:punct:]", "\\w\\-", "\\W",
+    "\\d", "\\S", "\\h", "\\p{Lu}", "\\P{Ll}", "\\p{Greek}", "\\p{Alpha}",
+    "\\p{^Lower}", "\\p{ASCII}", "x-\xC3\xBF", "A-\\x{17f}", "\\x{7f}-\\x{10ffff}",
+    "a-z0-9_\\x{7f}-\\x{10ffff}\\\\", "\xEF\xAC\x80-\xEF\xAC\x86", "\xCE\x90\xCE\xB0",
+    "\xE1\xBE\x80-\xE1\xBF\xBC", "\xD6\x87\xC5\x89\xC7\xB0", "\xCE\x91-\xCF\x89",
+    "\xC4\xB0\xC4\xB1", "[^a]b", "a-z&&[^k]", "\\x00-\\x7f", "^a-z", "^\\p{Lu}",
+  ]
+
   test "the shortcut answers what every atom answers":
-    const bodies = [
-      "a-z", "A-Z", "kK", "s", "\xE2\x84\xAA", "\xC5\xBF", "\xC3\x9F", "\xE1\xBA\x9E",
-      "_$[:alnum:]", "[:upper:]", "[:^lower:]", "[:^word:]", "[:punct:]", "\\w\\-",
-      "\\W", "\\d", "\\S", "\\h", "\\p{Lu}", "\\P{Ll}", "\\p{Greek}", "\\p{Alpha}",
-      "\\p{^Lower}", "\\p{ASCII}", "x-\xC3\xBF", "A-\\x{17f}", "\\x{7f}-\\x{10ffff}",
-      "a-z0-9_\\x{7f}-\\x{10ffff}\\\\", "\xEF\xAC\x80-\xEF\xAC\x86", "\xCE\x90\xCE\xB0",
-      "\xE1\xBE\x80-\xE1\xBF\xBC", "\xD6\x87\xC5\x89\xC7\xB0", "\xCE\x91-\xCF\x89",
-      "\xC4\xB0\xC4\xB1", "[^a]b", "a-z&&[^k]", "\\x00-\\x7f", "^a-z", "^\\p{Lu}",
-    ]
     const restrict =
       [rfIgnoreCaseAscii, rfAsciiWord, rfAsciiDigit, rfAsciiSpace, rfAsciiPosix]
     var compared = 0
-    for body in bodies:
+    for body in classBodies:
       let r = re("[" & body & "]")
       for id in classIds(r):
         let node = r.nodes[id.int]
@@ -1287,7 +1288,7 @@ suite "(?i) class table":
           check fast.ascii == slow.ascii
           check fast.folds == slow.folds
           inc compared
-    check compared >= bodies.len * 32
+    check compared >= classBodies.len * 32
 
   test "a pattern without (?i) carries no table, one with it does":
     var r = re("[a-z]x")
@@ -1300,3 +1301,65 @@ suite "(?i) class table":
     check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) != nil
     r = re("(?i)x")
     check classIds(r).len == 0
+
+  test "the table answers what the atoms answer":
+    # The test above holds the table to ``classFoldExhaustive``; this one
+    # holds that to the matcher, which answers from the atoms when a class
+    # has no table.  So every search runs twice, the second time with the
+    # fold tables and the leaf gates cleared.
+    const classes = block:
+      var all: seq[string]
+      for body in classBodies:
+        all.add "[" & body & "]"
+      all & @["\\p{Lu}", "\\P{Ll}"]
+    const scopes = [
+      ("(?i)", ""),
+      ("(?iI)", ""),
+      ("(?iW)", ""),
+      ("(?iD)", ""),
+      ("(?iS)", ""),
+      ("(?iP)", ""),
+      ("(?i:", ")"),
+      ("(?i)(?-i:", ")"),
+    ]
+    const shapes = ["$1+", "(?<=$1)x", "(?<!$1)x", "$1$1?$1", "(?<=a|$1{1,2})x"]
+    const subjects = [
+      "k", "K", "\xE2\x84\xAA", "s", "S", "\xC5\xBF", "\xC3\x9F", "ss", "SS", "st",
+      "ST", "\xEF\xAC\x81", "fi", "FI", "ffi", "_1-", "x", "\xFF",
+    ]
+
+    proc answer(subject: string, r: Regex): string =
+      try:
+        let m = search(subject, r)
+        if m.found:
+          $m.boundaries
+        else:
+          "none"
+      except RegexError as e:
+        "error: " & e.msg
+
+    proc differences(tabled: var int): seq[string] =
+      privateAccess(Regex)
+      for (head, tail) in scopes:
+        for shape in shapes:
+          for class in classes:
+            let pattern = head & shape % class & tail
+            let on = re(pattern)
+            var off = on
+            off.setClassFolds(@[])
+            off.setLeafGates(@[])
+            if on.classFolds.anyIt(it.derived):
+              inc tabled
+            for s in subjects:
+              for subject in [s, s & "x"]:
+                let (a, b) = (answer(subject, on), answer(subject, off))
+                if a != b:
+                  result.add pattern & " on " & subject.escape & ": " & a & " / " & b
+
+    var tabled = 0
+    let found = differences(tabled)
+    check found.len == 0
+    for d in found[0 ..< min(found.len, 5)]:
+      echo d
+    # Every scope but the last reads the class under ``(?i)``.
+    check tabled == classes.len * shapes.len * (scopes.len - 1)

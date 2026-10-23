@@ -1824,6 +1824,39 @@ proc classFirstVariant(ctx: MatchContext, node: Node): int {.inline.} =
   ## First variant for ``classAdvance``: folds first, else plain match.
   if classFoldsLive(ctx, node): 0 else: MultiCharFolds.len
 
+proc foldVariantEnd(
+    ctx: MatchContext, node: Node, variant: int, cf: ptr ClassFold
+): int {.noinline.} =
+  ## End offset of [classAdvance]'s fold ``variant`` from ``ctx.pos``, or -1,
+  ## once the lead byte there and ``cf`` have let it through.  Out of line:
+  ## only ``(?i)`` reaches it, and inline it kept [classAdvance] twice the
+  ## size, which measured 0.3-0.8% more ``Ir`` on class bench items without
+  ## ``(?i)``.  The start is not an argument: passing it measured 2.5-4.3%
+  ## more on ``(?i)`` classes.
+  let (srcCP, expCP, expLen) = MultiCharFolds[variant]
+  let srcRune = Rune(srcCP)
+  # Check if the source rune matches any atom in the class, unless the
+  # ``ClassFold`` already answered.
+  if cf == nil:
+    var atomMatch = false
+    for atom in node.atoms:
+      if matchCcAtomWithFold(srcRune, atom, ctx.flags):
+        atomMatch = true
+        break
+    if not atomMatch:
+      return -1
+  # Check if the expansion matches at the current position (case-insensitively)
+  var p = ctx.pos
+  for i in 0 ..< expLen:
+    if p >= ctx.subjectEnd:
+      return -1
+    var subjRune: Rune
+    nextCharAt(ctx.subject.oa, p, subjRune)
+    let expRune = Rune(expCP[i])
+    if subjRune != expRune and simpleFold(subjRune) != simpleFold(expRune):
+      return -1
+  p
+
 const ClassVariants = MultiCharFolds.len + 1 ## Fold variants plus the plain match.
 
 proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
@@ -1848,35 +1881,16 @@ proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
         -1
 
   if variant < MultiCharFolds.len:
-    # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss".
-    if not classFoldsApply(ctx, node):
+    # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss".  A lead
+    # byte the expansion cannot start at fails the first comparison of
+    # [foldVariantEnd]'s loop, which reads neither the class nor the flags.
+    let bit = 1'u32 shl variant
+    if (MultiCharFoldLeadMasks[lead] and bit) == 0 or not classFoldsApply(ctx, node):
       return -1
     let cf = classFoldOf(ctx, node)
-    if cf != nil and (cf.folds and (1'u32 shl variant)) == 0:
+    if cf != nil and (cf.folds and bit) == 0:
       return -1
-    let (srcCP, expCP, expLen) = MultiCharFolds[variant]
-    let srcRune = Rune(srcCP)
-    # Check if the source rune matches any atom in the class, unless the
-    # ``ClassFold`` already answered.
-    if cf == nil:
-      var atomMatch = false
-      for atom in node.atoms:
-        if matchCcAtomWithFold(srcRune, atom, ctx.flags):
-          atomMatch = true
-          break
-      if not atomMatch:
-        return -1
-    # Check if the expansion matches at the current position (case-insensitively)
-    var p = start
-    for i in 0 ..< expLen:
-      if p >= ctx.subjectEnd:
-        return -1
-      var subjRune: Rune
-      nextCharAt(ctx.subject.oa, p, subjRune)
-      let expRune = Rune(expCP[i])
-      if subjRune != expRune and simpleFold(subjRune) != simpleFold(expRune):
-        return -1
-    return p
+    return foldVariantEnd(ctx, node, variant, cf)
 
   if lead < 0x80:
     # Under ``(?i)`` the plain bitmap is out, but the folded one may answer.

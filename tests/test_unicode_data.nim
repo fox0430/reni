@@ -47,6 +47,37 @@ suite "Unicode data alignment":
             agree = false
       check agree
 
+  test "a fold expansion can start at the bytes its lead mask names":
+    # ``MultiCharFoldLeadMasks`` is derived from ``caseFoldVariants`` and the
+    # lead byte's payload bits; the matcher's expansion loop reads a character
+    # with ``nextCharAt`` and compares with ``simpleFold``.  Ask the loop's
+    # question of every lead byte, alone and followed by every run of
+    # continuation payloads, which is every character ``nextCharAt`` can read.
+    var starts: array[MultiCharFolds.len, Rune]
+    for i, f in MultiCharFolds:
+      starts[i] = simpleFold(Rune(f.expansion[0]))
+    var want: array[256, uint32]
+    proc note(want: var array[256, uint32], s: openArray[char]) =
+      var p = 0
+      var r: Rune
+      nextCharAt(s, p, r)
+      let folded = simpleFold(r)
+      for i, f in MultiCharFolds:
+        if int32(r) == f.expansion[0] or folded == starts[i]:
+          want[s[0].uint8] = want[s[0].uint8] or (1'u32 shl i)
+
+    var buf: array[MaxCharByteLen, char]
+    for b in 0 .. 255:
+      let n = encLen(uint8(b))
+      buf[0] = char(b)
+      want.note(buf.toOpenArray(0, 0))
+      if n > 1:
+        for tail in 0 ..< 1 shl (6 * (n - 1)):
+          for k in 1 ..< n:
+            buf[k] = char(0x80 or ((tail shr (6 * (n - 1 - k))) and 0x3F))
+          want.note(buf.toOpenArray(0, n - 1))
+    check want == MultiCharFoldLeadMasks
+
   test "unicodedb's Alphabetic, Uppercase and Lowercase are the UCD's":
     # reni matches them with the matchers of Alpha, Upper and Lower.
     for s in Sets:

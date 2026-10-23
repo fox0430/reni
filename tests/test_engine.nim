@@ -4710,6 +4710,47 @@ suite "a class under (?i) answered from what it holds":
     check search("AbC1", re("(?i)[a-z]+")).matchSpan == 0 .. 3
     check search("\xE2\x84\xAA", re("(?i)[k]")).matchSpan == 0 .. 3
 
+  test "an expansion starts at a byte of either case, and at no other":
+    # A fold variant is turned away before the class is read when the
+    # subject's ASCII byte cannot start its expansion.
+    check search("SS", re("(?i)[\xC3\x9F]")).matchSpan == 0 .. 2
+    check search("xss", re("(?i)[\xC3\x9F]")).matchSpan == 1 .. 3
+    check search("\xC5\xBFs", re("(?i)[\xC3\x9F]")).matchSpan == 0 .. 3
+    check search("ST", re("(?i)[\xEF\xAC\x85]")).matchSpan == 0 .. 2
+    check search("st", re("(?i)[\xEF\xAC\x85]")).matchSpan == 0 .. 2
+    check search("xfFi", re("(?i)[\xEF\xAC\x83]")).matchSpan == 1 .. 4
+    check search("\xCA\xBCn", re("(?i)[\xC5\x89]")).matchSpan == 0 .. 3
+    check not search("n", re("(?i)[\xC5\x89]")).found
+    check search("xs", re("(?i)[a-z\xC3\x9F]+")).matchSpan == 0 .. 2
+    check search("qz", re("(?i)[\\x{7f}-\\x{10ffff}a-z]+")).matchSpan == 0 .. 2
+    check search("q-z", re("(?i)[\\x{7f}-\\x{10ffff}a-z]+")).matchSpan == 0 .. 1
+    check not search("qz", re("(?i)[\\x{7f}-\\x{10ffff}]+")).found
+    check search("\xD0\x96\xD0\xB6ss", re("(?i)[\xD0\xB0-\xD1\x8F\xC3\x9F]+")).matchSpan ==
+      0 .. 6
+    check search(
+      "\xE6\xBC\xA2\xE5\xAD\x97SS", re("(?i)[\xE4\xB8\x80-\xE9\xBE\xA5\xC3\x9F]+")
+    ).matchSpan == 0 .. 8
+    check not search("\xC5s", re("(?i)[\xC3\x9F]")).found
+    # An overlong form reads as the character it spells: \xE0\x85\xBF is ſ.
+    check search("\xE0\x85\xBFs", re("(?i)[\xC3\x9F]")).matchSpan == 0 .. 4
+    check search("\xF0\x80\x85\xBFs", re("(?i)[\xC3\x9F]")).matchSpan == 0 .. 5
+
+  test "every expansion starts at each character sharing its first one's fold":
+    # One search for each fold variant and each character its expansion can
+    # start at, ASCII or not.
+    var searched = 0
+    for f in MultiCharFolds:
+      var rest = ""
+      for k in 1 ..< f.len:
+        rest.add toUTF8(Rune(f.expansion[k]))
+      let pattern = re("(?i)[" & toUTF8(Rune(f.source)) & "]")
+      for v in caseFoldVariants(Rune(f.expansion[0])):
+        let subject = toUTF8(v) & rest
+        checkpoint subject.escape
+        check search(subject, pattern).matchSpan == 0 .. subject.len
+        inc searched
+    check searched >= 47 # under Unicode 17.0.0; a later release may add more
+
   test "the flags in force decide, not the pattern's":
     check not search("AA", re("(?i:[a-z])[a-z]")).found
     check search("Aa", re("(?i:[a-z])[a-z]")).matchSpan == 0 .. 2
