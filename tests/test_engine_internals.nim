@@ -1293,16 +1293,18 @@ suite "the step budget of a search":
     # the 20,000 bytes of ``x`` before it earn the rest; searched from where
     # the run begins, they earn nothing.  Any limit from the run's first
     # attempt, about 4,000 steps, to the run less what its bytes earn, about
-    # 1.9 million, would do; the default pays for the run by itself.
+    # 1.9 million, would do; the default pays for the run by itself.  The
+    # ``!`` after the run lets the presence test through, and no digit
+    # follows it.
     let ctx = newMatchContext()
     var m: Match
-    let r = re("(?:a|b)*[!?]")
+    let r = re("(?:a|b)*[!?]\\d")
     const limit = 1_000_000
-    let forward = "x".repeat(20_000) & "a".repeat(1_000)
+    let forward = "x".repeat(20_000) & "a".repeat(1_000) & "!"
     check not searchIntoCtx(ctx, forward, r, m, stepLimit = limit)
     expect RegexLimitError:
       discard searchIntoCtx(ctx, forward, r, m, start = 20_000, stepLimit = limit)
-    let backward = "a".repeat(1_000) & "x".repeat(20_000)
+    let backward = "a".repeat(1_000) & "!" & "x".repeat(20_000)
     check not searchBackwardIntoCtx(ctx, backward, r, m, stepLimit = limit)
     expect RegexLimitError:
       discard

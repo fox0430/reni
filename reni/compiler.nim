@@ -1871,9 +1871,52 @@ const ByteWeight = block:
     t[ord(c)] = 3
   t
 
+const ByteWeights = block:
+  ## The weights ``ByteWeight`` gives, lightest first.
+  var weights: seq[int]
+  for w in ByteWeight:
+    if w notin weights:
+      weights.add w
+  weights.sort()
+  weights
+
+const WeightSteps = block:
+  ## ``ByteWeight`` as steps: each weight a byte has, how far it stands above
+  ## the next lighter one, and the bytes that weigh at least that much.  A
+  ## set weighs the sum over the steps of the step times how many of its
+  ## bytes the step holds.
+  var steps: array[ByteWeights.len, tuple[step: int, bytes: set[uint8]]]
+  var below = 0
+  for i, w in ByteWeights:
+    for b in 0 .. 255:
+      if ByteWeight[b] >= w:
+        steps[i].bytes.incl uint8(b)
+    steps[i].step = w - below
+    below = w
+  steps
+
+func popCount(x: uint64): int {.inline.} =
+  ## The builtin is a libgcc call without ``-mpopcnt``.
+  var v = x - ((x shr 1) and 0x5555555555555555'u64)
+  v = (v and 0x3333333333333333'u64) + ((v shr 2) and 0x3333333333333333'u64)
+  v = (v + (v shr 4)) and 0x0F0F0F0F0F0F0F0F'u64
+  int((v * 0x0101010101010101'u64) shr 56)
+
 proc setWeight(bs: set[uint8]): int =
-  for b in bs:
-    result += ByteWeight[b]
+  ## The sum of ``ByteWeight`` over ``bs``, a word at a time: the walk weighs
+  ## every class and every join, and a set read member by member tests all
+  ## 256 bytes.
+  when nimvm:
+    for b in bs:
+      result += ByteWeight[b]
+  else:
+    let words = cast[array[4, uint64]](bs)
+    for s in WeightSteps:
+      let held = cast[array[4, uint64]](s.bytes)
+      var n = 0
+      for i in 0 .. 3:
+        n += popCount(words[i] and held[i])
+      result += s.step * n
 
 const FoldedWeight = block:
   ## [setWeight] of each [FoldedLeadBytes] entry.
@@ -1910,16 +1953,6 @@ proc offer(s: var ReqSet, bs: set[uint8], weight: int) =
   if s.weight < 0 or weight < s.weight:
     s.weight = weight
     s.bs = bs
-
-proc offerByte(s: var ReqSet, cp: int32, flags: RegexFlags) =
-  ## A literal character's lead byte, or under folding what may stand for it.
-  if not flags.folds:
-    var buf: array[4, char]
-    discard utf8Encode(cp, buf)
-    let b = uint8(buf[0])
-    s.offer({b}, ByteWeight[b])
-  elif cp < 0x80:
-    s.offer(FoldedLeadBytes[cp], FoldedWeight[cp])
 
 proc offerSet(w: var ReqWalk, bs: set[uint8], weight: int, atStart: bool) =
   if atStart and w.skipStart:
@@ -1966,65 +1999,112 @@ proc reqRune(w: var ReqWalk, cp: int32, flags: RegexFlags) =
     w.offerSet(FoldedLeadBytes[cp], FoldedWeight[cp], w.atStart)
   w.atStart = false
 
-proc reqUnion(node: Node, flags: RegexFlags): ReqSet
+proc reqClassBytes(node: Node, flags: RegexFlags): set[uint8] =
+  ## [leafLeadBytes], less the set of every byte, which no subject lacks.
+  result = leafLeadBytes(node, flags)
+  if result == {0'u8 .. 255'u8}:
+    result = {}
 
-proc reqBest(s: var ReqSet, node: Node, flags: RegexFlags) =
-  ## The least likely byte set ``node`` requires, into ``s``.
+type ReqPair = object
+  ## [reqBest]'s answer twice: ``plain`` from the literals alone, ``wide``
+  ## counting classes and types too, and never likelier.  A class can be a
+  ## branch's least likely set and still join into a likelier one:
+  ## ``[uU]r|[bB]r|r`` joins ``{u, U, b, B, r}`` where the literals give
+  ## ``{r}``.  So an alternation joins both, and ``wide`` keeps the lighter.
+  plain, wide: ReqSet
+
+const NoReqPair = ReqPair(plain: ReqSet(weight: -1), wide: ReqSet(weight: -1))
+
+proc offer(p: var ReqPair, bs: set[uint8], weight: int) =
+  p.plain.offer(bs, weight)
+  p.wide.offer(bs, weight)
+
+proc offerByte(p: var ReqPair, cp: int32, flags: RegexFlags) =
+  ## A literal character's lead byte, or under folding what may stand for it.
+  if not flags.folds:
+    var buf: array[4, char]
+    discard utf8Encode(cp, buf)
+    let b = uint8(buf[0])
+    p.offer({b}, ByteWeight[b])
+  elif cp < 0x80:
+    p.offer(FoldedLeadBytes[cp], FoldedWeight[cp])
+
+proc reqUnion(node: Node, flags: RegexFlags): ReqPair
+
+proc reqBest(p: var ReqPair, node: Node, flags: RegexFlags) =
+  ## The least likely byte set ``node`` requires, into ``p``.
   if node == nil:
     return
   case node.kind
   of nkLiteral:
-    s.offerByte(int32(node.rune), flags)
+    p.offerByte(int32(node.rune), flags)
   of nkEscapedLiteral:
-    s.offerByte(int32(node.escapedRune), flags)
+    p.offerByte(int32(node.escapedRune), flags)
   of nkString:
     for r in node.runes:
-      s.offerByte(int32(r), flags)
+      p.offerByte(int32(r), flags)
   of nkConcat:
     var cur = flags
     for child in node.children.view:
       if child.kind == nkFlagGroup and child.flagBody == nil:
         cur = cur + child.flagsOn - child.flagsOff
       else:
-        s.reqBest(child, cur)
+        p.reqBest(child, cur)
   of nkCapture:
-    s.reqBest(node.captureBody, flags)
+    p.reqBest(node.captureBody, flags)
   of nkNamedCapture:
-    s.reqBest(node.namedCaptureBody, flags)
+    p.reqBest(node.namedCaptureBody, flags)
   of nkGroup:
-    s.reqBest(node.groupBody, flags)
+    p.reqBest(node.groupBody, flags)
   of nkAtomicGroup:
-    s.reqBest(node.atomicBody, flags)
+    p.reqBest(node.atomicBody, flags)
   of nkFlagGroup:
     if node.flagBody != nil:
-      s.reqBest(node.flagBody, flags + node.flagsOn - node.flagsOff)
+      p.reqBest(node.flagBody, flags + node.flagsOn - node.flagsOff)
   of nkLookaround:
     if node.lookKind == lkAhead:
-      s.reqBest(node.lookBody, flags)
+      p.reqBest(node.lookBody, flags)
   of nkQuantifier:
     if node.quantMin >= 1:
-      s.reqBest(node.quantBody, flags)
+      p.reqBest(node.quantBody, flags)
   of nkAlternation:
     let u = reqUnion(node, flags)
-    if u.weight >= 0:
-      s.offer(u.bs, u.weight)
+    if u.plain.weight >= 0:
+      p.plain.offer(u.plain.bs, u.plain.weight)
+    if u.wide.weight >= 0:
+      p.wide.offer(u.wide.bs, u.wide.weight)
+  of nkCharClass, nkCharType:
+    let bs = reqClassBytes(node, flags)
+    if bs != {}:
+      p.wide.offer(bs, setWeight(bs))
   else:
     discard
 
-proc reqUnion(node: Node, flags: RegexFlags): ReqSet =
+proc reqUnion(node: Node, flags: RegexFlags): ReqPair =
   ## One least likely set from each branch of the alternation ``node``,
-  ## joined; ``weight`` -1 when some branch requires nothing.
-  result.weight = -1
-  var bs: set[uint8]
+  ## joined, as [ReqPair] keeps them; ``weight`` -1 where some branch
+  ## requires nothing.
+  result = NoReqPair
+  if node.alternatives.len == 0:
+    return
+  var plain, wide: set[uint8]
+  var plainHeld = true
   for alt in node.alternatives.view:
-    var b = ReqSet(weight: -1)
+    var b = NoReqPair
     b.reqBest(alt, flags)
-    if b.weight < 0:
+    if b.wide.weight < 0:
+      # Nor does ``plain``, which takes no offer ``wide`` does not.
       return
-    bs = bs + b.bs
-  if node.alternatives.len > 0:
-    result.weight = setWeight(bs)
-    result.bs = bs
+    wide = wide + b.wide.bs
+    if b.plain.weight < 0:
+      plainHeld = false
+    else:
+      plain = plain + b.plain.bs
+  result.wide = ReqSet(weight: setWeight(wide), bs: wide)
+  if plainHeld:
+    result.plain = ReqSet(weight: setWeight(plain), bs: plain)
+    if result.plain.weight < result.wide.weight:
+      result.wide = result.plain
 
 proc reqWalk(w: var ReqWalk, node: Node, flags: RegexFlags) =
   if node == nil:
@@ -2090,13 +2170,24 @@ proc reqWalk(w: var ReqWalk, node: Node, flags: RegexFlags) =
     # Every branch requires something, or nothing is stated: then one byte
     # set from each, joined.
     w.flushRun()
-    let u = reqUnion(node, flags)
+    let u = reqUnion(node, flags).wide
     if u.weight >= 0:
       w.offerSet(u.bs, u.weight, false)
     w.reqBreak()
+  of nkCharClass, nkCharType:
+    # One character whose bytes are not known, only those it begins with:
+    # a set, as for an alternation.  ``[a-zA-Z_]`` turns away a line of
+    # ``/****/``, which Oniguruma's map refuses too.
+    w.flushRun()
+    # [offerSet] would leave it to the scan too; testing first saves the
+    # weighing.
+    if not (w.atStart and w.skipStart):
+      let bs = reqClassBytes(node, flags)
+      if bs != {}:
+        w.offerSet(bs, setWeight(bs), w.atStart)
+    w.reqBreak()
   else:
-    # Classes, references, calls, conditions and absent operators state no
-    # byte here.
+    # References, calls, conditions and absent operators state no byte here.
     w.reqBreak()
 
 proc requiredLiteral(

@@ -5,6 +5,7 @@ import ../reni/engine
 import ../reni/types
 import ../reni/unicode_utils
 import ../reni/leafgate {.all.}
+import ../reni/compiler {.all.}
 
 # What the compiler's rewriting passes leave behind: the first-character
 # prefilter, the leading-run skip, auto-possessification, the range and
@@ -595,8 +596,8 @@ suite "required literal":
     check lit("(?<!abc)\\w+").kind == rlNone
     check lit("(?!abc)\\w+").kind == rlNone
     check lit("\\w+(?:abc)?").kind == rlNone
-    check lit("\\w+(?:ab|\\d)").kind == rlNone
-    check lit("(x)?\\w+(?(1)ab|ab)").kind == rlNone
+    check lit("\\w+(?:ab|.)").kind == rlNone
+    check lit("(x)?.(?(1)ab|ab)").kind == rlNone
     # A positive look-ahead reads at or after the start.
     check str("\\w+(?=ab)") == "ab"
 
@@ -642,7 +643,109 @@ suite "required literal":
     check r.kind == rlSet
     check uint8('$') notin r.set
     check found("\\s(?:struct|class|union)\\b", "a union") == " union"
-    check lit("\\s(?:struct|\\w)").kind == rlNone
+    check lit("\\s(?:struct|.)").kind == rlNone
+
+  test "a class or a type states the bytes its character can begin with":
+    # Oniguruma's map takes ``[a-zA-Z_]`` here and turns a line of ``/****/``
+    # away untried.  Tried, every start costs time exponential in the stars:
+    # the step limit, at the default, ends the search with an error.
+    const banner = "(?:[&*](?:(?<=\\W)|(?=\\W)))*[a-zA-Z_]"
+    check lit(banner).kind == rlSet
+    check lit(banner).set ==
+      {uint8('A') .. uint8('Z'), uint8('a') .. uint8('z'), uint8('_')}
+    check found(banner, "/" & repeat('*', 76) & "/") == "<none>"
+    check found(banner, "/**/ x") == "x"
+    # Past an optional prefix, and in a branch.
+    check lit("x?[<>]").set == {uint8('<'), uint8('>')}
+    check found("x?[<>]", "a < b") == "<"
+    check lit("\\s(?:[<>]|=>)").set == {uint8('<'), uint8('='), uint8('>')}
+    # What opens every match is left to the first-byte scan.
+    check lit("[a-z]+\\d").kind == rlSet
+    check uint8('a') notin lit("[a-z]+\\d").set
+    # ``.`` may begin with any byte, and a folded class with a member above
+    # U+007F gives up: neither states anything.
+    check lit("\\s.").kind == rlNone
+    check lit("\\s(?i)[é]").kind == rlNone
+
+  test "a set weighs what its bytes weigh":
+    # [setWeight] counts a word at a time against ``WeightSteps`` at run time
+    # and adds byte by byte where a constant is built, and the two are
+    # compared: ``FoldedWeight`` against what the walk weighs.
+    var bs: set[uint8]
+    var sum = 0
+    var wrong: seq[int]
+    for b in 0 .. 255:
+      bs.incl uint8(b)
+      sum += ByteWeight[b]
+      if setWeight(bs) != sum or setWeight({uint8(b)}) != ByteWeight[b]:
+        wrong.add b
+    for c in 0 .. 127:
+      if setWeight(FoldedLeadBytes[c]) != FoldedWeight[c]:
+        wrong.add 1000 + c
+    check wrong.len == 0
+
+  test "an alternation keeps its literals where its classes join likelier":
+    # Each branch's least likely set is its class, and those join into
+    # ``{u, U, b, B, r}``, likelier than the ``r`` every branch holds.
+    check str("\\s(?:[uU]r|[bB]r|r[bB]?)") == "r"
+
+  test "what a class states never turns a match away":
+    # Every search runs twice, the second time with the required literal
+    # cleared, over classes and types under the flags that change what they
+    # match, and over folds, separators and malformed bytes.
+    const leaves = [
+      "[a-z]", "[A-Z_]", "[sk]", "[ß]", "[ﬁ]", "[é]", "[^a]", "[^\\x00-\\x7f]",
+      "[\\x{7f}-\\x{10ffff}]", "[\\x{80}-\\x{10ffff}]", "[[:alpha:]]", "[[:^word:]]",
+      "[\\w&&[^\\d]]", "\\p{Lu}", "\\P{L}", "[\\p{Zs}]", "\\w", "\\W", "\\d", "\\D",
+      "\\s", "\\S", "\\h", "\\H", ".", "\\O", "\\R", "\\N", "\\X",
+    ]
+    const scopes =
+      ["", "(?i)", "(?iI)", "(?W)", "(?iW)", "(?D)", "(?S)", "(?P)", "(?m)"]
+    # A match that may open with ``.`` gives the first-byte scan nothing to
+    # look for, so whatever the leaf states is taken, the likeliest sets too;
+    # behind ``\d``, only a set rarer than the digits the scan looks for.
+    const shapes =
+      ["(?:\\d|.)$1", "\\d$1", ".(?:$1|=>)", ".(?=$1)", "(?:.|y)$1+x?", ".(?:q|$1)\\d?"]
+    const tails = [
+      "a", "A", "k", "K", "\xE2\x84\xAA", "s", "S", "\xC5\xBF", "ss", "\xC3\x9F",
+      "\xE1\xBA\x9E", "fi", "\xEF\xAC\x81", "\xC3\xA9", "\xC3\x89", " ", "\t", "\n",
+      "\r\n", "\xC2\x85", "\xC2\xA0", "\xE3\x80\x80", "\xE2\x80\xA8", "_", "-", "0",
+      "f", "\xFF", "\x80", "\xC1\xB3", "\xE0\x81\xB3", "\xC5?", "=>", "",
+    ]
+
+    proc answer(subject: string, r: Regex): string =
+      try:
+        let m = search(subject, r)
+        let b = searchBackward(subject, r, start = subject.len)
+        (if m.found: $m.boundaries else: "none") & " / " &
+          (if b.found: $b.boundaries else: "none")
+      except RegexError as e:
+        "error: " & e.msg
+
+    proc differences(stated: var int): seq[string] =
+      privateAccess(Regex)
+      for scope in scopes:
+        for shape in shapes:
+          for leaf in leaves:
+            let pattern = scope & shape % leaf
+            let on = re(pattern)
+            var off = on
+            off.requiredLit = RequiredLiteral()
+            if shape == shapes[0] and on.requiredLit.kind != rlNone:
+              inc stated
+            for tail in tails:
+              for subject in ["1" & tail, "1" & tail & "x", "y" & tail]:
+                let (a, b) = (answer(subject, on), answer(subject, off))
+                if a != b:
+                  result.add pattern & " on " & subject.escape & ": " & a & " / " & b
+
+    var stated = 0
+    let found = differences(stated)
+    check found.len == 0
+    for d in found[0 ..< min(found.len, 5)]:
+      echo d
+    # About 200 of the 261: all but ``.``, ``\O``, ``\X`` and what (?i) gives up on.
+    check stated >= 190
 
   test "the subject is read for the literal once per scan":
     # The ``z`` stands far past every match; a scan does not walk to it again

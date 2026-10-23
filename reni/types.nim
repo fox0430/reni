@@ -1732,19 +1732,22 @@ proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
         return FirstCharInfo(kind: fcNone)
       byteSetInfo(asciiFoldBytes(b))
     else:
-      byteSetInfo({b})
+      # [byteSetInfo] would ask ``card``, a libgcc call without ``-mpopcnt``,
+      # what one byte already answers.
+      FirstCharInfo(kind: fcByte, byte: b)
   elif rfIgnoreCase in flags:
     # Case-insensitive non-ASCII: skip optimization (fold targets may differ)
     FirstCharInfo(kind: fcNone)
   else:
     # Non-ASCII case-sensitive: use the UTF-8 lead byte for fast skip
-    byteSetInfo({utf8LeadByte(cp)})
+    FirstCharInfo(kind: fcByte, byte: utf8LeadByte(cp))
 
 proc charTypeBytes(ct: CharTypeKind): set[uint8] =
   ## Bytes a character type can start with, or ``{}`` when it can start
   ## with anything.  Always the widest (Unicode) reading: the ASCII-only
   ## flags can be switched on at match time and only ever shrink the set, so
-  ## a superset stays sound.
+  ## a superset stays sound.  [leafLeadBytes] reads it away from the match
+  ## start too.
   case ct
   of ctWord:
     # ``\w`` and ``\W`` test the decoded code point directly instead of
@@ -1937,9 +1940,11 @@ proc atomsReachNonAscii*(atoms: seq[CcAtom]): bool =
       return true
   false
 
-proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
+proc classLeadBytes(node: Node, flags: RegexFlags): set[uint8] =
   ## Lead bytes a character class can start with — always a superset of the
-  ## truth, so the scan never skips a position the class could match.
+  ## truth, so the scan never skips a position the class could match.  ``{}``
+  ## where it gives up.  [leafLeadBytes] reads it away from the match start
+  ## too.
   var matched: set[uint8]
   var nonAscii, predicate: bool
   if not classAsciiMatches(node, matched, nonAscii, predicate):
@@ -1949,9 +1954,9 @@ proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
     # from the atoms.  ``rfIgnoreCase`` is out for [classBitmapAnswers]'s
     # reason: the set is built without folding.
     if not node.asciiSetOk or rfIgnoreCase in flags:
-      return FirstCharInfo(kind: fcNone)
+      return {}
     if node.negated:
-      return byteSetInfo((AllAsciiBytes - node.asciiSet) + NonAsciiBytes)
+      return (AllAsciiBytes - node.asciiSet) + NonAsciiBytes
     # A range across the ASCII boundary accepts stray bytes up to its end
     # ([classHasByte]), so take every high byte: the lead bytes alone would
     # drop 0x80..0xC1 and 0xF5..0xFF and the scan would skip a position the
@@ -1963,21 +1968,21 @@ proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
       high = NonAsciiBytes
     elif atomsReachNonAscii(node.atoms):
       high = ClassLeadBytes
-    return byteSetInfo(node.asciiSet + high)
+    return node.asciiSet + high
   if node.negated:
     # ``matched`` is exact below U+0080 and case folding only ever adds to
     # it, so its complement is a superset of what the negated class accepts.
     # Every byte above 0x7F stays in: a one-byte character above U+007F
     # reaches no container, so it misses every member and the negation lets
     # it through.
-    return byteSetInfo((AllAsciiBytes - matched) + NonAsciiBytes)
+    return (AllAsciiBytes - matched) + NonAsciiBytes
   var ascii = matched
   if rfIgnoreCase in flags:
     if predicate or nonAscii:
       # A fold variant of an ASCII byte can satisfy a predicate the byte
       # itself does not ((?iW:[[:^word:]]) matching "s" through ſ), and a
       # non-ASCII member can expand to arbitrary ASCII.  Give up.
-      return FirstCharInfo(kind: fcNone)
+      return {}
     for b in matched:
       ascii = ascii + asciiFoldBytes(b)
     ascii = ascii + SKFoldBytes
@@ -1985,12 +1990,30 @@ proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
       ascii = ascii + MultiCharFoldLeadBytes
     # ſ and K are the only characters above U+007F that fold onto an ASCII
     # member, and both are multi-byte.
-    return byteSetInfo(ascii + ClassLeadBytes)
+    return ascii + ClassLeadBytes
   if nonAscii:
     ascii = ascii + ClassLeadBytes
   # Every member is ASCII, and only a one-byte character is looked up against
   # them (``codeIsClassifiable``), so the ASCII set is the whole hint.
-  byteSetInfo(ascii)
+  ascii
+
+proc classFirstChar(node: Node, flags: RegexFlags): FirstCharInfo =
+  ## [classLeadBytes] as the first-byte scan reads it.
+  byteSetInfo(classLeadBytes(node, flags))
+
+proc leafLeadBytes*(node: Node, flags: RegexFlags): set[uint8] =
+  ## The bytes a character the class or type ``node`` matches can begin with,
+  ## wherever it stands, or ``{}`` where nothing is known.  The required
+  ## literal reads it at every position, not only where a match starts, so
+  ## [classLeadBytes] and [charTypeBytes] must not narrow it to what is true
+  ## at the start alone.
+  case node.kind
+  of nkCharClass:
+    classLeadBytes(node, flags)
+  of nkCharType:
+    charTypeBytes(node.charType)
+  else:
+    {}
 
 type FirstCharCache* = TableRef[(uint, RegexFlags), FirstCharInfo]
   ## Memo for ``extractFirstChar``, keyed by node identity and the flags it

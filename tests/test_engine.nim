@@ -941,10 +941,12 @@ suite "ReDoS protection (stepLimit)":
     # the search as a whole.  The search's budget stops it after about a
     # million steps.  The limit is spelled out because the default lets each
     # search run ten times as long; below one attempt, the attempt's own limit
-    # would raise instead of the budget.
+    # would raise instead of the budget.  The ``!`` the subject ends with is
+    # what the presence test looks for, so it lets the search through, and
+    # no digit ever follows it.
     const limit = 1_000_000
-    let subject = "a".repeat(20_000)
-    for pattern in ["(?:a|b)*[!?]", "(?:a|ab)*?[!?]", "\\w*?[!?]"]:
+    let subject = "a".repeat(20_000) & "!"
+    for pattern in ["(?:a|b)*[!?]\\d", "(?:a|ab)*?[!?]\\d", "\\w*?[!?]\\d"]:
       checkpoint pattern
       expect RegexLimitError:
         discard search(subject, re(pattern), stepLimit = limit)
