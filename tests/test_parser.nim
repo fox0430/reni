@@ -1,4 +1,4 @@
-import std/[unittest, unicode]
+import std/[unittest, unicode, strutils]
 
 import ../reni
 import ../reni/types
@@ -737,18 +737,27 @@ suite "Bug fixes and validation":
     expect RegexError:
       discard re("a{1,99999999999999999999}")
 
-  test "conditional group number past 32 bits raises error":
-    expect RegexError:
-      discard re("(a)(?(4294967297)a|b)")
+  test "a condition number past 32 bits is a pattern":
+    # Oniguruma's ``scan_number`` gives up past ``high(int32)``, and the
+    # condition is then read as a pattern, as ``(?(1a)`` is.
+    check search("b", re("(a)?(?(4294967297)a|b)")).matchSpan == 0 .. 1
+    check search("2147483648a", re("(?(2147483648)a|b)")).matchSpan == 0 .. 11
+    check search("b", re("(?(-2147483648)a|b)")).matchSpan == 0 .. 1
+    check search("b", re("(a)?(?(1+2147483648)a|b)")).matchSpan == 0 .. 1
+    check compileError("(?(2147483647)a|b)").startsWith(
+      "invalid conditional group reference"
+    )
+    check compileError("(a)(?(+2147483647)a|b)").startsWith(
+      "invalid conditional group reference"
+    )
 
-  test "an error in a bare-name condition gives its position in the pattern":
-    # The name is parsed on its own, so these check that the offsets are the
-    # pattern's, not the name's.  The first two run out at the ``)`` that ends
-    # the name, byte 6; the class goes through the class parser.
+  test "an error in a condition gives its position in the pattern":
+    # The condition is parsed in place, up to the ``)`` that closes it, so a
+    # ``)`` in a class or after a backslash does not end it.
     for (pattern, msg) in [
-      ("x(?([a)b)", "unterminated character class at position 6"),
-      ("x(?(a\\)b)", "unexpected end after '\\' at position 6"),
-      ("x(?(a(?(?=b)c)", "expected ')' at position 11"),
+      ("x(?([a)b)", "unterminated character class at position 9"),
+      ("x(?(a\\)b)", "expected ')' at position 9"),
+      ("x(?(a(?(?=b)c)", "expected ')' at position 14"),
     ]:
       check compileError(pattern) == msg
 
@@ -798,6 +807,14 @@ suite "Relative and numeric reference bounds":
   test "\\k<-1> valid within range":
     let r = re("(a)\\k<-1>")
     check r.ast.kind == nkConcat
+
+  test "\\k<+0>, \\k<-0> and numbers past 32 bits are names no group has":
+    # Oniguruma's -215 and -200; ``\k<+0>`` read the last group before.
+    for pattern in [
+      "(a)\\k<+0>", "(a)\\k<-0>", "(a)\\k<2147483648>", "(?<n>a)\\k<n+2147483648>"
+    ]:
+      expect RegexError:
+        discard re(pattern)
 
   test "\\g<0> whole-pattern recursion is valid":
     let r = re("a(?:\\g<0>)?b")

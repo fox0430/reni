@@ -163,7 +163,9 @@ suite "the \\Z anchor is reached the way Oniguruma reaches it":
     # and so counts it as unbounded, even ``(?~)`` and ``(?~|b)``, which
     # consume nothing.  With no window its scan walks the chain from 0 and
     # never lands on the ``\n`` at 1.
-    for pattern in ["(?~)\\Z", "(?~a*)\\Z", "(?~|b)\\Z", "(?:(?~))+\\Z", "((?~))\\Z"]:
+    for pattern in [
+      "(?~)\\Z", "(?~a*)\\Z", "(?~|b)\\Z", "(?:(?~))+\\Z", "((?~))\\Z", "(?((?~))|)\\Z"
+    ]:
       check re(pattern).semiEndDMax == -1
       check search("\xC0\x0A", re(pattern)).matchSpan == 2 .. 2
     # Where the operator cannot consume at all, the window stays.

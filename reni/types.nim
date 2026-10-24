@@ -457,7 +457,10 @@ type
       condScope*: int32
         ## ``backrefScope`` for ckNamedRef.  Both 32 bits wide, so the two
         ## share the word ``condRefIndex`` had alone.
-      condRefName*: string ## capture name for ckNamedRef
+      condRefName*: string
+        ## Capture name for ckNamedRef.  On a ckRegexCond, the condition's
+        ## text when it may still be a group's name (no ``)`` of its own),
+        ## which ``resolveBareNameConditions`` reads; anything else, "".
 
       condYes*: Node ## yes branch
       condNo*: Node ## no branch (nil if absent)
@@ -2404,6 +2407,22 @@ proc isEmptyAbsentFunc*(node: Node): bool {.inline.} =
   ## the one [markEmptyAbsentFuncs] cached at compile time.
   node.kind == nkAbsent and node.absentEmpty
 
+func followedBy(a, b: LenBounds): LenBounds =
+  ## What ``a`` and then ``b`` consume together; -1 where either is, or where
+  ## the sum passes ``int.high``.
+  LenBounds(
+    maxLen:
+      if a.maxLen < 0 or b.maxLen < 0 or b.maxLen > int.high - a.maxLen:
+        -1
+      else:
+        a.maxLen + b.maxLen,
+    fixedLen:
+      if a.fixedLen < 0 or b.fixedLen < 0 or b.fixedLen > int.high - a.fixedLen:
+        -1
+      else:
+        a.fixedLen + b.fixedLen,
+  )
+
 proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   ## Bound what ``node`` consumes.  See [LenBounds].
   ##
@@ -2445,8 +2464,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
         total += MaxAsciiFoldEquivBytes - 2
     LenBounds(maxLen: total, fixedLen: fixed)
   of nkConcat:
-    var total = 0
-    var fixed = 0
+    var total = LenBounds(maxLen: 0, fixedLen: 0)
     var currentFlags = flags
     var currentGm = gm
     for child in node.children.view:
@@ -2457,20 +2475,10 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
         if child.graphemeMode != gmNone:
           currentGm = child.graphemeMode
         continue
-      let cb = lengthBounds(child, currentFlags, currentGm)
-      if fixed >= 0:
-        if cb.fixedLen < 0 or cb.fixedLen > int.high - fixed:
-          fixed = -1
-        else:
-          fixed += cb.fixedLen
-      if total >= 0:
-        if cb.maxLen < 0 or cb.maxLen > int.high - total:
-          total = -1
-        else:
-          total += cb.maxLen
-      if total < 0 and fixed < 0:
+      total = total.followedBy(lengthBounds(child, currentFlags, currentGm))
+      if total.maxLen < 0 and total.fixedLen < 0:
         break
-    LenBounds(maxLen: total, fixedLen: fixed)
+    total
   of nkAlternation:
     if node.alternatives.len == 0:
       return LenBounds(maxLen: 0, fixedLen: 0)
@@ -2548,7 +2556,15 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   of nkBackreference, nkNamedBackref, nkSubexpCall:
     LenBounds(maxLen: -1, fixedLen: -1) # can't bound
   of nkConditional:
-    let yes = lengthBounds(node.condYes, flags, gm)
+    # A regex condition consumes what it matched before the yes branch, as
+    # ``BAG_IF_ELSE`` does: ``(?(a)|b)`` is one character either way, and
+    # ``(?(a)|)`` is not fixed.  The other tests are zero-width.
+    let test =
+      if node.condKind == ckRegexCond:
+        lengthBounds(node.condBody, flags, gm)
+      else:
+        LenBounds(maxLen: 0, fixedLen: 0)
+    let yes = test.followedBy(lengthBounds(node.condYes, flags, gm))
     let no =
       if node.condNo != nil:
         lengthBounds(node.condNo, flags, gm)
@@ -2560,7 +2576,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
           -1
         else:
           max(yes.maxLen, no.maxLen),
-      # One branch runs and the test is zero-width, so equal fixed lengths stay fixed.
+      # One branch runs, so equal fixed lengths stay fixed.
       fixedLen:
         if yes.fixedLen >= 0 and yes.fixedLen == no.fixedLen: yes.fixedLen else: -1,
     )
@@ -2632,7 +2648,8 @@ proc fixedByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
 proc holdsAbsentLoop(node: Node): bool =
   ## Whether ``node`` holds an absent operator other than the range clear
   ## ``(?~|)`` where [lengthBounds] counts what it consumes: outside every
-  ## lookaround, conditional test and repeat that runs zero times.
+  ## lookaround, every conditional test but a pattern, and every repeat that
+  ## runs zero times.
   if node == nil:
     return false
   case node.kind
@@ -2644,7 +2661,9 @@ proc holdsAbsentLoop(node: Node): bool =
     if effectiveQuantBounds(node.quantMin, node.quantMax).hi == 0:
       return false
   of nkConditional:
-    return holdsAbsentLoop(node.condYes) or holdsAbsentLoop(node.condNo)
+    return
+      (node.condKind == ckRegexCond and holdsAbsentLoop(node.condBody)) or
+      holdsAbsentLoop(node.condYes) or holdsAbsentLoop(node.condNo)
   else:
     discard
   for child in node.childNodes:

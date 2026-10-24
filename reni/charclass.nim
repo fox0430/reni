@@ -5,7 +5,6 @@ import types, unicode_utils, stackguard
 type CcParser* = object
   src: string
   pos: int
-  base: int ## Where ``src`` starts in the pattern, added to reported positions.
   flags: RegexFlags
   pendingAtoms*: seq[CcAtom]
   stackBase: int ## Outer parse start frame; shared base for the byte-budget check.
@@ -48,17 +47,14 @@ proc parseOctInt*(s: string): int =
     if result > 0x10FFFF:
       raise newException(RegexError, "octal escape value too large")
 
-proc initCcParser*(
-    src: string, pos: int, flags: RegexFlags, stackBase: int, base = 0
-): CcParser =
-  CcParser(src: src, pos: pos, base: base, flags: flags, stackBase: stackBase)
+proc initCcParser*(src: string, pos: int, flags: RegexFlags, stackBase: int): CcParser =
+  CcParser(src: src, pos: pos, flags: flags, stackBase: stackBase)
 
 template checkCcBudget(p: CcParser) =
   ## Byte-budget check covering `[` nesting and `&&` right sides.
   if stackUsedFrom(p.stackBase) > MaxStackBytes:
-    raise newException(
-      RegexLimitError, "parse stack budget exceeded at position " & $(p.pos + p.base)
-    )
+    raise
+      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
 proc position*(p: CcParser): int =
   p.pos
@@ -84,7 +80,7 @@ proc advance(p: var CcParser) =
     inc p.pos
 
 proc error(p: CcParser, msg: string, at: int) {.noreturn.} =
-  raise newException(RegexError, msg & " at position " & $(at + p.base))
+  raise newException(RegexError, msg & " at position " & $at)
 
 proc error(p: CcParser, msg: string) {.noreturn.} =
   p.error(msg, p.pos)
@@ -668,12 +664,11 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
   result = (negated, atoms)
 
 proc parseCharClass*(
-    src: string, pos: int, flags: RegexFlags, stackBase: int, base = 0
+    src: string, pos: int, flags: RegexFlags, stackBase: int
 ): (int, Node) =
   ## Parse a character class starting at `[` at position pos.
-  ## Returns (new position after `]`, Node).  ``base`` is where ``src`` starts
-  ## in the pattern, for the positions errors report.
-  var p = initCcParser(src, pos, flags, stackBase, base)
+  ## Returns (new position after `]`, Node).
+  var p = initCcParser(src, pos, flags, stackBase)
   p.advance() # skip '['
 
   let (negated, atoms) = p.parseCharClassBody()

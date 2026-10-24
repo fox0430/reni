@@ -117,20 +117,27 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     # nkAnchor, nkNamedBackref — no transformation needed
     node
 
-proc resolveForwardRefConditions(node: Node, namedCaptures: seq[(string, int)]) =
-  ## Resolve conditional forward references: when ckRegexCond has a condName
-  ## matching a named capture, convert it to ckNamedRef.
+proc hasGroupName(namedCaptures: seq[(string, int)], name: string): bool =
+  for (n, _) in namedCaptures:
+    if n == name:
+      return true
+  false
+
+proc resolveBareNameConditions(node: Node, namedCaptures: seq[(string, int)]): bool =
+  ## Turn each condition whose text is a group's name, ``(?(n)...)``, into a
+  ## reference to that group, wherever the group is: reni's own spelling.
+  ## The parser read every such condition as a pattern, as Oniguruma does.
+  ## True when any became a reference.
   if node == nil:
-    return
+    return false
   if node.kind == nkConditional and node.condKind == ckRegexCond and
-      node.condRefName.len > 0:
-    for (name, _) in namedCaptures:
-      if name == node.condRefName:
-        node.condKind = ckNamedRef
-        node.condBody = nil
-        break
+      node.condRefName.len > 0 and namedCaptures.hasGroupName(node.condRefName):
+    node.condKind = ckNamedRef
+    node.condBody = nil
+    result = true
   for child in node.childNodes:
-    resolveForwardRefConditions(child, namedCaptures)
+    if resolveBareNameConditions(child, namedCaptures):
+      result = true
 
 proc validateUtf8(s: string) =
   ## Check that the pattern string is valid UTF-8.
@@ -291,6 +298,10 @@ proc hasRecursiveCycle(
     else:
       hasRecursiveCycle(startIdx, node.quantBody, bodies, namedCaptures, visiting)
   of nkConditional:
+    # A pattern condition runs first, whichever branch follows.
+    if node.condKind == ckRegexCond and
+        hasRecursiveCycle(startIdx, node.condBody, bodies, namedCaptures, visiting):
+      return true
     if node.condYes != nil and
         hasRecursiveCycle(startIdx, node.condYes, bodies, namedCaptures, visiting):
       if node.condNo != nil:
@@ -481,12 +492,7 @@ proc validateNumericRefs(
       )
   of nkSubexpCall:
     if node.callName.len > 0:
-      var found = false
-      for (n, _) in namedCaptures:
-        if n == node.callName:
-          found = true
-          break
-      if not found:
+      if not namedCaptures.hasGroupName(node.callName):
         raise newException(
           RegexError, "undefined name reference '\\g<" & node.callName & ">'"
         )
@@ -496,12 +502,7 @@ proc validateNumericRefs(
         raise
           newException(RegexError, "invalid subexp call '\\g<" & $node.callIndex & ">'")
   of nkNamedBackref:
-    var found = false
-    for (n, _) in namedCaptures:
-      if n == node.backrefName:
-        found = true
-        break
-    if not found:
+    if not namedCaptures.hasGroupName(node.backrefName):
       raise newException(
         RegexError, "undefined name reference '\\k<" & node.backrefName & ">'"
       )
@@ -513,12 +514,7 @@ proc validateNumericRefs(
           "invalid conditional group reference '(" & $node.condRefIndex & ")'",
         )
     elif node.condKind == ckNamedRef:
-      var found = false
-      for (n, _) in namedCaptures:
-        if n == node.condRefName:
-          found = true
-          break
-      if not found:
+      if not namedCaptures.hasGroupName(node.condRefName):
         raise newException(
           RegexError,
           "undefined name reference in conditional '" & node.condRefName & "'",
@@ -2825,9 +2821,15 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     flattenLiteralGroups(ast)
   var namedCaptures = p.namedCaptures
   var captureCount = p.captureCount
-  # Resolve forward reference conditionals now that all named captures are known
-  if namedCaptures.len > 0:
-    resolveForwardRefConditions(ast, namedCaptures)
+  # Bare-name conditions, now that every group name is known.  One that
+  # becomes a reference reads its group.
+  if p.sawBareNameCondition and namedCaptures.len > 0:
+    if resolveBareNameConditions(ast, namedCaptures):
+      p.sawGroupRead = true
+  # A bare name with no branch has to have been a reference (``(?(n))``).
+  for (name, at) in p.branchlessNames:
+    if not namedCaptures.hasGroupName(name):
+      raise newException(RegexError, "invalid if-else syntax at position " & $at)
   # When named captures exist, demote unnamed captures to non-capturing groups
   # (Oniguruma default behavior: unnamed groups don't capture when named groups present)
   if namedCaptures.len > 0 and rfCaptureGroup notin flags:

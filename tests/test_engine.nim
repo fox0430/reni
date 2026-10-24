@@ -1177,8 +1177,8 @@ suite "Conditionals":
 
   # Every expectation from here to the end of the false-condition group was
   # read off Oniguruma 6.9.10 (ONIG_SYNTAX_ONIGURUMA, UTF-8, onig_search).
-  # Oniguruma has no regex conditions — /(?(?=a))b/ and /(?(a+))b/ are syntax
-  # errors there — so the regex-condition cases below follow PCRE2 instead.
+  # The look-around conditions after it, ``(?(?=a)...)`` and the like, are
+  # reni's own spelling, which Oniguruma rejects, so they follow PCRE2.
   test "backref condition: no else branch skips a non-empty yes branch":
     # Oniguruma matches the empty string at 0 here.
     let m = search("c", re("(a)?(?(1)b)"))
@@ -1287,9 +1287,8 @@ suite "Conditionals":
     check m.boundaries[0] == 0 .. 0
 
   test "regex condition: empty yes branch and no else is skipped":
-    # The empty-yes-branch rule is Oniguruma's, and Oniguruma has no regex
-    # conditions — /(?(?=a))b/ is a syntax error there.  PCRE2 is the only
-    # reference, and it skips the false condition and matches "b".
+    # PCRE2 skips the false condition and matches "b".  Oniguruma rejects this
+    # spelling, and its own one, /(?((?=a)))b/, for having no branch.
     let m = search("b", re("(?(?=a))b"))
     check m.found
     check m.boundaries[0] == 0 .. 1
@@ -1299,15 +1298,20 @@ suite "Conditionals":
     check m.found
     check m.boundaries[0] == 1 .. 2
 
-  test "bare regex condition: empty yes branch and no else is skipped":
-    let m = search("b", re("(?(a+))b"))
-    check m.found
-    check m.boundaries[0] == 0 .. 1
-
-  test "always-false condition: empty yes branch and no else is skipped":
-    let m = search("b", re("(?(*FAIL))b"))
-    check m.found
-    check m.boundaries[0] == 0 .. 1
+  test "only a reference condition may go without a branch":
+    # Oniguruma's -224, invalid if-else syntax: a reference with no branch
+    # tests its group alone, and any other condition needs a branch, if only
+    # an empty one.  A bare name may still name a later group.
+    for pattern in [
+      "(?(a+))b", "(?(a))", "(?((?:a)))b", "(?((?=a)))b", "(?())b", "(?(*FAIL))b",
+      "(?(*COUNT))b", "(?(?{x}))b", "(?(n x))b", "(?<m>a)(?(n))b",
+    ]:
+      check compileError(pattern).startsWith("invalid if-else syntax")
+    check search("ab", re("(?(a)|)b")).matchSpan == 0 .. 2
+    # libonig's search says 1..2: its optimizer takes a conditional with no
+    # else for an empty one.  Its match at 0 says 0..2.
+    check search("ab", re("(?(a)(?#x))b")).matchSpan == 0 .. 2
+    check search("b", re("(?(n))b(?<n>a)|b")).matchSpan == 0 .. 1
 
   test "conditional alternation both branches":
     let m1 = search("ab", re("(a)?(?(1)b|c)"))
@@ -1321,6 +1325,116 @@ suite "Conditionals":
     let m = search("abc", re("(a)(?<x>b)(?(<x>)c|d)"))
     check m.found
     check m.boundaries[0] == 0 .. 3
+
+  test "a condition is a pattern up to the ')' that closes it":
+    # Read off Oniguruma 6.9.10: the condition consumes what it matched, and
+    # a parenthesis inside it is the pattern's.
+    check search("axb", re("(?((?:a)x)b|c)")).matchSpan == 0 .. 3
+    check not search("axb", re("(?((?:ab))b|c)")).found
+    check search("a)b", re("(?(a\\))b|c)")).matchSpan == 0 .. 3
+    check search(")b", re("(?([)])b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(?((?#x)a)b|c)")).matchSpan == 0 .. 2
+    check not search("aab", re("(?(a+)ab|c)")).found
+
+  test "a group in a condition captures and is counted":
+    let m = search("axb", re("(?((a)x)(b)|c)"))
+    check captureText(m, 1, "axb") == some("a")
+    check captureText(m, 2, "axb") == some("b")
+    let m2 = search("bc", re("(?((a)|(b))c|d)"))
+    check captureText(m2, 1, "bc") == none(string)
+    check captureText(m2, 2, "bc") == some("b")
+    check search("aba", re("(?((a))b|c)\\1")).matchSpan == 0 .. 3
+    check search("axa", re("(?((?<n>a)x)\\k<n>|c)")).matchSpan == 0 .. 3
+
+  test "an option set in a condition ends with it":
+    check search("Ab", re("(?((?i)a)b|c)")).matchSpan == 0 .. 2
+    check not search("AB", re("(?((?i)a)b|c)")).found
+    check search("aXB", re("(?((?:a)(?i)x)B|c)")).matchSpan == 0 .. 3
+
+  test "a bare name is a reference to a group before or after it":
+    # reni's own spelling: Oniguruma reads ``(?(a-b)y|z)`` as a pattern.  A
+    # name need not be word characters, in either engine.
+    check search("xy", re("(?<a-b>x)(?(a-b)y|z)")).matchSpan == 0 .. 2
+    check search("zx", re("(?(a-b)y|z)(?<a-b>x)")).matchSpan == 0 .. 2
+    check compileError("(?(a-b))(?<a-b>x)") == ""
+    check compileError("(?<a-b>x)(?(a-b))") == ""
+    # The text is parsed as a pattern first, so a name that is not one fails
+    # there, as the condition does in Oniguruma.
+    check compileError("(?<a[>x)(?(a[)y|z)").startsWith("unterminated character class")
+
+  test "a condition that only starts like a group number is a pattern":
+    # Oniguruma reads ``n``, ``-n`` or ``+n``, a level after it or not, then
+    # ``)`` as a reference, and anything else as a pattern.
+    check search("1ab", re("(?(1a)b|c)")).matchSpan == 0 .. 3
+    check search("-b", re("(?(-)b|c)")).matchSpan == 0 .. 2
+    check search("a1-b", re("(a)(?(1-)b|c)")).matchSpan == 0 .. 4
+    let m = search("ca", re("(?(+1)b|c)(a)"))
+    check m.matchSpan == 0 .. 2
+    check captureText(m, 1, "ca") == some("a")
+
+  test "a condition reference takes level 0 only":
+    # A level tests the group at another depth of recursion.  reni does not
+    # follow that for a condition, so it refuses one rather than answer
+    # differently: Oniguruma finds nothing in ``ab`` for ``(a)(?(1+1)b|c)``.
+    check search("ab", re("(a)(?(1+0)b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(a)(?(1-0)b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(a)(?(-1-0)b|c)")).matchSpan == 0 .. 2
+    for pattern in ["(a)(?(1+1)b|c)", "(a)(?(1-1)b|c)", "(a)(?(+1-2)b|c)(d)"]:
+      check compileError(pattern).startsWith(
+        "a level in a conditional reference is not supported"
+      )
+
+  test "a condition reference in <> or '' reads numbers and levels as a bare one":
+    # Oniguruma reads all three spellings with ``fetch_name_with_level``.
+    check search("ab", re("(a)(?(<-1>)b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(a)(?('-1')b|c)")).matchSpan == 0 .. 2
+    check search("c", re("(a)?(?(<-1>)b|c)")).matchSpan == 0 .. 1
+    let m = search("ca", re("(?(<+1>)b|c)(a)"))
+    check m.matchSpan == 0 .. 2
+    check captureText(m, 1, "ca") == some("a")
+    check search("ab", re("(a)(?(<1+0>)b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(a)(?(<-1-0>)b|c)")).matchSpan == 0 .. 2
+    check search("ab", re("(?<n>a)(?(<n+0>)b|c)")).matchSpan == 0 .. 2
+    check search("c", re("(?<n>a)?(?('n-0')b|c)")).matchSpan == 0 .. 1
+    for pattern in ["(a)(?(<1+1>)b|c)", "(?<n>a)(?('n-1')b|c)"]:
+      check compileError(pattern).startsWith(
+        "a level in a conditional reference is not supported"
+      )
+    # A relative 0 or a number past 32 bits is a name, which no group has:
+    # Oniguruma's -215 and -200.
+    for pattern in ["(a)(?(<+0>)b|c)", "(a)(?('-0')b|c)", "(a)(?(<2147483648>)b|c)"]:
+      check compileError(pattern).startsWith("undefined name reference in conditional")
+
+  test "a look-around condition spelled as a pattern keeps Oniguruma's captures":
+    # Only reni's own ``(?(?!X)`` keeps what ``X`` captured when it matched,
+    # as PCRE2 does; ``(?((?!X))`` is a pattern, and the look-around drops it.
+    let m = search("abc", re("(?((?!(a)))b|\\1)"))
+    check m.matchSpan == 1 .. 2
+    check captureText(m, 1, "abc") == none(string)
+    check not search("a", re("(?((?!(a)))b|\\1)")).found
+    check search("abc", re("(?(?!(a))b|\\1)")).matchSpan == 0 .. 1
+
+  test "a condition in a look-behind is checked as any of its body":
+    check not search("a", re("(?<=(?((?:a))a|b))")).found
+    check search("ax", re("(?<!(?((?:a))a|b))x")).matchSpan == 1 .. 2
+    check search("abx", re("(?<=(?((?<=a))b|c))x")).matchSpan == 2 .. 3
+    check compileError("(?<=(?((?=a))a|b))").startsWith(
+      "invalid pattern in look-behind"
+    )
+
+  test "a regex condition counts toward the length of its conditional":
+    # The condition consumes before the yes branch.  Taken for zero-width, it
+    # made ``(?(a)|)`` fixed at 0 characters, so the look-behind tried one
+    # start only, and it shortened the window ``\Z`` scans.
+    check lengthBounds(re("(?(a)|)").ast, {}) == LenBounds(maxLen: 1, fixedLen: -1)
+    check lengthBounds(re("(?(a)|b)").ast, {}) == LenBounds(maxLen: 1, fixedLen: 1)
+    check lengthBounds(re("(?(?=a)|)").ast, {}) == LenBounds(maxLen: 0, fixedLen: 0)
+    check search("xay", re("(?<=x(?(a)|))y")).matchSpan == 2 .. 3
+    check search("abc", re("(?(ab)c|d)\\Z")).matchSpan == 0 .. 3
+    # libonig 6.9.10 finds nothing in these two, though the conditional can
+    # take its else branch there.
+    check search("xy", re("(?<=x(?(a)|))y")).matchSpan == 1 .. 2
+    check search("cy", re("(?<=(?(a)b|c))y")).matchSpan == 1 .. 2
 
   test "a callout condition holds as the callout does":
     # Read off Oniguruma 6.9.10: the callout is the condition, so only
@@ -4182,6 +4296,17 @@ suite "Mutual recursion detection":
   test "recursion after an inverted range is detected before a consumer":
     expect RegexError:
       discard re("(?<a>b{2,0}(?&a)c)")
+
+  test "recursion in a pattern condition detected":
+    # The condition runs before either branch.  Oniguruma: -221.
+    expect RegexError:
+      discard re("(?<n>(?(\\g<n>)a|b))")
+    check search("b", re("(?<n>(?(x\\g<n>)a|b))")).matchSpan == 0 .. 1
+
+  test "a call that consumes keeps a conditional's branch off the start":
+    # ``\\g<m>`` consumes ``x``, so the no branch calls ``n`` past it, as
+    # Oniguruma reads it too.
+    check not search("xb", re("(?<n>(?(a)b|\\g<m>\\g<n>))(?<m>x)")).found
 
   test "recursion behind a conditional with no else branch detected":
     # /(?(<a>)x)/ matches empty when the condition is false, so \g<a> is

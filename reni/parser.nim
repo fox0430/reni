@@ -6,10 +6,6 @@ import types, charclass, unicode_utils, stackguard
 type Parser* = object
   src: string
   pos: int
-  base: int
-    ## Where ``src`` starts in the pattern.  A bare-name condition is parsed
-    ## from its own text (see ``parseConditional``), and its parser reports
-    ## ``pos + base`` so that its positions are the pattern's.
   flags: RegexFlags
   captureCount*: int
   namedCaptures*: seq[(string, int)]
@@ -40,6 +36,13 @@ type Parser* = object
     ## True once a backreference, or a conditional that reads a group or may
     ## (see ``parseConditional``), has been parsed, so the compiler can skip
     ## ``markGroupReads`` when nothing reads a group.
+  sawBareNameCondition*: bool
+    ## True once a condition whose text may be a group's name has been parsed,
+    ## so the compiler can skip ``resolveBareNameConditions`` without one.
+  branchlessNames*: seq[(string, int)]
+    ## Each bare-name condition with no branch, ``(?(n))``, and where the
+    ## ``)`` after it is.  The name has to be a group's, which ``re`` checks
+    ## once every group is known.
 
 const
   MaxNestingDepth = 256
@@ -87,7 +90,7 @@ proc advanceRune(p: var Parser): Rune =
   r
 
 proc error(p: Parser, msg: string, at: int) {.noreturn.} =
-  raise newException(RegexError, msg & " at position " & $(at + p.base))
+  raise newException(RegexError, msg & " at position " & $at)
 
 proc error(p: Parser, msg: string) {.noreturn.} =
   p.error(msg, p.pos)
@@ -107,6 +110,103 @@ proc relativeForwardIndex(p: Parser, index: int): int =
   if index > high(int) - p.captureCount:
     p.error("relative capture reference is too large")
   p.captureCount + index
+
+type
+  GroupRefKind = enum
+    grNumber ## ``n``
+    grRelative ## ``-n`` or ``+n``
+    grName
+
+  GroupRef = object ## A reference to a group, as [readGroupRef] reads it.
+    kind: GroupRefKind
+    number: int ## signed for grRelative
+    name: string ## for grName
+    level: int ## signed; 0 when there is none
+    leveled: bool
+    levelAt: int ## where the level's sign is in the text
+
+proc scanGroupNumber(text: string, i: var int, value: var int): bool =
+  ## Read the digits at ``i`` into ``value``.  False when there are none, or
+  ## when they pass ``high(int32)``, where Oniguruma's ``scan_number`` gives up.
+  let start = i
+  value = 0
+  while i < text.len and text[i] in {'0' .. '9'}:
+    let digit = ord(text[i]) - ord('0')
+    if value > (high(int32) - digit) div 10:
+      return false
+    value = value * 10 + digit
+    inc i
+  i > start
+
+proc readLevel(text: string, at: int, r: var GroupRef): bool =
+  ## Read the level whose sign is at ``at`` into ``r``, if digits alone run
+  ## from there to the end of ``text``.
+  var i = at + 1
+  var level: int
+  if not scanGroupNumber(text, i, level) or i != text.len:
+    return false
+  r.level =
+    if text[at] == '-':
+      -level
+    else:
+      level
+  r.leveled = true
+  r.levelAt = at
+  true
+
+proc readGroupRef(text: string): GroupRef =
+  ## Read ``text``, what stands between the delimiters of ``\k<...>`` or of a
+  ## condition, as Oniguruma's ``fetch_name_with_level`` does: a number ``n``,
+  ## ``-n`` or ``+n``, or a name, then perhaps a level ``+n`` or ``-n``.  Any
+  ## other text is a name whole, since a name need not be word characters
+  ## (``(?<a-b>x)``).  Oniguruma rejects a relative ``±0``, a number past
+  ## ``high(int32)`` and ``1a``; as names no group has, they fail here too.
+  let signed = text.len > 0 and text[0] in {'-', '+'}
+  var i = ord(signed)
+  var number: int
+  if scanGroupNumber(text, i, number) and not (signed and number == 0):
+    result = GroupRef(
+      kind: if signed: grRelative else: grNumber,
+      number:
+        if text[0] == '-':
+          -number
+        else:
+          number,
+    )
+    if i == text.len or (text[i] in {'-', '+'} and text.readLevel(i, result)):
+      return
+  result = GroupRef(kind: grName, name: text)
+  for at in 1 ..< text.len:
+    if text[at] in {'-', '+'}:
+      if text.readLevel(at, result):
+        result.name = text[0 ..< at]
+      break
+
+proc readBareGroupRef(p: var Parser, r: var GroupRef): bool =
+  ## Read the condition at ``p.pos`` and the ``)`` after it if it is a group
+  ## number with no delimiters, as [readGroupRef] reads one.  Oniguruma reads
+  ## any other condition as a pattern, so ``(?(1a)``, ``(?(-)``, ``(?(1+)``
+  ## and ``(?(2147483648)`` match their own text.
+  var i = p.pos
+  while i < p.src.len and p.src[i] in {'0' .. '9', '-', '+'}:
+    inc i
+  if i == p.src.len or p.src[i] != ')':
+    return false
+  r = readGroupRef(p.src[p.pos ..< i])
+  if r.kind == grName:
+    return false
+  p.pos = i + 1
+  true
+
+proc groupIndex(p: Parser, r: GroupRef): int =
+  ## The number of the group ``r`` refers to by number.  A relative one counts
+  ## from the groups opened so far: ``-1`` is the last, ``+1`` the next.
+  if r.kind == grNumber:
+    r.number
+  elif r.number < 0:
+    p.captureCount + r.number + 1
+  else:
+    p.relativeForwardIndex(r.number)
 
 proc charToFlag(ch: char): RegexFlag =
   case ch
@@ -668,80 +768,25 @@ proc parseEscape(p: var Parser): Node =
       p.error("expected '<' or '\\'' after '\\k'")
     if name.len == 0:
       p.error("empty backreference name")
-    # Handle numeric, relative, and level-suffix backrefs
-    # Parse +level or -level suffix (e.g., \k<1+3> → index=1, level=3)
-    var baseName = name
-    var level = 0
-    var leveled = false
-    let plusPos = name.find('+', start = 1)
-      # skip first char (could be +/- for relative ref)
-    let minusPos = name.find('-', start = 1)
-    var levelPos = -1
-    if plusPos > 0 and (minusPos < 0 or plusPos < minusPos):
-      levelPos = plusPos
-    elif minusPos > 0:
-      levelPos = minusPos
-    if levelPos > 0:
-      let levelStr = name[levelPos + 1 .. ^1]
-      var isLevelNum = levelStr.len > 0
-      for c in levelStr:
-        if c notin {'0' .. '9'}:
-          isLevelNum = false
-          break
-      if isLevelNum:
-        leveled = true
-        for c in levelStr:
-          appendDecimal(level, c)
-        if name[levelPos] == '-':
-          level = -level
-        baseName = name[0 ..< levelPos]
-    # Check if it's a numeric or relative reference
-    if baseName.len > 0 and (baseName[0] in {'0' .. '9'} or baseName[0] in {'+', '-'}):
-      var neg = false
-      var startIdx = 0
-      if baseName[0] == '+':
-        startIdx = 1
-      elif baseName[0] == '-':
-        neg = true
-        startIdx = 1
-      var isNum = true
-      for i in startIdx ..< baseName.len:
-        if baseName[i] notin {'0' .. '9'}:
-          isNum = false
-          break
-      if isNum and baseName.len > startIdx:
-        var idx = 0
-        for i in startIdx ..< baseName.len:
-          appendDecimal(idx, baseName[i])
-        if neg:
-          let origN = idx
-          idx = p.captureCount - idx + 1
-          if idx < 1:
-            p.error("invalid relative backref '\\k<-" & $origN & ">'")
-        elif baseName[0] == '+':
-          idx = p.relativeForwardIndex(idx)
-          # Forward reference — bounds checked at compile time.
-        result = Node(
-          kind: nkBackreference,
-          backrefIndex: idx,
-          backrefLevel: level,
-          backrefLeveled: leveled,
-        )
-      else:
-        result = Node(
-          kind: nkNamedBackref,
-          backrefName: baseName,
-          namedBackrefLevel: level,
-          namedBackrefLeveled: leveled,
-          backrefScope: int32(p.namedCaptures.len),
-        )
-    else:
+    let r = readGroupRef(name)
+    if r.kind == grName:
       result = Node(
         kind: nkNamedBackref,
-        backrefName: baseName,
-        namedBackrefLevel: level,
-        namedBackrefLeveled: leveled,
+        backrefName: r.name,
+        namedBackrefLevel: r.level,
+        namedBackrefLeveled: r.leveled,
         backrefScope: int32(p.namedCaptures.len),
+      )
+    else:
+      # A forward reference is bounds-checked at compile time.
+      let idx = p.groupIndex(r)
+      if idx < 1 and r.kind == grRelative:
+        p.error("invalid relative backref '\\k<" & $r.number & ">'")
+      result = Node(
+        kind: nkBackreference,
+        backrefIndex: idx,
+        backrefLevel: r.level,
+        backrefLeveled: r.leveled,
       )
     p.sawGroupRead = true
   of 'g':
@@ -911,39 +956,41 @@ proc parseCalloutVerb(p: var Parser): Node =
       p.error("undefined callout name '" & verbName & "'")
     Node(kind: nkGroup, groupBody: Node(kind: nkConcat, children: @[]))
 
-proc resolveCondRef(
-    name: string,
+proc setConditionRef(
+    p: Parser,
+    r: GroupRef,
+    textStart: int,
     condKind: var ConditionalKind,
     condIndex: var int,
     condName: var string,
 ) =
-  ## Parse a conditional reference name as either a numeric backref or named ref.
-  var isNum = true
-  for c in name:
-    if c notin {'0' .. '9'}:
-      isNum = false
-      break
-  if isNum and name.len > 0:
-    condKind = ckBackref
-    condIndex = 0
-    for c in name:
-      appendDecimal(condIndex, c)
-  else:
+  ## Make the condition the reference ``r``, read from the text at
+  ## ``textStart``, delimited or not.
+  # A level tests the group at another depth of recursion, which reni does
+  # not follow for a condition, so only level 0, the group itself, is read.
+  if r.level != 0:
+    p.error(
+      "a level in a conditional reference is not supported", textStart + r.levelAt
+    )
+  if r.kind == grName:
     condKind = ckNamedRef
-    condName = name
+    condName = r.name
+  else:
+    condKind = ckBackref
+    condIndex = p.groupIndex(r)
+    if condIndex < 1 and r.kind == grRelative:
+      p.error("invalid relative conditional reference '(?(" & $r.number & "))'")
 
 # Forward declarations
 proc parseGroup(p: var Parser): Node
 proc parseAlternation(p: var Parser): Node
 
 proc recordStart(p: Parser, node: Node, start: int) =
-  ## Write where ``node``, which starts at ``start`` in ``p.src``, starts in the
-  ## pattern into [patternPos], for the error ``validateLookbehinds`` raises.
-  ## An offset past ``high(int32)`` stays unrecorded, and the error there has
-  ## no position.
-  let offset = start + p.base
-  if offset <= high(int32):
-    node.patternPos = int32(offset)
+  ## Write ``start``, where ``node`` starts in the pattern, into [patternPos],
+  ## for the error ``validateLookbehinds`` raises.  An offset past
+  ## ``high(int32)`` stays unrecorded, and the error there has no position.
+  if start <= high(int32):
+    node.patternPos = int32(start)
 
 proc parseAtom(p: var Parser): Node =
   if p.atEnd:
@@ -979,7 +1026,7 @@ proc parseAtom(p: var Parser): Node =
     p.advance()
     result = Node(kind: nkAnchor, anchor: akLineEnd)
   of '[':
-    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase, p.base)
+    let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase)
     p.pos = newPos
     result = node
   of ')', '|':
@@ -1204,11 +1251,14 @@ proc parseConditional(p: var Parser): Node =
   ## Parse a conditional group: (?(condition)yes|no).
   ## Called after '(', '?', '(' have been consumed.
   let condStart = p.pos - 1 # the '(' a look-around condition starts with
+  # An isolated ``(?i)`` in the condition ends with it, as in any group.
+  let outerFlags = p.flags
   var condKind: ConditionalKind
   var condIndex: int
   var condName: string
-  var condNameStart = 0 # where a bare name starts, which its parser reads
   var condBodyNode: Node = nil
+  var lookaroundSpelled = false # ``(?(?=a)``, reni's own spelling
+  var bareRef: GroupRef
   # A name in ``<>`` or ``''`` reads the groups opened before it, as a
   # ``\k<name>`` does; a bare one, not Oniguruma's spelling, every group.
   var condScope = EveryNamedGroup
@@ -1239,6 +1289,8 @@ proc parseConditional(p: var Parser): Node =
       condKind = ckRegexCond
       condIndex = -1
       condBodyNode = Node(kind: nkLookaround, lookKind: lookKind, lookBody: lookBody)
+      p.recordStart(condBodyNode, condStart)
+      lookaroundSpelled = true
     elif p.peek == '<' and p.pos + 1 < p.src.len and p.src[p.pos + 1] in {'=', '!'}:
       p.advance()
       let lookKind = if p.peek == '=': lkBehind else: lkNegBehind
@@ -1248,6 +1300,8 @@ proc parseConditional(p: var Parser): Node =
       condKind = ckRegexCond
       condIndex = -1
       condBodyNode = Node(kind: nkLookaround, lookKind: lookKind, lookBody: lookBody)
+      p.recordStart(condBodyNode, condStart)
+      lookaroundSpelled = true
     else:
       # Oniguruma reads this ``?`` as a repeat with nothing before it, as it
       # does the ``(?(?=`` and ``(?(?<=`` reni keeps above.
@@ -1264,6 +1318,7 @@ proc parseConditional(p: var Parser): Node =
     else:
       condKind = ckRegexCond
       condBodyNode = verb
+      p.recordStart(condBodyNode, condStart)
   elif p.peek == '{':
     p.advance()
     var depth = 1
@@ -1276,80 +1331,45 @@ proc parseConditional(p: var Parser): Node =
     condKind = ckAlwaysTrue
     condIndex = -1
     p.expect(')')
-  elif p.peek == '<':
+  elif p.peek in {'<', '\''}:
+    let close = if p.peek == '<': '>' else: '\''
     p.advance()
-    var name = ""
-    while not p.atEnd and p.peek != '>':
-      name.add(p.peek)
+    let textStart = p.pos
+    while not p.atEnd and p.peek != close:
       p.advance()
-    p.expect('>')
+    let text = p.src[textStart ..< p.pos]
+    p.expect(close)
     p.expect(')')
-    resolveCondRef(name, condKind, condIndex, condName)
+    p.setConditionRef(readGroupRef(text), textStart, condKind, condIndex, condName)
     condScope = int32(p.namedCaptures.len)
-  elif p.peek == '\'':
-    p.advance()
-    var name = ""
-    while not p.atEnd and p.peek != '\'':
-      name.add(p.peek)
-      p.advance()
-    p.expect('\'')
-    p.expect(')')
-    resolveCondRef(name, condKind, condIndex, condName)
-    condScope = int32(p.namedCaptures.len)
-  elif p.peek in {'0' .. '9'} or p.peek == '-':
-    var neg = false
-    if p.peek == '-':
-      neg = true
-      p.advance()
-    var numStr = ""
-    while p.peek in {'0' .. '9'}:
-      numStr.add(p.peek)
-      p.advance()
-    if p.peek == '+':
-      p.advance()
-      while p.peek in {'0' .. '9'}:
-        p.advance()
-    p.expect(')')
-    condKind = ckBackref
-    condIndex = 0
-    for c in numStr:
-      appendDecimal(condIndex, c)
-    if neg:
-      let origN = condIndex
-      condIndex = p.captureCount - condIndex + 1
-      if condIndex < 1:
-        p.error("invalid relative conditional reference '(?(-" & $origN & "))'")
+  elif p.readBareGroupRef(bareRef):
+    p.setConditionRef(bareRef, condStart + 1, condKind, condIndex, condName)
   else:
-    condNameStart = p.pos
-    var name = ""
-    while not p.atEnd and p.peek != ')':
-      name.add(p.peek)
-      p.advance()
+    # Any other condition is a pattern, up to the ``)`` that closes it, as in
+    # Oniguruma: ``(?((a)x)b|c)`` matches ``axb`` and sets group 1.
+    let textStart = p.pos
+    condKind = ckRegexCond
+    condIndex = -1
+    condBodyNode = p.parseRegex()
     p.expect(')')
-    if name.len == 0:
-      condKind = ckAlwaysTrue
-      condIndex = -1
-    else:
-      var isNamedCapture = false
-      for (cn, _) in p.namedCaptures:
-        if cn == name:
-          isNamedCapture = true
-          break
-      if isNamedCapture:
-        condKind = ckNamedRef
-        condName = name
-      else:
-        condKind = ckRegexCond
-        condName = name
+    # A look-around alone is still a pattern here, not reni's own ``(?(?!X)``
+    # spelling, whose captures ``condHolds`` keeps the PCRE2 way.
+    if condBodyNode.kind == nkLookaround:
+      condBodyNode = Node(kind: nkGroup, groupBody: condBodyNode)
+    # Text with no ``)`` of its own may be a group's name, which is reni's own
+    # spelling of a reference to that group, before or after it.
+    # ``resolveBareNameConditions`` decides once every group is known.
+    if p.src.find(')', textStart) == p.pos - 1:
+      condName = p.src[textStart ..< p.pos - 1]
+  p.flags = outerFlags
 
-  if condBodyNode != nil:
-    p.recordStart(condBodyNode, condStart)
-  elif condKind == ckRegexCond:
-    var condParser = initParser(condName, p.flags)
-    condParser.base = p.base + condNameStart
-    # Shares the outer budget; runs on top of already-spent frames.
-    condParser.stackBase = p.stackBase
-    condBodyNode = condParser.parseRegex()
+  # Only a reference may go without a branch, and then it tests its group
+  # alone (``(?(1))``).  A bare name may still be one.  The look-around
+  # spelling follows PCRE2, which lets it go without.
+  if p.peek == ')' and condKind notin {ckBackref, ckNamedRef} and not lookaroundSpelled:
+    if condName.len == 0:
+      p.error("invalid if-else syntax") # Oniguruma's -224
+    p.branchlessNames.add((condName, p.pos))
 
   let yesStart = p.pos
   var yes = p.parseConcat()
@@ -1365,12 +1385,13 @@ proc parseConditional(p: var Parser): Node =
   if p.peek == '|':
     p.advance()
     no = p.parseRegex()
-  # A bare name no group has yet may name a later one, which
-  # ``resolveForwardRefConditions`` turns into a ``ckNamedRef``.  Every other
+  # A bare name may name a group, which ``resolveBareNameConditions`` turns
+  # into a ``ckNamedRef``, saying then that it reads one.  Every other
   # condition reads no group of its own.
-  if condKind in {ckBackref, ckNamedRef} or
-      (condKind == ckRegexCond and condName.len > 0):
+  if condKind in {ckBackref, ckNamedRef}:
     p.sawGroupRead = true
+  elif condKind == ckRegexCond and condName.len > 0:
+    p.sawBareNameCondition = true
   if condIndex > high(int32):
     # No group has that number; said here, as the node keeps 32 bits of it.
     p.error("invalid conditional group reference '(" & $condIndex & ")'")
@@ -1393,9 +1414,8 @@ proc parseGroup(p: var Parser): Node =
   # Level cap is a complexity limit; this is the resource guard.
   # Parser levels are cheap, so check every level.
   if stackUsedFrom(p.stackBase) > MaxStackBytes:
-    raise newException(
-      RegexLimitError, "parse stack budget exceeded at position " & $(p.pos + p.base)
-    )
+    raise
+      newException(RegexLimitError, "parse stack budget exceeded at position " & $p.pos)
 
   let savedFlags = p.flags
   # Only ``(?:...)`` and ``(?flags:...)`` wrap without ending the run of

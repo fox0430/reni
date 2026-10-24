@@ -57,7 +57,6 @@ suite "capture-group compile option":
       "\\g<+" & huge & ">",
       "(?" & huge & ")",
       "(?+" & huge & ")",
-      "(?(" & huge & ")a|b)",
       "(?('" & huge & "')a|b)",
       "(*MAX{" & huge & "})",
       "\\k<+" & $high(int) & ">",
@@ -67,6 +66,9 @@ suite "capture-group compile option":
       checkpoint(suffix)
       expect RegexError:
         discard re("(a)(?<name>b)" & suffix, {rfCaptureGroup})
+    # A condition number that large is a pattern, as in Oniguruma.
+    let cond = re("(a)(?<name>b)(?(" & huge & ")a|b)", {rfCaptureGroup})
+    check search("abb", cond).matchSpan == 0 .. 3
 
   test "long plain numeric escapes retain their octal fallback":
     let digits = "1".repeat(100)
