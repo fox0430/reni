@@ -841,25 +841,34 @@ proc simpleFold*(r: Rune): Rune =
   simpleCaseFold(r)
 
 static:
-  doAssert MultiCharFolds.len <= 32, "MultiCharFoldLeadMasks holds one bit per fold"
+  for f in MultiCharFolds:
+    doAssert f.len >= 2,
+      "MultiCharFoldNextMasks reads every expansion's second character"
 
-const MultiCharFoldLeadMasks*: array[256, uint32] = block:
-  ## Bit ``i`` of entry ``b`` is set when ``MultiCharFolds[i]``'s expansion
-  ## can start at a subject character whose first byte is ``b``: one sharing
-  ## its first character's simple case fold, as [nextCharAt] reads it.  That
-  ## reading checks neither continuation bytes nor overlong forms, so ``b``
-  ## stands for every code point its payload bits lead (``\xE0\x85\xBF`` is
-  ## ſ), and for its own value when the sequence is truncated.
-  ## [MultiCharFoldStarts] answers the same of a code point, without the fold.
-  var masks: array[256, uint32]
+proc multiCharFoldMasks(k: int): array[256, uint32] =
+  ## Bit ``i`` of entry ``b`` is set when character ``k`` of
+  ## ``MultiCharFolds[i]``'s expansion can stand at a subject character whose
+  ## first byte is ``b``: one sharing its simple case fold, as [nextCharAt]
+  ## reads it.  That reading checks neither continuation bytes nor overlong
+  ## forms, so ``b`` stands for every code point its payload bits lead
+  ## (``\xE0\x85\xBF`` is ſ), and for its own value when the sequence is
+  ## truncated.
   for b in 0'i32 .. 255'i32:
     let n = encLen(uint8(b))
     for i, f in MultiCharFolds:
-      for v in caseFoldVariants(Rune(f.expansion[0])):
+      for v in caseFoldVariants(Rune(f.expansion[k])):
         let cp = int32(v)
         if cp == b or (n > 1 and cp shr (6 * (n - 1)) == (b and (0x7F'i32 shr n))):
-          masks[b] = masks[b] or (1'u32 shl i)
-  masks
+          result[b] = result[b] or (1'u32 shl i)
+
+const MultiCharFoldLeadMasks*: array[256, uint32] = multiCharFoldMasks(0)
+  ## Per subject byte, the folds whose expansion can start at a character it
+  ## leads; see [multiCharFoldMasks].  [MultiCharFoldStarts] answers the same
+  ## of a code point, without the fold.
+
+const MultiCharFoldNextMasks*: array[256, uint32] = multiCharFoldMasks(1)
+  ## Per subject byte, the folds whose expansion's second character can be
+  ## one it leads; see [multiCharFoldMasks].  Every expansion has one.
 
 proc getMultiCharFold*(r: Rune): RuneBuf =
   ## The multi-character case fold expansion of ``r``, or ``len == 0`` when it

@@ -4888,6 +4888,104 @@ suite "a class under (?i) answered from what it holds":
     check not search("\xE2\x84\xAAx", re("(?i)(?<![a-z])x")).found
     check search("ssx", re("(?i)(?<=[\xC3\x9F])x")).matchSpan == 2 .. 3
 
+suite "a class under (?i) tries one character before a fold expansion":
+  # Where a class can take one character or a multi-character fold (ß for
+  # "ss", ﬁ for "fi"), Oniguruma takes the character first and reaches the
+  # expansions only by backtracking, in code-point order.  ``(?I)`` expands
+  # no member at all.  Each row is every group's span from a forward search /
+  # from a backward search, all libonig 6.9.10's.  One test for all of
+  # them: each ``test`` costs four module-level globals, and this file is
+  # near ``refc``'s limit.
+  proc spans(subject, pattern: string): string =
+    let r = re(pattern)
+    var parts: seq[string]
+    for m in [search(subject, r), searchBackward(subject, r)]:
+      if m.found:
+        var groups: seq[string]
+        for s in m.boundaries:
+          groups.add(
+            if s.a < 0:
+              "-"
+            else:
+              $s.a & ".." & $s.b
+          )
+        parts.add groups.join(" ")
+      else:
+        parts.add "none"
+    parts.join(" / ")
+
+  proc checkRows(rows: openArray[(string, string, string)]) =
+    for (pattern, subject, want) in rows:
+      checkpoint pattern & " on " & subject.escape
+      check spans(subject, pattern) == want
+
+  # The character first, whatever order the class lists them in.
+  const CharacterFirst = [
+    ("(?i)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?i)[\xC3\x9Fs]", "ss", "0..1 / 1..2"),
+    ("(?i)[s\xC3\x9F]", "Ss", "0..1 / 1..2"),
+    ("(?i)[\\w]", "ss", "0..1 / 1..2"),
+    ("(?i)[\\p{L}]", "ss", "0..1 / 1..2"),
+    ("(?i)[\\x{7f}-\\x{10ffff}]", "ss", "0..1 / 1..2"),
+    ("(?i)[\\w.]", "fi", "0..1 / 1..2"),
+    ("(?i)[\xEF\xAC\x81f]", "fi", "0..1 / 0..1"),
+    ("(?i)[\xEF\xAC\x83f]", "ffi", "0..1 / 1..2"),
+    ("(?i)[\xCE\xB1-\xCF\x89\xCE\x90]+", "\xCE\x99\xCC\x88\xCC\x81", "0..2 / 0..2"),
+    ("(?i)([s\xC3\x9F])", "ss", "0..1 0..1 / 1..2 1..2"),
+  ]
+
+  # Backtracking reaches the expansions, in code-point order.
+  const Backtracking = [
+    ("(?i)[\xC3\x9F]", "ss", "0..2 / 0..2"),
+    ("(?i)[\xEF\xAC\x80\xEF\xAC\x83]", "ffi", "0..2 / 0..2"),
+    ("(?i)[s\xC3\x9F]x", "ssx", "0..3 / 1..3"),
+    ("(?i)\\A[s\xC3\x9F]\\z", "ss", "0..2 / 0..2"),
+    ("(?i)[s\xC3\x9F]$", "ss", "0..2 / 1..2"),
+    ("(?i)[s\xC3\x9F]{2}", "sss", "0..2 / 1..3"),
+    ("(?i)[s\xC3\x9F]{2}$", "sss", "0..3 / 1..3"),
+    ("(?i)[s\xC3\x9F]+?$", "ss", "0..2 / 1..2"),
+  ]
+
+  # An atomic group keeps the first way, the character.
+  const Atomic = [
+    ("(?i)(?>[s\xC3\x9F])", "ss", "0..1 / 1..2"),
+    ("(?i)(?>[s\xC3\x9F])s", "ss", "0..2 / 0..2"),
+    ("(?i)(?>[s\xC3\x9F])$", "ss", "1..2 / 1..2"),
+    ("(?i)[s\xC3\x9F]++s", "sss", "none / none"),
+  ]
+
+  # The order shows under every flag scope.
+  const Scopes = [
+    ("(?iW)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?iW)[\xC3\x9F]", "ss", "0..2 / 0..2"),
+    ("(?iD)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?iS)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?iP)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?i:[s\xC3\x9F])", "ss", "0..1 / 1..2"),
+    ("(?i:[\xC3\x9F])", "ss", "0..2 / 0..2"),
+    ("(?i)(?-i:[s\xC3\x9F])", "ss", "0..1 / 1..2"),
+    ("(?i)(?-i:[\xC3\x9F])", "ss", "none / none"),
+  ]
+
+  # ``(?I)`` expands no member to several characters.
+  const AsciiOnly = [
+    ("(?iI)[\xC3\x9F]", "ss", "none / none"),
+    ("(?iI)[\xEF\xAC\x85]", "st", "none / none"),
+    ("(?iI)(?>[\xC3\x9F])", "ss", "none / none"),
+    ("(?iI)(?<=[\xC3\x9F])x", "ssx", "none / none"),
+    ("(?iI)[s\xC3\x9F]", "ss", "0..1 / 1..2"),
+    ("(?iI)[a-z\xC3\x9F]+", "ss", "0..2 / 1..2"),
+    ("(?iI)[\xC3\x9F]", "\xC3\x9F", "0..2 / 0..2"),
+    ("(?iI)[\xC3\x9F]", "\xE1\xBA\x9E", "none / none"),
+  ]
+
+  test "the character first, the expansions by backtracking, none under (?I)":
+    checkRows(CharacterFirst)
+    checkRows(Backtracking)
+    checkRows(Atomic)
+    checkRows(Scopes)
+    checkRows(AsciiOnly)
+
 suite "an alternation takes no capture snapshot":
   # Backtracking into an alternation does not copy the capture vector back:
   # every capture written after its choice point carries an undo of its own,

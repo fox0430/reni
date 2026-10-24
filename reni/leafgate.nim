@@ -7,9 +7,16 @@
 import std/unicode
 import types, unicode_utils
 
+proc multiCharFoldsApply*(flags: RegexFlags): bool {.inline.} =
+  ## Whether ``flags`` let a character fold to several: ``(?i)``, and not
+  ## ``(?I)``, which folds nothing above U+007F, where every fold source is
+  ## ([foldSourceRunesOf]).
+  rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags
+
 proc classFoldsApply*(node: Node, flags: RegexFlags): bool {.inline.} =
-  ## Whether multi-char folds can apply: positive bracket class under ``(?i)``.
-  rfIgnoreCase in flags and node.bracketClass and not node.negated
+  ## Whether multi-char folds can apply to a class: a positive bracket class
+  ## under [multiCharFoldsApply].
+  multiCharFoldsApply(flags) and node.bracketClass and not node.negated
 
 proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
   ## Whether ``node`` matches at most one way. Single-way bodies allow greedy
@@ -24,9 +31,10 @@ proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
     node.runes.len > 0
   of nkLiteral, nkEscapedLiteral:
     # The second way a literal can match is the multi-character fold, which
-    # only exists under ``(?i)`` and only for a character that has one.
+    # only exists under [multiCharFoldsApply] and only for a character that
+    # has one.
     let r = if node.kind == nkLiteral: node.rune else: node.escapedRune
-    rfIgnoreCase notin flags or getMultiCharFold(r).len == 0
+    not multiCharFoldsApply(flags) or not hasMultiCharFold(r)
   of nkCharClass:
     not classFoldsApply(node, flags)
   else:
@@ -101,16 +109,13 @@ proc buildLeafGates*(nodes: seq[Node], flags: RegexFlags): seq[LeafGate] =
     gate.runnable = leafRunAccepts(node, flags, gate.accept)
     result[i] = gate
 
-static:
-  doAssert MultiCharFolds.len <= 32, "ClassFold.folds holds one bit per fold"
-
 proc classFoldExhaustive(node: Node, flags: RegexFlags): ClassFold =
   ## [ClassFold] of class ``node`` under ``flags``.  Each answer runs the
   ## matcher's own test: ``classHasByte``'s atom walk for every byte below
-  ## 0x80, and the membership test a fold variant of ``classAdvance`` opens
-  ## with for every source in ``MultiCharFolds``.  [classFoldOf] answers
-  ## from it where its shortcut does not reach, and the tests hold the
-  ## shortcut to it.
+  ## 0x80, and for every source in ``MultiCharFolds`` the membership test
+  ## ``classWays`` asks of the atoms where no [ClassFold] stands, unless
+  ## [classFoldsApply] rules them all out.  [classFoldOf] answers from it
+  ## where its shortcut does not reach, and the tests hold the shortcut to it.
   result = ClassFold(flags: flags, derived: true)
   for b in 0'u8 .. 0x7F'u8:
     let r = Rune(int32(b))
@@ -123,6 +128,8 @@ proc classFoldExhaustive(node: Node, flags: RegexFlags): ClassFold =
       ):
         result.ascii.incl b
         break
+  if not classFoldsApply(node, flags):
+    return
   for i, f in MultiCharFolds:
     let src = Rune(f.source)
     for atom in node.atoms:
@@ -208,19 +215,20 @@ proc classFoldOf(node: Node, flags: RegexFlags): ClassFold =
   if not atomsReachNonAscii(node.atoms):
     return
   let plain = flags - {rfIgnoreCase, rfIgnoreCaseAscii}
-  # ``(?I)`` folds nothing above U+007F: no byte reaches K or ſ, and a fold
-  # source is held only as itself.
-  let asciiOnly = rfIgnoreCaseAscii in flags
-  if not asciiOnly:
-    if plainMember(node, Rune(0x212A), plain):
-      result.ascii.incl uint8('k')
-      result.ascii.incl uint8('K')
-    if plainMember(node, Rune(0x017F), plain):
-      result.ascii.incl uint8('s')
-      result.ascii.incl uint8('S')
+  # ``(?I)`` folds nothing above U+007F: no byte reaches K or ſ, and no fold
+  # source expands ([classFoldsApply]).
+  if rfIgnoreCaseAscii in flags:
+    return
+  if plainMember(node, Rune(0x212A), plain):
+    result.ascii.incl uint8('k')
+    result.ascii.incl uint8('K')
+  if plainMember(node, Rune(0x017F), plain):
+    result.ascii.incl uint8('s')
+    result.ascii.incl uint8('S')
+  if not classFoldsApply(node, flags):
+    return
   for i, src in FoldSourceRunesTable:
-    let n = if asciiOnly: 1 else: src.len
-    for k in 0 ..< n:
+    for k in 0 ..< src.len:
       if plainMember(node, Rune(src.runes[k]), plain):
         result.folds = result.folds or (1'u32 shl i)
         break

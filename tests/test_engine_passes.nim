@@ -1,7 +1,7 @@
 import std/[unittest, options, importutils, sequtils, strutils, unicode]
 
 import ../reni
-import ../reni/engine
+import ../reni/engine {.all.}
 import ../reni/types
 import ../reni/unicode_utils
 import ../reni/leafgate {.all.}
@@ -65,6 +65,16 @@ suite "firstCharInfo optimization":
     let r = re("(?i)1")
     check r.firstCharInfo.kind == fcByte
     check r.firstCharInfo.byte == uint8('1')
+
+  test "the hint for a case-insensitive ASCII class leaves fold expansions out":
+    # No ASCII member is a multi-character fold source, so nothing ``[0-9]``
+    # matches starts with ``f`` (ﬁ → "fi"), under ``(?i)`` or ``(?iI)``.
+    for flags in [{rfIgnoreCase}, {rfIgnoreCase, rfIgnoreCaseAscii}]:
+      let r = re("[0-9]", flags)
+      check r.firstCharInfo.kind == fcByteSet
+      check uint8('0') in r.firstCharInfo.bytes
+      check uint8('f') notin r.firstCharInfo.bytes
+      check search("fi\xEF\xAC\x81ss7", r).matchSpan == 7 .. 8
 
 suite "leadRun scan skip":
   # A broken disqualifier silently drops matches, so each is pinned twice:
@@ -1393,6 +1403,33 @@ suite "(?i) class table":
           inc compared
     check compared >= classBodies.len * 32
 
+  test "no fold source counts under (?I) or in a negated class":
+    # ``(?I)`` expands no member to several characters, and a negated class
+    # never expands one; both answers above carry the bit, so pin it here.
+    for (body, flags) in [
+      ("\xC3\x9F", {rfIgnoreCase, rfIgnoreCaseAscii}),
+      ("a-z\xC3\x9F\xEF\xAC\x81", {rfIgnoreCase, rfIgnoreCaseAscii}),
+      ("^\xC3\x9F", {rfIgnoreCase}),
+    ]:
+      let r = re("[" & body & "]")
+      let node = r.nodes[classIds(r)[0].int]
+      check classFoldOf(node, flags).folds == 0
+      check classFoldExhaustive(node, flags).folds == 0
+    let r = re("[\xC3\x9F]")
+    check classFoldOf(r.nodes[classIds(r)[0].int], {rfIgnoreCase}).folds != 0
+
+  test "a literal under (?I) matches one way, as a class there does":
+    # ``literalAdvance`` refuses ß's "ss" under ``(?I)``, so the literal is
+    # single-way there and its repeat leaves no choice per character.
+    var lit: Node
+    for node in re("\xC3\x9F").nodes:
+      if node != nil and node.kind == nkLiteral:
+        lit = node
+    check singleWayLeaf(lit, {rfIgnoreCase, rfIgnoreCaseAscii})
+    check not singleWayLeaf(lit, {rfIgnoreCase})
+    check search("ss\xC3\x9F", re("(?iI)\xC3\x9F+")).matchSpan == 2 .. 4
+    check search("ssa", re("(?i)\xC3\x9F+")).matchSpan == 0 .. 2
+
   test "a pattern without (?i) carries no table, one with it does":
     var r = re("[a-z]x")
     check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) == nil
@@ -1404,6 +1441,62 @@ suite "(?i) class table":
     check classFoldAt(addr r, classIds(r)[0], r.flags + {rfIgnoreCase}) != nil
     r = re("(?i)x")
     check classIds(r).len == 0
+
+  test "without a table the atoms leave open the ways the table does":
+    # Where no table stands under the flags in force, ``classWays`` asks the
+    # atoms which fold sources the class holds, so ``(?i)[a-z]`` at "ss"
+    # leaves no fold way behind, and with it no choice that can only fail.
+    proc ways(r: var Regex, subject: string, id: NodeId): uint32 =
+      let ctx = newMatchContext()
+      resetForRegex(ctx, subject, addr r, DefaultStepLimit, DefaultMaxRecursionDepth)
+      classWays(ctx, r.nodes[id.int])
+
+    var compared, folded = 0
+    for body in classBodies:
+      var on = re("[" & body & "]", {rfIgnoreCase})
+      var off = on
+      off.setClassFolds(@[])
+      for id in classIds(on):
+        for subject in ["ss", "SS", "st", "FFI", "\xCA\xBCn", "sa", "s"]:
+          let want = ways(on, subject, id)
+          check ways(off, subject, id) == want
+          if want != PlainWay:
+            inc folded
+          inc compared
+    check compared >= classBodies.len * 7
+    check folded > 0
+    var r = re("[a-z]", {rfIgnoreCase})
+    r.setClassFolds(@[])
+    check ways(r, "ss", classIds(r)[0]) == PlainWay
+
+  test "a debug build catches a way the leaf cannot take":
+    # ``classAdvance`` trusts ``classWays`` with its fold ways, and
+    # ``leadLeafEnd`` its callers with a single-way leaf.  A debug build asks
+    # again, so a caller that tries every variant fails loudly rather than
+    # expanding ß under ``(?I)``, in a negated class or in one without it.
+    when not defined(release):
+      var sharpS = -1
+      for i, f in MultiCharFolds:
+        if f.source == 0xDF:
+          sharpS = i
+      for (body, flags) in [
+        ("\xC3\x9F", {rfIgnoreCase, rfIgnoreCaseAscii}),
+        ("^\xC3\x9F", {rfIgnoreCase}),
+        ("a-z", {rfIgnoreCase}),
+        ("\xC3\x9F", {rfIgnoreCase}),
+      ]:
+        var r = re("[" & body & "]", flags)
+        let ctx = newMatchContext()
+        let subject = "ss"
+        resetForRegex(ctx, subject, addr r, DefaultStepLimit, DefaultMaxRecursionDepth)
+        let node = r.nodes[classIds(r)[0].int]
+        if classWays(ctx, node) == PlainWay:
+          expect AssertionDefect:
+            discard classAdvance(ctx, node, sharpS + 1)
+        else:
+          check classAdvance(ctx, node, sharpS + 1) == 2
+          expect AssertionDefect:
+            discard leadLeafEnd(ctx, node)
 
   test "the table answers what the atoms answer":
     # The test above holds the table to ``classFoldExhaustive``; this one

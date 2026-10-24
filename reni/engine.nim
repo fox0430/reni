@@ -401,7 +401,7 @@ type
           ## asserts it finds again; see [altCheckPush].
     of chLeafVariant:
       lNode: NodeId
-      lVariant: int32 ## next way to try
+      lWays: uint32 ## the ways left to try, as [leafWays] numbers them
       lCont: ContId
       lFramesLen: int32
       lPos: int
@@ -1430,8 +1430,12 @@ proc matchBytes(ctx: MatchContext, target: Rune, p: int): int {.inline.} =
   else:
     matchEncodedBytes(ctx, target, p)
 
-const LiteralVariants = 2
-  ## Ways one literal can match: direct compare plus ``(?i)`` multi-char fold.
+const
+  PlainWay = 1'u32
+    ## A leaf's first way, its own character: bit 0 of a ways mask, as
+    ## [leafWays] numbers them.
+  LiteralWays = 0b11'u32
+    ## Ways one literal can match: direct compare plus ``(?i)`` multi-char fold.
 
 proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
   ## End offset of the ``variant``-th way ``target`` matches at ``ctx.pos``,
@@ -1460,7 +1464,7 @@ proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
   if variant != 1:
     return -1
   # Multi-char fold: pattern char folds to multiple chars (e.g., ß → ss)
-  if rfIgnoreCaseAscii in ctx.flags and int32(target) > 127:
+  if not multiCharFoldsApply(ctx.flags):
     return -1
   let fold = getMultiCharFold(target)
   if fold.len == 0:
@@ -1538,7 +1542,7 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
       continue
 
     # Try forward multi-char fold: pattern char folds to multiple subject chars (e.g., ß → ss)
-    if rfIgnoreCaseAscii notin ctx.flags or int32(target) <= 127:
+    if multiCharFoldsApply(ctx.flags):
       let fold = getMultiCharFold(target)
       if fold.len > 0:
         p = posBeforeSubjChar
@@ -1560,7 +1564,7 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
 
     # Try reverse multi-char fold: subject char folds to consecutive pattern chars
     # e.g., subject "ß" matches pattern "ss" because ß full-folds to ss
-    if rfIgnoreCaseAscii notin ctx.flags:
+    if multiCharFoldsApply(ctx.flags):
       let fold = getMultiCharFold(r)
       if fold.len > 0 and i + fold.len <= runes.len:
         var matched = true
@@ -1806,45 +1810,96 @@ proc classFoldOf(ctx: MatchContext, node: Node): ptr ClassFold {.inline.} =
   ## else nil.
   classFoldAt(ctx.regex, node.id, ctx.flags)
 
-proc foldSourceHeld(ctx: MatchContext, node: Node): bool {.noinline.} =
-  ## Whether the class may hold a multi-character fold source: false only
-  ## when its [ClassFold] says it holds none.  Out of line: inline in
-  ## [classFirstVariant], the read measured up to 1% more ``Ir`` on bench
-  ## items without ``(?i)``, through ``runMachine`` and ``matchWithCont``.
-  let cf = classFoldOf(ctx, node)
+proc foldSourceHeld(cf: ptr ClassFold): bool {.inline.} =
+  ## Whether a class whose [ClassFold] is ``cf`` may hold a multi-character
+  ## fold source: false only when ``cf`` says it holds none.  ``nil``, no
+  ## [ClassFold] under the flags in force, says nothing.
   cf == nil or cf.folds != 0
 
 proc classFoldsLive(ctx: MatchContext, node: Node): bool {.inline.} =
   ## [classFoldsApply], narrowed by the [ClassFold]: a class holding no
   ## multi-character fold source has the plain way alone, though ``(?i)``
   ## applies to it.
-  classFoldsApply(ctx, node) and foldSourceHeld(ctx, node)
+  classFoldsApply(ctx, node) and foldSourceHeld(classFoldOf(ctx, node))
 
-proc classFirstVariant(ctx: MatchContext, node: Node): int {.inline.} =
-  ## First variant for ``classAdvance``: folds first, else plain match.
-  if classFoldsLive(ctx, node): 0 else: MultiCharFolds.len
-
-proc foldVariantEnd(
-    ctx: MatchContext, node: Node, variant: int, cf: ptr ClassFold
-): int {.noinline.} =
-  ## End offset of [classAdvance]'s fold ``variant`` from ``ctx.pos``, or -1,
-  ## once the lead byte there and ``cf`` have let it through.  Out of line:
-  ## only ``(?i)`` reaches it, and inline it kept [classAdvance] twice the
-  ## size, which measured 0.3-0.8% more ``Ir`` on class bench items without
-  ## ``(?i)``.  The start is not an argument: passing it measured 2.5-4.3%
-  ## more on ``(?i)`` classes.
-  let (srcCP, expCP, expLen) = MultiCharFolds[variant]
-  let srcRune = Rune(srcCP)
-  # Check if the source rune matches any atom in the class, unless the
-  # ``ClassFold`` already answered.
-  if cf == nil:
-    var atomMatch = false
+proc atomFolds(ctx: MatchContext, node: Node, open: uint32): uint32 {.noinline.} =
+  ## The folds in ``open`` whose source an atom of the class accepts under
+  ## the flags in force: what ``ClassFold.folds`` holds where one was derived
+  ## under them.
+  var rest = open
+  while rest != 0:
+    let i = countTrailingZeroBits(rest)
+    rest = rest and (rest - 1)
+    let src = Rune(MultiCharFolds[i].source)
     for atom in node.atoms:
-      if matchCcAtomWithFold(srcRune, atom, ctx.flags):
-        atomMatch = true
+      if matchCcAtomWithFold(src, atom, ctx.flags):
+        result = result or (1'u32 shl i)
         break
-    if not atomMatch:
-      return -1
+
+# The one check on how many folds there are: ``ClassFold.folds`` and
+# ``MultiCharFoldLeadMasks`` hold a bit per fold, and a ways mask one more.
+static:
+  doAssert MultiCharFolds.len < 32,
+    "a ways mask holds the plain way and one bit per fold"
+
+proc classFoldWays(ctx: MatchContext, node: Node): uint32 {.noinline.} =
+  ## [classWays] where [classFoldsApply] holds: the plain way, and every fold
+  ## variant whose source the class holds and whose expansion the lead byte
+  ## at ``ctx.pos`` and, after an ASCII lead, the byte that follows can
+  ## begin.  [foldVariantEnd] compares only the expansion.  Out of line:
+  ## [classWays] stands at every class ``runMachine`` and ``matchWithCont``
+  ## match, where reading the [ClassFold] inline measured up to 1% more
+  ## ``Ir`` on bench items without ``(?i)``.
+  let cf = classFoldOf(ctx, node)
+  # Most classes hold no fold source; they need not read the subject.
+  if not foldSourceHeld(cf) or ctx.pos >= ctx.subjectEnd:
+    return PlainWay
+  let lead = ctx.subject[ctx.pos].uint8
+  var open = MultiCharFoldLeadMasks[lead]
+  if cf != nil:
+    open = open and cf.folds
+  if open != 0 and lead < 0x80:
+    # An ASCII first character is one byte, so the second starts right after
+    # it: at "sa", ß's "ss" is turned away here and leaves no choice behind.
+    open =
+      if ctx.pos + 1 < ctx.subjectEnd:
+        open and MultiCharFoldNextMasks[ctx.subject[ctx.pos + 1].uint8]
+      else:
+        0
+  if cf == nil and open != 0:
+    # Without a [ClassFold] the atoms answer, last since they take a walk
+    # per fold still open.  A fold whose source the class lacks would leave
+    # a choice that can only fail.
+    open = atomFolds(ctx, node, open)
+  PlainWay or (open shl 1)
+
+proc classWays(ctx: MatchContext, node: Node): uint32 {.inline.} =
+  ## The ways [classAdvance] may match ``node`` by at ``ctx.pos``: bit 0 the
+  ## plain match, bit ``i + 1`` the expansion of ``MultiCharFolds[i]``.  The
+  ## plain match is tried first, as Oniguruma tries a class before its
+  ## multi-character folds: ``(?i)[sß]`` takes one ``s`` of ``"ss"``, and
+  ## only backtracking reaches ``ß``.
+  if classFoldsApply(ctx, node):
+    classFoldWays(ctx, node)
+  else:
+    PlainWay
+
+proc foldVariantEnd(ctx: MatchContext, node: Node, fold: int): int {.noinline.} =
+  ## End offset of the expansion of ``MultiCharFolds[fold]`` from
+  ## ``ctx.pos``, or -1, for a way [classWays] left open: the flags and the
+  ## class's members have let the fold through, so only the expansion is
+  ## left to compare.  Out of line: only ``(?i)`` reaches it, and inline it
+  ## kept [classAdvance] twice the size, which measured 0.3-0.8% more ``Ir``
+  ## on class bench items without ``(?i)``.  The start is not an argument:
+  ## passing it measured 2.5-4.3% more on ``(?i)`` classes.
+  when not defined(release):
+    # Debug builds only: a release build reads no [ClassFold] here.
+    let cf = classFoldOf(ctx, node)
+    let bit = 1'u32 shl fold
+    doAssert classFoldsApply(ctx, node) and
+      (if cf != nil: cf.folds and bit else: atomFolds(ctx, node, bit)) != 0,
+      "a fold way the class cannot take"
+  let (_, expCP, expLen) = MultiCharFolds[fold]
   # Check if the expansion matches at the current position (case-insensitively)
   var p = ctx.pos
   for i in 0 ..< expLen:
@@ -1857,40 +1912,28 @@ proc foldVariantEnd(
       return -1
   p
 
-const ClassVariants = MultiCharFolds.len + 1 ## Fold variants plus the plain match.
-
 proc classAdvance(ctx: MatchContext, node: Node, variant: int): int =
-  ## End offset of the ``variant``-th way ``node`` matches, or -1.
-  ## Leaves ``ctx.pos`` alone.
+  ## End offset of the ``variant``-th way ``node`` matches, or -1: 0 is the
+  ## plain match, ``i + 1`` the expansion of ``MultiCharFolds[i]``, which
+  ## only a way [classWays] left open may ask for.  Leaves ``ctx.pos`` alone.
   let start = ctx.pos
   if start >= ctx.subjectEnd:
     return -1
 
+  if variant != 0:
+    # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss", which
+    # [classWays] has asked the flags and the class about.
+    return foldVariantEnd(ctx, node, variant - 1)
+
   # ASCII fast path: one bit test on an exact bitmap, the same answer
-  # [classHasByte] gives but without the decode, negation applied here.  The
-  # gate rules out ``rfIgnoreCase``, so no fold variant exists and the variant
-  # arm below is answered with -1 rather than run.
+  # [classHasByte] gives but without the decode, negation applied here.
   let lead = ctx.subject[start].uint8
   if classBitmapAnswers(node, lead, ctx.flags):
-    if variant < MultiCharFolds.len:
-      return -1
     return
       if (lead in node.asciiSet) != node.negated:
         start + 1
       else:
         -1
-
-  if variant < MultiCharFolds.len:
-    # Multi-character fold expansion, e.g. (?i:[ß]) matching "ss".  A lead
-    # byte the expansion cannot start at fails the first comparison of
-    # [foldVariantEnd]'s loop, which reads neither the class nor the flags.
-    let bit = 1'u32 shl variant
-    if (MultiCharFoldLeadMasks[lead] and bit) == 0 or not classFoldsApply(ctx, node):
-      return -1
-    let cf = classFoldOf(ctx, node)
-    if cf != nil and (cf.folds and bit) == 0:
-      return -1
-    return foldVariantEnd(ctx, node, variant, cf)
 
   if lead < 0x80:
     # Under ``(?i)`` the plain bitmap is out, but the folded one may answer.
@@ -2016,6 +2059,26 @@ proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inli
   else:
     -1
 
+proc leafWays(ctx: MatchContext, node: Node): uint32 {.inline.} =
+  ## The ways [leafVariantAdvance] may match literal or class ``node`` by at
+  ## ``ctx.pos``, bit ``v`` for its variant ``v``.
+  if node.kind == nkCharClass:
+    classWays(ctx, node)
+  else:
+    LiteralWays
+
+template firstWayEnd(ways: var uint32, advance: untyped): int =
+  ## End offset of the lowest way in ``ways`` that fits, or -1, clearing it
+  ## and every way below it.  ``advance`` is the end of way ``v``, or -1.
+  var e = -1
+  while ways != 0:
+    let v {.inject.} = countTrailingZeroBits(ways)
+    ways = ways and (ways - 1)
+    e = advance
+    if e >= 0:
+      break
+  e
+
 const LeadLeafTrial = 32'i32 ## Positions answered before reading the refusal rate.
 
 const LeadLeafPayoff = 8'i32
@@ -2035,11 +2098,15 @@ const LeadLeafCapacity = 256'i32
 proc leadLeafEnd(ctx: MatchContext, node: Node): int {.inline.} =
   ## End offset of the leaf matched at ``ctx.pos``, or -1. One character test,
   ## no writes. ``nkString`` tests the whole run; only the lazy scan reaches it.
+  ## A literal or class here is single-way ([isSingleWayLeaf]), as the search
+  ## pins for its lead leaf and the lazy scan checks before it runs, so its
+  ## plain way is its only one.
   case node.kind
-  of nkLiteral, nkEscapedLiteral:
+  of nkLiteral, nkEscapedLiteral, nkCharClass:
+    when not defined(release):
+      # Debug builds only: the gate read costs a release build at every start.
+      doAssert isSingleWayLeaf(ctx, node), "a lead leaf with a second way"
     leafVariantAdvance(ctx, node, 0)
-  of nkCharClass:
-    leafVariantAdvance(ctx, node, classFirstVariant(ctx, node))
   of nkCharType:
     charTypeAdvance(ctx, node.charType)
   of nkString:
@@ -2110,18 +2177,12 @@ proc leafWaysEndAt(
   of nkCharType:
     result = charTypeAdvance(ctx, body.charType) == targetEnd
   else:
-    let lastVariant = if body.kind == nkCharClass: ClassVariants else: LiteralVariants
-    var v =
-      if body.kind == nkCharClass:
-        classFirstVariant(ctx, body)
-      else:
-        0
+    var ways = leafWays(ctx, body)
     result = false
-    while v < lastVariant:
-      if leafVariantAdvance(ctx, body, v) == targetEnd:
+    while ways != 0:
+      if firstWayEnd(ways, leafVariantAdvance(ctx, body, v)) == targetEnd:
         result = true
         break
-      inc v
   ctx.lookLimit = savedLimit
 
 proc leafBodyEndsAt(
@@ -2175,18 +2236,8 @@ proc leafBodyMatchesHere(ctx: MatchContext, body: Node): bool =
     # ``(?i)``, ``(?=ß)`` has to reach "ss" by the multi-character fold.  Only
     # [leafBodyEndsAt]'s fixed-width literal stops at the first, since a fold
     # carries no fixed width.
-    let lastVariant = if body.kind == nkCharClass: ClassVariants else: LiteralVariants
-    var v =
-      if body.kind == nkCharClass:
-        classFirstVariant(ctx, body)
-      else:
-        0
-    result = false
-    while v < lastVariant:
-      if leafVariantAdvance(ctx, body, v) >= 0:
-        result = true
-        break
-      inc v
+    var ways = leafWays(ctx, body)
+    result = firstWayEnd(ways, leafVariantAdvance(ctx, body, v)) >= 0
   ctx.lookLimit = savedLimit
 
 proc pureLookaheadMatches(ctx: MatchContext, body: Node): bool =
@@ -2445,10 +2496,10 @@ proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int 
       nextCharAt(ctx.subject.oa, mp, mr)
       if sr == mr or caseInsensitiveMatch(sr, mr, ctx.flags):
         continue
-      let asciiOnly = rfIgnoreCaseAscii in ctx.flags
+      let multiFold = multiCharFoldsApply(ctx.flags)
       # Forward multi-char fold: captured rune folds to multiple subject runes.
       block forwardFold:
-        if asciiOnly and int32(sr) > 127:
+        if not multiFold:
           break forwardFold
         let fold = getMultiCharFold(sr)
         if fold.len == 0:
@@ -2469,7 +2520,7 @@ proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int 
           continue
       # Reverse multi-char fold: subject rune folds to multiple captured runes.
       block reverseFold:
-        if asciiOnly:
+        if not multiFold:
           break reverseFold
         let fold = getMultiCharFold(mr)
         if fold.len == 0:
@@ -3841,25 +3892,20 @@ proc runMachine(
     else:
       restore(ctx, ctx.choices[top].qcSaved)
 
-  template tryLeafVariants(firstVariant, lastVariant: int, advance: untyped): untyped =
-    ## Match the leaf ``node`` by its first way that fits, leaving the next
-    ## way behind as a choice.  ``advance`` is the end of way ``v``, or -1.
-    var v {.inject.} = firstVariant
-    var e = -1
-    while v < lastVariant:
-      e = advance
-      if e >= 0:
-        break
-      inc v
+  template tryLeafVariants(open: uint32, multiWay, advance: untyped): untyped =
+    ## Match the leaf ``node`` by its first way in ``open`` that fits, leaving
+    ## the ways above it behind as a choice unless ``multiWay`` finds the leaf
+    ## single-way.  ``advance`` is the end of way ``v``, or -1.
+    var ways = open
+    let e = firstWayEnd(ways, advance)
     if e < 0:
       mode = mFail
     else:
-      # Single-way leaf has no second variant; skip the choice entry.
-      if v + 1 < lastVariant and not isSingleWayLeaf(ctx, node):
+      if ways != 0 and multiWay:
         ctx.pushChoice Choice(
           kind: chLeafVariant,
           lNode: node.id,
-          lVariant: int32(v + 1),
+          lWays: ways,
           lCont: cont,
           lFramesLen: ctx.framesLen.int32,
           lPos: ctx.pos,
@@ -3896,13 +3942,15 @@ proc runMachine(
             ctx.pos = e
             mode = mCont
         else:
-          tryLeafVariants(0, LiteralVariants, literalAdvance(ctx, r, v))
+          # A literal without a multi-character fold has no second way.
+          tryLeafVariants(
+            LiteralWays, not isSingleWayLeaf(ctx, node), literalAdvance(ctx, r, v)
+          )
       of nkCharClass:
         # Through ``leafVariantAdvance`` although the kind is known: calling
-        # ``classAdvance`` directly read +0.1% ``Ir`` on the class items.
-        tryLeafVariants(
-          classFirstVariant(ctx, node), ClassVariants, leafVariantAdvance(ctx, node, v)
-        )
+        # ``classAdvance`` directly read +0.1% ``Ir`` on the class items.  A
+        # fold way left over means the class is not single-way.
+        tryLeafVariants(classWays(ctx, node), true, leafVariantAdvance(ctx, node, v))
       of nkString:
         let e = stringAdvance(ctx, node)
         if e < 0:
@@ -4869,24 +4917,17 @@ proc runMachine(
         ctx.pos = ctx.choices[top].lPos
         ctx.framesLen = ctx.choices[top].lFramesLen
         let leaf {.cursor.} = ctx.nodeAt(ctx.choices[top].lNode)
-        let lastVariant =
-          if leaf.kind == nkCharClass: ClassVariants else: LiteralVariants
-        var v = int(ctx.choices[top].lVariant)
-        var e = -1
-        while v < lastVariant:
-          e = leafVariantAdvance(ctx, leaf, v)
-          if e >= 0:
-            break
-          inc v
+        var ways = ctx.choices[top].lWays
+        let e = firstWayEnd(ways, leafVariantAdvance(ctx, leaf, v))
         if e < 0:
           ctx.choicesLen = top
           mode = mFail
         else:
           cont = ctx.choices[top].lCont
-          if v + 1 >= lastVariant:
+          if ways == 0:
             ctx.choicesLen = top
           else:
-            ctx.choices[top].lVariant = int32(v + 1)
+            ctx.choices[top].lWays = ways
           ctx.pos = e
           mode = mCont
       of chSimpleRepeat:
@@ -5108,18 +5149,8 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
       of nkCharType:
         e = charTypeAdvance(ctx, node.charType)
       else:
-        let lastVariant =
-          if node.kind == nkCharClass: ClassVariants else: LiteralVariants
-        var v =
-          if node.kind == nkCharClass:
-            classFirstVariant(ctx, node)
-          else:
-            0
-        while v < lastVariant:
-          e = leafVariantAdvance(ctx, node, v)
-          if e >= 0:
-            break
-          inc v
+        var ways = leafWays(ctx, node)
+        e = firstWayEnd(ways, leafVariantAdvance(ctx, node, v))
       if e < 0:
         return false
       ctx.pos = e

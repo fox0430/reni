@@ -983,8 +983,10 @@ type
       ## The ASCII bytes the atoms accept under ``flags``, before negation:
       ## what ``classHasByte`` answers below 0x80.
     folds*: uint32
-      ## Bit ``i`` set when ``MultiCharFolds[i]``'s source is a member, the
-      ## test each fold variant opens with.  0 rules every fold variant out.
+      ## Bit ``i`` set when ``MultiCharFolds[i]``'s source is a member, which
+      ## ``classWays`` asks before it leaves a fold variant open, and
+      ## multi-character folds apply to the class at all
+      ## (``leafgate.classFoldsApply``).  0 rules every fold variant out.
     flags*: RegexFlags
       ## The flags in force at the class, as the pattern reads; a reader
       ## under any others answers the long way.
@@ -1815,23 +1817,9 @@ proc posixBytes(cls: PosixClassName): set[uint8] =
   of pcWord:
     WordAsciiBytes
 
-const
-  SKFoldBytes = {uint8('s'), uint8('S'), uint8('k'), uint8('K')}
-    ## The only ASCII letters a non-ASCII rune folds to: ſ (U+017F) → s and
-    ## K (U+212A) → k.
-  MultiCharFoldLeadBytes = block:
-    ## First letters of the multi-character case-fold expansions (ß → "ss",
-    ## ﬁ → "fi", ẘ → "w"+ring, …), derived from [MultiCharFolds].  Under (?i) a
-    ## bracket class holding the source rune matches the expansion, so the
-    ## subject can start with any of these.
-    var bs: set[uint8]
-    for f in MultiCharFolds:
-      let cp = f.expansion[0]
-      if cp < 0x80:
-        bs.incl(uint8(cp))
-        if cp >= ord('a') and cp <= ord('z'):
-          bs.incl(uint8(cp - 32))
-    bs
+const SKFoldBytes = {uint8('s'), uint8('S'), uint8('k'), uint8('K')}
+  ## The only ASCII letters a non-ASCII rune folds to: ſ (U+017F) → s and
+  ## K (U+212A) → k.
 
 proc classAsciiMatches*(
     node: Node, ascii: var set[uint8], nonAscii, predicate: var bool
@@ -1989,10 +1977,10 @@ proc classLeadBytes(node: Node, flags: RegexFlags): set[uint8] =
     for b in matched:
       ascii = ascii + asciiFoldBytes(b)
     ascii = ascii + SKFoldBytes
-    if node.bracketClass:
-      ascii = ascii + MultiCharFoldLeadBytes
     # ſ and K are the only characters above U+007F that fold onto an ASCII
-    # member, and both are multi-byte.
+    # member, and both are multi-byte.  No member expands to several
+    # characters: every fold source is above U+007F and shares its simple
+    # fold with nothing below (``leafgate``'s static check).
     return ascii + ClassLeadBytes
   if nonAscii:
     ascii = ascii + ClassLeadBytes
