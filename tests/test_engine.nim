@@ -4277,15 +4277,17 @@ suite "Mutual recursion detection":
     let r = re("(?<a>x(?&b)?)(?<b>y(?&a)?)")
     check r.captureCount == 2
 
-  test "mutual recursion via optional quantifier is valid":
-    let r = re("(?<a>(?&b)?x)(?<b>(?&a)?y)")
-    check r.captureCount == 2
+  test "mutual recursion via optional quantifier is detected":
+    # Each group may call the other before it consumes anything.  Oniguruma:
+    # -221, as for any left recursion.
+    expect RegexError:
+      discard re("(?<a>(?&b)?x)(?<b>(?&a)?y)")
 
-  test "self-recursion under an inverted range is valid":
-    # ``{2,0}`` behaves like ``{0,2}``, so the body may be skipped and the
-    # call is not forced without consuming input.
-    let r = re("(?<a>(?&a){2,0})")
-    check r.captureCount == 1
+  test "self-recursion under an inverted range is detected":
+    # ``{2,0}`` behaves like ``{0,2}``: the body may be skipped, but the call
+    # in it comes before anything is consumed.  Oniguruma: -221.
+    expect RegexError:
+      discard re("(?<a>(?&a){2,0})")
 
   test "recursion after an inverted range is detected":
     # ``b{2,0}`` can match empty, so the call is reachable without consuming
@@ -4319,6 +4321,106 @@ suite "Mutual recursion detection":
     # Both branches consume, so the call is only reached after input.
     let r = re("(?<a>(?(<a>)x|y)\\g<a>?)")
     check r.captureCount == 1
+
+  # The rest of the suite follows Oniguruma's ``infinite_recursive_call_check``;
+  # every pattern rejected below is -221 in libonig 6.9.10, every other one
+  # compiles there.
+
+  test "a call to the whole pattern is checked like a group":
+    for pattern in [
+      "\\g<0>", "a\\g<0>", "a|\\g<0>", "(?=\\g<0>)", "x|(?<=\\g<0>)", "x|(?<!\\g<0>)"
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    check search("abb", re("a|b\\g<0>")).matchSpan == 0 .. 1
+
+  test "a branch that recurses before it consumes is detected":
+    # Another branch that stops the recursion does not help.
+    for pattern in ["(a|\\g<1>)", "(?<n>(?:\\g<n>)?a|b)", "(?<a>\\g<b>|x)(?<b>\\g<a>)"]:
+      expect RegexError:
+        discard re(pattern)
+
+  test "a recursion with no way out is detected after a consumer":
+    for pattern in [
+      "(a\\g<1>)", "a(?<a>b\\g<b>)(?<b>\\g<a>)", "(?<a>x(?<b>\\g<a>))\\g<b>"
+    ]:
+      expect RegexError:
+        discard re(pattern)
+
+  test "a group no call can run is not checked":
+    # A call under ``{0}`` runs only from a group that is called.
+    check search("a", re("(?<a>\\g<a>){0}a")).matchSpan == 0 .. 1
+    check search("b", re("(?<a>\\g<b>){0}(?<b>\\g<a>){0}b")).matchSpan == 0 .. 1
+    expect RegexError:
+      discard re("(?<a>\\g<a>){0}\\g<a>")
+    expect RegexError:
+      discard re("(?<a>\\g<b>){0}(?<b>\\g<a>){0}\\g<b>")
+
+  test "what counts as consuming before a recursion":
+    # Zero-width items do not, and neither does ``(*FAIL)``, which Oniguruma
+    # reads as a callout here.
+    for pattern in [
+      "(?<n>\\K\\g<n>|c)", "(?<n>\\y\\g<n>|c)", "(?<n>(*FAIL)\\g<n>|c)",
+      "(?<n>(*MAX{2})\\g<n>|c)", "(?<n>a{0}\\g<n>|c)", "(?<n>(?(a)b)\\g<n>|d)",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    check search("c", re("(?<n>(?(a)b|c)\\g<n>|d)")).found == false
+    # A backreference counts as the shortest group it reads, and as empty
+    # inside a group it reads.
+    expect RegexError:
+      discard re("(\\2\\g<1>|c)()")
+    expect RegexError:
+      discard re("(\\1\\g<1>|c)")
+    expect RegexError:
+      discard re("(?<n>a)(?<n>)(?<m>\\k<n>\\g<m>|c)")
+    check search("ca", re("(\\2\\g<1>|c)(a)")).matchSpan == 0 .. 2
+    check search("abc", re("(?<n>a)(?<n>b)(?<m>\\k<n>\\g<m>|c)")).matchSpan == 0 .. 3
+    # ``(?~|X|E)`` consumes what ``E`` does; the other absent forms nothing.
+    check search("c", re("(?<n>(?~|a|b)\\g<n>|c)")).matchSpan == 0 .. 1
+    for pattern in [
+      "(?<n>(?~|a|b*)\\g<n>|c)", "(?<n>(?~a)\\g<n>|c)", "(?<n>(?~|a)\\g<n>|c)",
+      "(?<n>(?~|)\\g<n>|c)",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+
+  test "a recursion in an absent pattern is never one every path takes":
+    check search("c", re("(?<n>(?~a\\g<n>)|c)")).found
+    for pattern in [
+      "(?<n>(?~\\g<n>)|c)", "(?<n>(?~|\\g<n>|b)|c)", "(?<n>(?~|a|\\g<n>)|c)",
+      "(?<n>(?~|a|b\\g<n>))",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+
+  test "a conditional's yes branch starts where its condition ends":
+    for pattern in [
+      "(?<n>(?(<n>)\\g<n>|b))", "(?<n>(?(*FAIL)a|\\g<n>))",
+      "(?<n>a(?(<n>)\\g<n>|\\g<n>))",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    check search("b", re("(?<n>(?(b\\g<n>)a|b))")).matchSpan == 0 .. 1
+    check search("a", re("(?<n>a(?(<n>)\\g<n>))")).matchSpan == 0 .. 1
+
+  test "a length worked out during one group's check is kept for the next":
+    # Oniguruma fixes a group's length the first time it is asked for.  Asked
+    # while group 1 is checked, group 2 (a call to group 1) counts group 1 as
+    # empty, so group 3 then sees ``\2`` as empty too.  In the other order
+    # group 2's length is worked out first, and is 1.
+    expect RegexError:
+      discard re("(\\2x\\g<1>|w)(\\g<1>)(\\2\\g<3>|v)")
+    check re("(\\3\\g<1>|v)(\\3x\\g<2>|w)(\\g<2>)").captureCount == 3
+
+  test "a group called twice by each next one is walked once":
+    # Each of the 40 groups calls the one before twice, so walking every call
+    # would take 2^40 steps.  None of them leads back to ``r``, so each walk
+    # into one goes the same way.
+    var levels = ""
+    for i in 1 .. 40:
+      levels.add "(?<a" & $i & ">\\g<a" & $(i - 1) & ">\\g<a" & $(i - 1) & ">)"
+    check re("(?<r>(?<a0>x)" & levels & "(?:\\g<r>)?)").captureCount == 42
 
 suite "matchSpan on non-matching result":
   test "matchSpan returns UnsetSpan when not found":

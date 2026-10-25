@@ -178,51 +178,6 @@ proc validateUtf8(s: string) =
         raise newException(RegexError, "invalid code point value")
     i += seqLen
 
-proc canMatchEmpty(node: Node): bool =
-  ## Check if a node can match without consuming input (conservative).
-  if node == nil:
-    return true
-  case node.kind
-  of nkLiteral, nkEscapedLiteral, nkString, nkCharType, nkCharClass, nkBackreference,
-      nkNamedBackref:
-    false
-  of nkConcat:
-    for child in node.children.view:
-      if not canMatchEmpty(child):
-        return false
-    true
-  of nkAlternation:
-    for alt in node.alternatives.view:
-      if canMatchEmpty(alt):
-        return true
-    false
-  of nkQuantifier:
-    # Inverted range behaves swapped (``{2,0}`` like ``{0,2}``): use the
-    # effective minimum.
-    effectiveQuantBounds(node.quantMin, node.quantMax).lo == 0 or
-      canMatchEmpty(node.quantBody)
-  of nkCapture:
-    canMatchEmpty(node.captureBody)
-  of nkNamedCapture:
-    canMatchEmpty(node.namedCaptureBody)
-  of nkGroup:
-    canMatchEmpty(node.groupBody)
-  of nkFlagGroup:
-    node.flagBody == nil or canMatchEmpty(node.flagBody)
-  of nkAnchor, nkLookaround, nkAbsent, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
-    true # zero-width
-  of nkAtomicGroup:
-    canMatchEmpty(node.atomicBody)
-  of nkConditional:
-    # Either branch matching empty is enough, and with no else-branch a false
-    # condition matches empty by itself.
-    if node.condNo == nil:
-      true
-    else:
-      canMatchEmpty(node.condYes) or canMatchEmpty(node.condNo)
-  of nkSubexpCall:
-    true # conservative: assume it can match empty
-
 proc callTarget(node: Node, bodies: seq[Node], namedCaptures: seq[(string, int)]): int =
   ## The 0-based group the call ``node`` runs, or -1 when there is no body to
   ## follow: a call to the whole pattern (``\g<0>``, ``(?R)``), a number
@@ -238,85 +193,429 @@ proc callTarget(node: Node, bodies: seq[Node], namedCaptures: seq[(string, int)]
         break
   if idx >= 0 and idx < bodies.len and bodies[idx] != nil: idx else: -1
 
-proc hasRecursiveCycle(
-    startIdx: int,
-    node: Node,
-    bodies: seq[Node],
-    namedCaptures: seq[(string, int)],
-    visiting: var HashSet[int],
-): bool =
-  ## Return true when evaluating ``node`` unconditionally reaches ``startIdx``
-  ## through a subexpression-call chain without consuming input — direct
-  ## (``(?<a>(?&a))``) or mutual (``(?<a>(?&b))(?<b>(?&a))``) recursion.
+const
+  RecursionExist = 1'u8 ## The walk reached the group being checked.
+  RecursionMust = 2'u8 ## ... on every path it took.
+  RecursionInfinite = 4'u8 ## ... on a path that had consumed nothing.
+
+type RecursionCheck = object
+  ## The state of [checkNeverEndingRecursion].  A slot is a group: slot 0 the
+  ## whole pattern, which ``\g<0>`` calls, and slot ``k`` group ``k``.
+  ast: Node
+  bodies: ptr seq[Node]
+  namedCaptures: ptr seq[(string, int)]
+  called: seq[bool]
+    ## A call that can run reaches the group (Oniguruma's ``CALLED``).  Only
+    ## these groups are checked.
+  recursive: seq[bool]
+    ## The group runs itself again, through calls or not (Oniguruma's
+    ## ``RECURSION``).  Only these groups are checked.
+  component: seq[int]
+    ## The group's strongly connected component, where a group leads to the
+    ## groups its body holds and calls.  Set for the groups a call reaches.
+  componentEntered: seq[int] ## How many groups of each component the walk is inside.
+  check: int ## The number of the check running, from 1.
+  memo: seq[uint8]
+    ## The flags of the walk into slot ``s`` with head ``h``, at ``2*s+h``,
+    ## for a walk begun while the walk was inside no group of the slot's
+    ## component.  Nothing that walk reaches is then on the path to it, so it
+    ## goes the same way each time, and it leaves every length it needs
+    ## worked out, so walking it again would change nothing.
+  memoCheck: seq[int] ## The check each ``memo`` entry belongs to.
+  marked: seq[bool]
+    ## Oniguruma's ``MARK1``: the group being checked, and the groups whose
+    ## length is being worked out.  Both count as matching empty.
+  entered: seq[bool] ## Oniguruma's ``MARK2``: the groups the walk is inside.
+  minLen: seq[int8]
+    ## Whether a group always consumes, once worked out: -1 not yet, 0 no,
+    ## 1 yes.  Kept from one group's check to the next, as Oniguruma keeps
+    ## ``FIXED_MIN``, so a group worked out while another was being checked
+    ## keeps the 0 that one counted as.
+  openRefs: HashSet[pointer]
+    ## The backreferences written inside a group they read, which count as
+    ## matching empty (``ND_ST_RECURSION`` on a backreference).
+
+proc slotBody(c: RecursionCheck, slot: int): Node =
+  if slot == 0:
+    c.ast
+  else:
+    c.bodies[][slot - 1]
+
+proc groupSlot(node: Node): int =
+  ## The slot of the group ``node``, or -1 when it is not one.
+  case node.kind
+  of nkCapture:
+    node.captureIndex + 1
+  of nkNamedCapture:
+    node.namedCaptureIndex + 1
+  else:
+    -1
+
+proc callSlot(c: RecursionCheck, node: Node): int =
+  ## The slot the call ``node`` runs, or -1 when there is no body to follow.
+  if node.callIndex == 0 and node.callName.len == 0:
+    return 0
+  let idx = callTarget(node, c.bodies[], c.namedCaptures[])
+  if idx < 0:
+    -1
+  else:
+    idx + 1
+
+iterator refSlots(c: RecursionCheck, node: Node): int =
+  ## The slots the backreference ``node`` reads.
+  if node.kind == nkBackreference:
+    if node.backrefIndex >= 1 and node.backrefIndex <= c.bodies[].len:
+      yield node.backrefIndex
+  else:
+    for idx in c.namedCaptures[].namedGroupsRead(node.backrefName, node.backrefScope):
+      yield idx + 1
+
+proc consumes(c: var RecursionCheck, node: Node): bool
+
+proc groupConsumes(c: var RecursionCheck, slot: int): bool =
+  ## [consumes] for a group, and for a call to it.
+  if c.minLen[slot] >= 0:
+    return c.minLen[slot] == 1
+  if c.marked[slot]:
+    return false
+  c.marked[slot] = true
+  result = c.consumes(c.slotBody(slot))
+  c.marked[slot] = false
+  c.minLen[slot] = int8(result)
+
+proc consumes(c: var RecursionCheck, node: Node): bool =
+  ## Whether ``node`` always consumes something: Oniguruma's
+  ## ``node_min_byte_len`` is not 0.  Every part is worked out, as there, even
+  ## once one settles the answer, since working out a group fixes its length.
   if node == nil:
     return false
   case node.kind
-  of nkSubexpCall:
-    let callIdx = callTarget(node, bodies, namedCaptures)
-    if callIdx < 0:
-      return false
-    if callIdx == startIdx:
-      return true
-    if callIdx in visiting:
-      # Already on the DFS stack through a different path — the cycle, if any,
-      # would have been detected on that frame. Treat as non-recursive here.
-      return false
-    visiting.incl(callIdx)
-    let hit =
-      hasRecursiveCycle(startIdx, bodies[callIdx], bodies, namedCaptures, visiting)
-    visiting.excl(callIdx)
-    hit
+  of nkLiteral, nkEscapedLiteral, nkCharType, nkCharClass:
+    result = true
+  of nkString:
+    result = node.runes.len > 0
   of nkConcat:
+    result = false
     for child in node.children.view:
-      if hasRecursiveCycle(startIdx, child, bodies, namedCaptures, visiting):
-        return true
-      if not canMatchEmpty(child):
-        return false
-    false
+      if c.consumes(child):
+        result = true
   of nkAlternation:
+    result = node.alternatives.len > 0
     for alt in node.alternatives.view:
-      if not hasRecursiveCycle(startIdx, alt, bodies, namedCaptures, visiting):
-        return false
-    node.alternatives.len > 0
-  of nkCapture:
-    hasRecursiveCycle(startIdx, node.captureBody, bodies, namedCaptures, visiting)
-  of nkNamedCapture:
-    hasRecursiveCycle(startIdx, node.namedCaptureBody, bodies, namedCaptures, visiting)
-  of nkGroup:
-    hasRecursiveCycle(startIdx, node.groupBody, bodies, namedCaptures, visiting)
-  of nkFlagGroup:
-    if node.flagBody == nil:
-      false
-    else:
-      hasRecursiveCycle(startIdx, node.flagBody, bodies, namedCaptures, visiting)
-  of nkAtomicGroup:
-    hasRecursiveCycle(startIdx, node.atomicBody, bodies, namedCaptures, visiting)
+      if not c.consumes(alt):
+        result = false
   of nkQuantifier:
-    # Effective min == 0 skips the body and never forces recursion.
-    if effectiveQuantBounds(node.quantMin, node.quantMax).lo == 0:
-      false
-    else:
-      hasRecursiveCycle(startIdx, node.quantBody, bodies, namedCaptures, visiting)
+    result =
+      effectiveQuantBounds(node.quantMin, node.quantMax).lo > 0 and
+      c.consumes(node.quantBody)
+  of nkCapture, nkNamedCapture:
+    result = c.groupConsumes(groupSlot(node))
+  of nkGroup:
+    result = c.consumes(node.groupBody)
+  of nkAtomicGroup:
+    result = c.consumes(node.atomicBody)
+  of nkFlagGroup:
+    result = c.consumes(node.flagBody)
+  of nkBackreference, nkNamedBackref:
+    # The shortest of the groups it reads.  Inside one of them it reads unset.
+    if cast[pointer](node) in c.openRefs:
+      return false
+    result = true
+    for slot in c.refSlots(node):
+      if not c.groupConsumes(slot):
+        result = false
+  of nkSubexpCall:
+    let slot = c.callSlot(node)
+    result = slot >= 0 and c.groupConsumes(slot)
+  of nkAbsent:
+    # Only ``(?~|X|E)`` holds what ``E`` consumes; the other forms may stop
+    # where they start.
+    result = node.absentKind == abExpression and c.consumes(node.absentExpr)
   of nkConditional:
-    # A pattern condition runs first, whichever branch follows.
-    if node.condKind == ckRegexCond and
-        hasRecursiveCycle(startIdx, node.condBody, bodies, namedCaptures, visiting):
-      return true
-    if node.condYes != nil and
-        hasRecursiveCycle(startIdx, node.condYes, bodies, namedCaptures, visiting):
-      if node.condNo != nil:
-        return hasRecursiveCycle(startIdx, node.condNo, bodies, namedCaptures, visiting)
-      # condNo is nil. The nil branch matches empty when the condition is
-      # false — but if the condition is guaranteed true (a backref whose
-      # target can match empty), the yes branch is always taken.
-      if node.condKind == ckBackref:
-        let refIdx = node.condRefIndex - 1
-        if refIdx >= 0 and refIdx < bodies.len and bodies[refIdx] != nil:
-          if canMatchEmpty(bodies[refIdx]):
-            return true
-    false
+    var yes = node.condKind == ckRegexCond and c.consumes(node.condBody)
+    if c.consumes(node.condYes):
+      yes = true
+    let no = c.consumes(node.condNo)
+    result = yes and no
+  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    # ``(*FAIL)`` too: Oniguruma reads it as a callout here, not as its fail
+    # node.
+    result = false
+
+proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8
+
+proc enterGroup(c: var RecursionCheck, slot: int, head: bool): uint8 =
+  if c.entered[slot]:
+    return 0
+  if c.marked[slot]:
+    return
+      if head:
+        RecursionExist or RecursionMust or RecursionInfinite
+      else:
+        RecursionExist or RecursionMust
+  let component = c.component[slot]
+  let fresh = c.componentEntered[component] == 0
+  let key = 2 * slot + ord(head)
+  if fresh and c.memoCheck[key] == c.check:
+    return c.memo[key]
+  c.entered[slot] = true
+  inc c.componentEntered[component]
+  result = c.recursionFlags(c.slotBody(slot), head)
+  dec c.componentEntered[component]
+  c.entered[slot] = false
+  if fresh:
+    c.memo[key] = result
+    c.memoCheck[key] = c.check
+
+proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8 =
+  ## Oniguruma's ``infinite_recursive_call_check``: how ``node`` reaches the
+  ## group being checked, where ``head`` says nothing has been consumed since
+  ## that group began.  Returns at once with ``RecursionInfinite``.
+  if node == nil:
+    return 0
+  case node.kind
+  of nkConcat:
+    var head = head
+    for child in node.children.view:
+      let flags = c.recursionFlags(child, head)
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = result or flags
+      if head and c.consumes(child):
+        head = false
+  of nkAlternation:
+    var must = RecursionMust
+    for alt in node.alternatives.view:
+      let flags = c.recursionFlags(alt, head)
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = result or (flags and RecursionExist)
+      must = must and flags
+    result = result or must
+  of nkQuantifier:
+    let bounds = effectiveQuantBounds(node.quantMin, node.quantMax)
+    if bounds.hi != 0:
+      result = c.recursionFlags(node.quantBody, head)
+      if bounds.lo == 0:
+        result = result and not RecursionMust
+  of nkCapture, nkNamedCapture:
+    result = c.enterGroup(groupSlot(node), head)
+  of nkSubexpCall:
+    let slot = c.callSlot(node)
+    if slot >= 0:
+      result = c.enterGroup(slot, head)
+  of nkGroup:
+    result = c.recursionFlags(node.groupBody, head)
+  of nkAtomicGroup:
+    result = c.recursionFlags(node.atomicBody, head)
+  of nkFlagGroup:
+    result = c.recursionFlags(node.flagBody, head)
+  of nkLookaround:
+    result = c.recursionFlags(node.lookBody, head)
+  of nkAbsent:
+    # Oniguruma tries the absent pattern in a loop that may stop before it,
+    # so no recursion in it is one every path takes.
+    if node.absentBody != nil:
+      let flags = c.recursionFlags(node.absentBody, head)
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = flags and RecursionExist
+    if node.absentKind == abExpression:
+      let flags = c.recursionFlags(node.absentExpr, head)
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = result or flags
+  of nkConditional:
+    let cond = if node.condKind == ckRegexCond: node.condBody else: nil
+    result = c.recursionFlags(cond, head)
+    if (result and RecursionInfinite) != 0:
+      return
+    if node.condYes != nil:
+      let flags = c.recursionFlags(node.condYes, head and not c.consumes(cond))
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = result or flags
+    if node.condNo != nil:
+      let flags = c.recursionFlags(node.condNo, head)
+      if (flags and RecursionInfinite) != 0:
+        return flags
+      result = result or (flags and RecursionExist)
+      if (flags and RecursionMust) == 0:
+        result = result and not RecursionMust
+    else:
+      # Oniguruma's rule, though a recursion in the condition runs either way.
+      result = result and not RecursionMust
   else:
-    false
+    discard
+
+proc collectEdges(c: RecursionCheck, node: Node, edges: var seq[int]) =
+  ## Add the slots ``node`` runs itself: the groups it holds and the ones it
+  ## calls, not the ones those run in turn.
+  if node == nil:
+    return
+  let slot =
+    if node.kind == nkSubexpCall:
+      c.callSlot(node)
+    else:
+      groupSlot(node)
+  if slot >= 0:
+    edges.add slot
+    return
+  for child in node.childNodes:
+    c.collectEdges(child, edges)
+
+type ComponentSearch = object
+  ## Tarjan's algorithm over the slots, for [findComponents].
+  edges: seq[int] ## The slots each slot reached runs, added as it is reached.
+  order: seq[int] ## The order a slot was reached in, from 1; 0 for not yet.
+  low: seq[int] ## The lowest order the slot leads back to.
+  stack: seq[int]
+  onStack: seq[bool]
+  reached: int
+
+proc connect(c: var RecursionCheck, t: var ComponentSearch, v: int) =
+  inc t.reached
+  t.order[v] = t.reached
+  t.low[v] = t.reached
+  t.stack.add v
+  t.onStack[v] = true
+  let first = t.edges.len
+  c.collectEdges(c.slotBody(v), t.edges)
+  let last = t.edges.len
+  for i in first ..< last:
+    let w = t.edges[i]
+    if w == v:
+      c.recursive[v] = true
+    if t.order[w] == 0:
+      c.connect(t, w)
+      t.low[v] = min(t.low[v], t.low[w])
+    elif t.onStack[w]:
+      t.low[v] = min(t.low[v], t.order[w])
+  if t.low[v] == t.order[v]:
+    let component = c.componentEntered.len
+    c.componentEntered.add 0
+    while true:
+      let w = t.stack.pop()
+      t.onStack[w] = false
+      c.component[w] = component
+      if w == v:
+        break
+
+proc findComponents(c: var RecursionCheck, slots: int) =
+  ## Fill ``c.component`` and ``c.recursive`` for the groups a call reaches,
+  ## the only ones a check walks into: a group runs itself again when it
+  ## calls itself or shares its component.
+  var t = ComponentSearch(
+    order: newSeq[int](slots), low: newSeq[int](slots), onStack: newSeq[bool](slots)
+  )
+  c.recursive = newSeq[bool](slots)
+  c.component = newSeq[int](slots)
+  for slot in 0 ..< slots:
+    if c.called[slot] and t.order[slot] == 0:
+      c.connect(t, slot)
+  var size = newSeq[int](c.componentEntered.len)
+  for slot in 0 ..< slots:
+    if t.order[slot] != 0:
+      inc size[c.component[slot]]
+  for slot in 0 ..< slots:
+    if t.order[slot] != 0 and size[c.component[slot]] > 1:
+      c.recursive[slot] = true
+
+proc markCalled(c: var RecursionCheck, node: Node, inCall: bool) =
+  ## Oniguruma's ``tune_call2``: mark the groups a call that can run reaches.
+  ## Outside a called body, a call under ``{0}`` cannot run.
+  if node == nil:
+    return
+  case node.kind
+  of nkSubexpCall:
+    let slot = c.callSlot(node)
+    if slot >= 0 and not c.called[slot]:
+      c.called[slot] = true
+      c.markCalled(c.slotBody(slot), true)
+    return
+  of nkQuantifier:
+    if not inCall and effectiveQuantBounds(node.quantMin, node.quantMax).hi == 0:
+      return
+  else:
+    discard
+  for child in node.childNodes:
+    c.markCalled(child, inCall)
+
+proc markOpenRefs(c: var RecursionCheck, node: Node, open: var seq[bool]) =
+  ## Fill ``c.openRefs``, where ``open`` holds the groups around ``node``.
+  if node == nil:
+    return
+  if node.kind in {nkBackreference, nkNamedBackref}:
+    for read in c.refSlots(node):
+      if open[read]:
+        c.openRefs.incl(cast[pointer](node))
+        break
+  let slot = groupSlot(node)
+  if slot >= 0:
+    open[slot] = true
+  for child in node.childNodes:
+    c.markOpenRefs(child, open)
+  if slot >= 0:
+    open[slot] = false
+
+proc checkGroup(c: var RecursionCheck, slot: int) =
+  if not c.called[slot] or not c.recursive[slot]:
+    return
+  inc c.check
+  c.marked[slot] = true
+  let flags = c.recursionFlags(c.slotBody(slot), true)
+  if (flags and (RecursionMust or RecursionInfinite)) != 0:
+    raise newException(RegexError, "never ending recursion")
+  c.marked[slot] = false
+
+proc checkGroups(c: var RecursionCheck, node: Node) =
+  ## Oniguruma's ``infinite_recursive_call_check_trav``: check every group in
+  ## ``node``, in its order.
+  if node == nil:
+    return
+  case node.kind
+  of nkCapture, nkNamedCapture:
+    c.checkGroup(groupSlot(node))
+  of nkConditional:
+    # Both branches before the condition, as there.
+    c.checkGroups(node.condYes)
+    c.checkGroups(node.condNo)
+    c.checkGroups(node.condBody)
+    return
+  else:
+    discard
+  for child in node.childNodes:
+    c.checkGroups(child)
+
+proc checkNeverEndingRecursion(
+    ast: Node, bodies: seq[Node], namedCaptures: seq[(string, int)], readsGroups: bool
+) =
+  ## Reject a recursion that never ends, as Oniguruma does
+  ## (``ONIGERR_NEVER_ENDING_RECURSION``): a group a call can run that calls
+  ## itself on every path through it, or before it has consumed anything.
+  ## ``\g<0>``, ``a|\g<0>``, ``(a\g<1>)`` and ``x|(?<=\g<0>)`` are rejected,
+  ## ``a|b\g<0>`` and ``(?<n>a\g<n>){0}`` are not.  The rules are Oniguruma's
+  ## to the letter, down to the lengths a check works out for the next.
+  var c = RecursionCheck(
+    ast: ast, bodies: unsafeAddr bodies, namedCaptures: unsafeAddr namedCaptures
+  )
+  let slots = bodies.len + 1
+  c.called = newSeq[bool](slots)
+  c.marked = newSeq[bool](slots)
+  c.entered = newSeq[bool](slots)
+  c.minLen = newSeq[int8](slots)
+  for slot in 0 ..< slots:
+    c.minLen[slot] = -1
+  c.memo = newSeq[uint8](2 * slots)
+  c.memoCheck = newSeq[int](2 * slots)
+  c.markCalled(ast, false)
+  c.findComponents(slots)
+  if readsGroups:
+    var open = newSeq[bool](slots)
+    c.markOpenRefs(ast, open)
+  # The whole pattern is the outermost group.
+  c.checkGroup(0)
+  c.checkGroups(ast)
 
 proc containsAbsent(
     node: Node,
@@ -2845,17 +3144,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   var bodies: seq[Node]
   var groupFlags: seq[RegexFlags]
   collectGroupBodies(ast, bodies, groupFlags, flags)
-  # Check for never-ending recursion, including mutual recursion via
-  # subexpression calls.
-  for i, body in bodies:
-    if body == nil:
-      continue
-    var visiting = initHashSet[int]()
-    visiting.incl(i)
-    if hasRecursiveCycle(i, body, bodies, namedCaptures, visiting):
-      raise newException(RegexError, "never ending recursion")
   # Validate that every numeric / named reference points to an existing group.
   validateNumericRefs(ast, captureCount, namedCaptures)
+  # After the reference checks, which Oniguruma makes first too.
+  if p.sawCall:
+    checkNeverEndingRecursion(ast, bodies, namedCaptures, p.sawGroupRead)
   # What a look-behind body may hold, and absent operators reached through
   # calls.  After the reference checks, as Oniguruma reports those while
   # parsing and this one while tuning: ``(?<!(a))\5`` is a bad reference there.

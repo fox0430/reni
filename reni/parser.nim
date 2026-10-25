@@ -39,6 +39,9 @@ type Parser* = object
   sawBareNameCondition*: bool
     ## True once a condition whose text may be a group's name has been parsed,
     ## so the compiler can skip ``resolveBareNameConditions`` without one.
+  sawCall*: bool
+    ## True once a subexpression call has been parsed, so the compiler can
+    ## skip ``checkNeverEndingRecursion`` when nothing calls a group.
   branchlessNames*: seq[(string, int)]
     ## Each bare-name condition with no branch, ``(?(n))``, and where the
     ## ``)`` after it is.  The name has to be a group's, which ``re`` checks
@@ -105,6 +108,11 @@ proc appendDecimal(value: var int, digit: char) =
   if value > (high(int) - n) div 10:
     raise newException(RegexError, "numeric regex argument is too large")
   value = value * 10 + n
+
+proc callNode(p: var Parser, index: int, name: string): Node =
+  ## A subexpression call, noted in ``p.sawCall``.
+  p.sawCall = true
+  Node(kind: nkSubexpCall, callIndex: index, callName: name)
 
 proc relativeForwardIndex(p: Parser, index: int): int =
   if index > high(int) - p.captureCount:
@@ -851,7 +859,7 @@ proc parseEscape(p: var Parser): Node =
         p.error("invalid relative subexp call '\\g<-" & $n & ">'")
     else:
       callName = name
-    result = Node(kind: nkSubexpCall, callIndex: callIndex, callName: callName)
+    result = p.callNode(callIndex, callName)
   of 'Q':
     p.advance()
     p.inLiteralQuote = true
@@ -1548,14 +1556,14 @@ proc parseGroup(p: var Parser): Node =
       elif p.peek == 'R':
         # (?R) — whole pattern recursion (= \g<0>)
         p.advance()
-        result = Node(kind: nkSubexpCall, callIndex: 0, callName: "")
+        result = p.callNode(0, "")
       elif p.peek in {'0' .. '9'}:
         # (?1), (?2), etc. — numeric subroutine call (= \g<n>)
         var n = 0
         while not p.atEnd and p.peek in {'0' .. '9'}:
           appendDecimal(n, p.peek)
           p.advance()
-        result = Node(kind: nkSubexpCall, callIndex: n, callName: "")
+        result = p.callNode(n, "")
       elif p.peek == '+':
         # (?+1) — relative forward subroutine call
         p.advance()
@@ -1563,8 +1571,7 @@ proc parseGroup(p: var Parser): Node =
         while not p.atEnd and p.peek in {'0' .. '9'}:
           appendDecimal(n, p.peek)
           p.advance()
-        result =
-          Node(kind: nkSubexpCall, callIndex: p.relativeForwardIndex(n), callName: "")
+        result = p.callNode(p.relativeForwardIndex(n), "")
       elif p.peek == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] in {'0' .. '9'}:
         # (?-1) — relative backward subroutine call
         p.advance()
@@ -1575,7 +1582,7 @@ proc parseGroup(p: var Parser): Node =
         let ci = p.captureCount - n + 1
         if ci < 1:
           p.error("invalid relative subexp call '(?-" & $n & ")'")
-        result = Node(kind: nkSubexpCall, callIndex: ci, callName: "")
+        result = p.callNode(ci, "")
       elif p.peek == '&':
         # (?&name) — named subroutine call (= \g<name>)
         p.advance()
@@ -1585,7 +1592,7 @@ proc parseGroup(p: var Parser): Node =
           p.advance()
         if name.len == 0:
           p.error("empty subroutine name")
-        result = Node(kind: nkSubexpCall, callIndex: -1, callName: name)
+        result = p.callNode(-1, name)
       elif p.peek == 'P' and p.pos + 1 < p.src.len and
           p.src[p.pos + 1] in {'<', '=', '>'}:
         p.advance() # skip 'P'
@@ -1618,7 +1625,7 @@ proc parseGroup(p: var Parser): Node =
             p.advance()
           if name.len == 0:
             p.error("empty subroutine name")
-          result = Node(kind: nkSubexpCall, callIndex: -1, callName: name)
+          result = p.callNode(-1, name)
       # Try to parse inline flags: (?imx-imx:...) or (?imx)
       elif p.peek in FlagChars or p.peek == '-':
         var flagsOn: RegexFlags = {}
