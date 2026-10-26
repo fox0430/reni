@@ -1147,10 +1147,14 @@ suite "repeat tuning":
     check re("(?:ab){2}").ast.bytes == "abab"
     check search("aaa", re("a{3}")).matchSpan == 0 .. 3
     check search("abab", re("(?:ab){2}")).matchSpan == 0 .. 4
-    # An escaped literal takes the nkEscapedLiteral branch.
+    # A character escaped as itself is a literal, and a code takes the
+    # nkEscapedLiteral branch.
     check re("\\*{3}").ast.kind == nkString
     check re("\\*{3}").ast.bytes == "***"
     check search("***", re("\\*{3}")).matchSpan == 0 .. 3
+    check re("\\x2A{3}").ast.kind == nkString
+    check re("\\x2A{3}").ast.bytes == "***"
+    check search("***", re("\\x2A{3}")).matchSpan == 0 .. 3
     # Not an exact count, not a literal body, and past the length bound: each
     # stays a repeat.
     check shapes("a{2,3}") == @[(2, 3, qkGreedy)]

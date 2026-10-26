@@ -188,8 +188,8 @@ type
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
     ## parsed trees; node kinds may change at any time without notice.
-    nkLiteral ## single rune
-    nkEscapedLiteral ## \n, \t, \x{HHHH}, etc.
+    nkLiteral ## single rune, written plain or escaped as itself: a, \.
+    nkEscapedLiteral ## a rune written as a code: \n, \t, \x{HHHH}, etc.
     nkConcat ## sequence of nodes
     nkAlternation ## a|b
     nkCapture ## (...) capturing group

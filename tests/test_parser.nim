@@ -192,11 +192,12 @@ suite "Step 5: Escape sequences":
     check re("\\ca").ast.escapedRune == Rune(1) # control-a
 
   test "literal escape \\\\":
-    check re("\\\\").ast.escapedRune == Rune(ord('\\'))
+    check re("\\\\").ast.rune == Rune(ord('\\'))
 
   test "escaped dot":
-    check re("\\.").ast.kind == nkEscapedLiteral
-    check re("\\.").ast.escapedRune == Rune(ord('.'))
+    # Escaped as itself, it is the plain character, as Oniguruma reads it.
+    check re("\\.").ast.kind == nkLiteral
+    check re("\\.").ast.rune == Rune(ord('.'))
 
   test "backreference \\1":
     let r = re("(a)\\1")
@@ -805,6 +806,63 @@ suite "Bug fixes and validation":
     # ``(?i)(?i)a`` nests as ``(?i:(?i:a))`` does, in Oniguruma too.
     check search("A", re("(?i)".repeat(256) & "a")).found
     check compileError("(?i)".repeat(257) & "a").startsWith("nesting too deep")
+
+  test "a repeat after a group of characters under {1} takes the last one":
+    # Oniguruma drops ``{1}`` and the ``(?:...)`` with it, so the next repeat
+    # meets the bare characters and takes the last alone, as after ``ab``.
+    check search("xa", re("x(?:ab){1}?")).matchSpan == 0 .. 2
+    check search("abbb", re("(?:ab){1}+")).matchSpan == 0 .. 4
+    check search("abcc", re("(?:abc){1}{2}")).matchSpan == 0 .. 4
+    check search("a", re("(?:(?:ab){1}){1}?")).matchSpan == 0 .. 1
+    check search("a", re("(?:ab){1}(?#c)?")).matchSpan == 0 .. 1
+    check search("a", re("(?:a\\.){1}?")).matchSpan == 0 .. 1
+    # ``\p`` with no property after it is the letter, as ``\.`` is the dot.
+    check search("ap", re("(?:a\\pb){1}?")).matchSpan == 0 .. 2
+    # A ``{1}`` on the last character drops as the one around the group does
+    # and leaves the string whole; one before the last ends the string.
+    check search("abb", re("(?:ab{1}){1}{2}")).matchSpan == 0 .. 3
+    check search("a", re("(?:\\Qab\\E{1}){1}?")).matchSpan == 0 .. 1
+    check search("a", re("(?:a{1}b){1}?")).matchSpan == 0 .. 0
+    # Not without the ``{1}``, nor when a code, a group or a capture is there:
+    # those are no one string to it.
+    check search("x", re("x(?:ab)?")).matchSpan == 0 .. 1
+    check search("a", re("(?:a\\tb){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:a(?:b)){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(ab){1}?")).matchSpan == 0 .. 0
+    # ``\M-x`` is a code to Oniguruma, which reni reads as the letter M.
+    check search("M", re("(?:\\M-ab){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:a\\M-b){1}?")).matchSpan == 0 .. 0
+    # A ``\Q...\E`` quote is a string of its own: alone it splits, and with
+    # anything around it the run is two strings.
+    check search("a", re("(?:\\Qab\\E){1}?")).matchSpan == 0 .. 1
+    check search("a", re("(?:a\\Qb\\E){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:\\Qa\\Eb){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:\\Qa\\E\\Qb\\E){1}?")).matchSpan == 0 .. 0
+    # An empty one is an empty string, and Oniguruma reads a bare ``\E`` as
+    # E: the characters around either are no one string, even when the group
+    # holds nothing else.
+    check search("a", re("(?:ab\\Q\\E){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:a\\Q\\Eb){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:\\Q\\Eab){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:\\Qab\\E\\Q\\E){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:(?:ab){1}\\Q\\E){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:(?:ab\\Q\\E){1}){1}?")).matchSpan == 0 .. 0
+    check search("a", re("(?:a\\Eb){1}?")).matchSpan == 0 .. 0
+    # A repeat after either goes to the atom before it, whole.  Oniguruma
+    # gives it to the empty string or the E, and splits nothing either.
+    check search("xa", re("x(?:ab){1}\\Q\\E?")).matchSpan == 0 .. 1
+    check search("xa", re("x(?:ab){1}\\E?")).matchSpan == 0 .. 1
+
+  test "a repeat that splits a run of characters still nests a level":
+    # As the dropped ``{1}`` counts toward Oniguruma's parse depth, and as
+    # ``(?:a){1}?`` counts here.  A setjmp build runs out of stack budget
+    # before 255 groups (see test_stack_budget).
+    when not compileOption("exceptions", "setjmp"):
+      for inner in ["(?:ab){1}?", "(?:a){1}?"]:
+        check compileError("(?:".repeat(254) & inner & ")".repeat(254)) == ""
+        check compileError("(?:".repeat(255) & inner & ")".repeat(255)).startsWith(
+          "nesting too deep"
+        )
 
   test "a condition number past 32 bits is a pattern":
     # Oniguruma's ``scan_number`` gives up past ``high(int32)``, and the

@@ -34,6 +34,11 @@ type Parser* = object
     ## and the isolated ``(?I)a`` one, which spans the rest of its own group
     ## but still may not have siblings outside the wrappers around it.
   inLiteralQuote: bool ## true when inside \Q...\E
+  bodyParted: bool
+    ## Whether the concat [parseConcat] returned last is more than one string
+    ## to Oniguruma's parser, or its one node is a group whose body is:
+    ## ``ab\Q\E``, ``(?:ab\Q\E)``.  [splitRun] reads it for the group just
+    ## parsed, the one whose body that concat was.
   sawPlainGroup*: bool
     ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
     ## skip [flattenLiteralGroups] when there is nothing to find.
@@ -286,6 +291,68 @@ proc skipComment(p: var Parser): bool =
     p.advance()
   p.expect(')')
   true
+
+func underOnes(node: Node): Node =
+  ## ``node`` under the ``{1}`` repeats around it, which Oniguruma's parser
+  ## drops.
+  result = node
+  while result.kind == nkQuantifier and result.quantMin == 1 and result.quantMax == 1:
+    result = result.quantBody
+
+func plainRun(node: Node, run: var seq[Node]): bool =
+  ## Collect the characters of ``node`` when it is one string to Oniguruma's
+  ## parser, through any ``(?:...)`` and ``{1}`` around it, which that parser
+  ## drops: characters written plain or escaped as themselves, ``a\.b``, or
+  ## one ``\Q...\E`` quote alone, and a ``{1}`` on the last, ``ab{1}``.
+  ## ``(?:a(?:b))``, ``(?:a\tb)`` and ``a{1}b`` are two or more.  A body
+  ## parted by a quote or an empty node, ``(?:a\Qb\E)``, ``(?:ab\Q\E)``,
+  ## looks the same here: the caller checks [Parser.bodyParted].
+  if node == nil:
+    return false
+  let node = underOnes(node)
+  case node.kind
+  of nkLiteral:
+    run.add node
+    true
+  of nkConcat:
+    for i, child in node.children.view:
+      # A ``{1}`` drops without parting the string, but ends it: only the
+      # last character may carry one.
+      let c =
+        if i == node.children.high:
+          underOnes(child)
+        else:
+          child
+      if c.kind != nkLiteral:
+        return false
+      run.add c
+    true
+  of nkGroup:
+    plainRun(node.groupBody, run)
+  else:
+    false
+
+proc splitRun(p: Parser, node: Node): seq[Node] =
+  ## Take from ``node``, a repeat of a repeat, the characters its first
+  ## repeat that is no ``{1}`` splits off, to go in front of it.  Oniguruma
+  ## drops ``X{1}``, and the ``(?:...)`` of one string with it, so a repeat
+  ## after one takes the last character of the string alone: ``(?:ab){1}?``
+  ## is ``ab?``.  The repeat keeps the level the dropped ``{1}`` gave it, as
+  ## that counts toward Oniguruma's parse depth.  Called right after the atom
+  ## is parsed, so [Parser.bodyParted] is the atom's body's when it is a
+  ## group; any other atom makes no run of two characters.
+  var split: Node = nil
+  var q = node
+  while q.kind == nkQuantifier:
+    if not (q.quantMin == 1 and q.quantMax == 1):
+      split = q
+    q = q.quantBody
+  if split == nil or split.quantBody.kind != nkQuantifier:
+    return
+  var run: seq[Node]
+  if not p.bodyParted and plainRun(split.quantBody, run) and run.len > 1:
+    split.quantBody = run.pop()
+    result = run
 
 proc parseQuantifier(p: var Parser, body: Node, reach: var int): Node =
   ## Apply the repeat at ``p.pos`` to ``body``, whose deepest level is
@@ -743,7 +810,7 @@ proc parseEscape(p: var Parser): Node =
         p.advance()
       p.expect('}')
     elif p.atEnd or p.peek notin PropertyLetters:
-      return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('p')))
+      return Node(kind: nkLiteral, rune: Rune(ord('p')))
     else:
       name.add(p.peek)
       p.advance()
@@ -774,7 +841,7 @@ proc parseEscape(p: var Parser): Node =
         p.advance()
       p.expect('}')
     elif p.atEnd or p.peek notin PropertyLetters:
-      return Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('P')))
+      return Node(kind: nkLiteral, rune: Rune(ord('P')))
     else:
       name.add(p.peek)
       p.advance()
@@ -902,26 +969,25 @@ proc parseEscape(p: var Parser): Node =
       callName = name
     result = p.callNode(callIndex, callName)
   of 'Q':
+    # Open a quote: [parseAtom] reads its characters and the ``\E`` that
+    # closes it, and [parseConcat] takes the empty node here as its start.
+    # A ``\Q`` at the end quotes nothing.
     p.advance()
-    p.inLiteralQuote = true
-    # Return the first character inside \Q as a literal
-    if p.atEnd:
-      p.inLiteralQuote = false
-      result = Node(kind: nkConcat, children: @[])
-    elif p.peek == '\\' and p.pos + 1 < p.src.len and p.src[p.pos + 1] == 'E':
-      p.pos += 2 # empty \Q\E
-      p.inLiteralQuote = false
-      result = Node(kind: nkConcat, children: @[])
-    else:
-      let r = p.advanceRune()
-      result = Node(kind: nkLiteral, rune: r)
+    p.inLiteralQuote = not p.atEnd
+    result = Node(kind: nkConcat, children: @[])
   of 'E':
-    # \E outside \Q...\E — ignore (treat as empty)
+    # \E outside \Q...\E — ignore (treat as empty).  Oniguruma reads it as
+    # the letter E, so ``a\Eb`` is no string ``ab`` to it.
     p.advance()
     result = Node(kind: nkConcat, children: @[])
+  of 'M':
+    # Oniguruma's ``\M-x`` is a code, ``x`` with the high bit set, which reni
+    # reads as the letter M: a code still parts the characters around it.
+    p.advance()
+    result = Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('M')))
   else:
     let r = p.advanceRune()
-    result = Node(kind: nkEscapedLiteral, escapedRune: r)
+    result = Node(kind: nkLiteral, rune: r)
 
 proc parseCalloutVerb(p: var Parser): Node =
   ## Parse a backtracking control verb: (*FAIL), (*MAX{n}), etc.
@@ -1287,6 +1353,11 @@ proc parseConcat(p: var Parser): Node =
   p.reach = max(p.reach, p.depth)
   let savedConcatCount = p.concatNodeCount
   p.concatNodeCount = 0
+  # The concat is more than one string to Oniguruma's parser once it holds
+  # more nodes than this; see the empty nodes below.
+  var partedPast = high(int)
+  var quoted = false # a ``\Q...\E`` quote is open
+  p.bodyParted = false
   while not p.atEnd:
     if not p.inLiteralQuote:
       p.skipWhitespaceAndComments()
@@ -1338,12 +1409,30 @@ proc parseConcat(p: var Parser): Node =
       if isolatedNeedsExclusive:
         p.requiresExclusive = true
       break
-    # Skip empty nodes from \E; the repeats after one go to the atom before
+    # Skip empty nodes: ``\Q`` opening a quote, the ``\E`` closing it, a bare
+    # ``\E`` and ``(?)``.  The repeats after one go to the atom before.  To
+    # Oniguruma's parser a quote is a string of its own, even empty, and a
+    # bare ``\E`` the letter E, and ``(?)`` is read as ``(?:)``, so the concat
+    # is more than one string with a quote and anything before or after it,
+    # ``a\Qb\E``, ``ab\Q\E``, ``\Qa\Eb``, or with ``\E`` or ``(?)`` anywhere.
     if node.kind == nkConcat and node.children.len == 0:
+      if p.inLiteralQuote:
+        quoted = true
+        if nodes.len > 0:
+          partedPast = -1
+      elif quoted:
+        quoted = false
+        partedPast = min(partedPast, nodes.len)
+      else:
+        partedPast = -1
       if not p.inLiteralQuote and nodes.len > 0:
         p.parseRepeats(nodes[^1], lastReach)
         p.reach = max(p.reach, lastReach)
       continue
+    # A repeat that splits a run of characters takes the last alone, after
+    # the rest.
+    if node.kind == nkQuantifier and node.quantBody.kind == nkQuantifier:
+      nodes.add p.splitRun(node)
     nodes.add(node)
     lastReach = reach
     p.concatNodeCount = nodes.len
@@ -1356,6 +1445,11 @@ proc parseConcat(p: var Parser): Node =
   # ``(?I:a)|b`` while taking ``(?I:a|b)``, where the bar is inside the body.
   if p.requiresExclusive and nodes.len == 1 and not p.atEnd and p.peek != ')':
     p.error("invalid combination of options")
+  # A concat of one node is parted when that node's body is,
+  # ``(?:(?:ab\Q\E){1})``: that body is the concat whose end set
+  # [bodyParted] last, as no other atom here parses one, and a node with no
+  # body leaves it as reset above.
+  p.bodyParted = nodes.len > partedPast or nodes.len == 1 and p.bodyParted
   p.concatNodeCount = savedConcatCount
   case nodes.len
   of 0:
@@ -1617,7 +1711,8 @@ proc parseGroup(p: var Parser): Node =
     p.advance() # skip '?'
     case p.peek
     of ')':
-      # (?) empty group — treat as empty non-capturing group
+      # (?) empty group — treat as empty non-capturing group, which parts
+      # the characters around it as ``(?:)`` does
       result = Node(kind: nkConcat, children: @[])
     of ':':
       # (?:...) non-capturing group
