@@ -109,13 +109,40 @@ proc buildLeafGates*(nodes: seq[Node], flags: RegexFlags): seq[LeafGate] =
     gate.runnable = leafRunAccepts(node, flags, gate.accept)
     result[i] = gate
 
+proc foldSourceMask(node: Node, flags: RegexFlags): uint32 =
+  ## Bit ``i`` set for each source ``MultiCharFolds[i]`` class ``node``
+  ## holds, by the membership test ``classWays`` asks of the atoms where no
+  ## [ClassFold] stands, or 0 where [classFoldsApply] rules them all out.
+  if not classFoldsApply(node, flags):
+    return
+  for i, f in MultiCharFolds:
+    let src = Rune(f.source)
+    for atom in node.atoms:
+      if matchCcAtomWithFold(src, atom, flags):
+        result = result or (1'u32 shl i)
+        break
+
+proc classHoldsFoldSource*(node: Node, flags: RegexFlags): bool =
+  ## Whether class ``node`` holds a character with a multi-character fold
+  ## under ``flags``: any of [AllMultiCharFoldSources], not only those the
+  ## matcher expands.  Oniguruma's parser makes such a class an alternation
+  ## of the class and each fold's string.  Asks the atoms, so it answers on
+  ## the parser's node, before the compiler sets ``asciiSet``.
+  if not classFoldsApply(node, flags):
+    return false
+  for (first, last) in AllMultiCharFoldSources:
+    for cp in first .. last:
+      for atom in node.atoms:
+        if matchCcAtomWithFold(Rune(cp), atom, flags):
+          return true
+  false
+
 proc classFoldExhaustive(node: Node, flags: RegexFlags): ClassFold =
   ## [ClassFold] of class ``node`` under ``flags``.  Each answer runs the
   ## matcher's own test: ``classHasByte``'s atom walk for every byte below
-  ## 0x80, and for every source in ``MultiCharFolds`` the membership test
-  ## ``classWays`` asks of the atoms where no [ClassFold] stands, unless
-  ## [classFoldsApply] rules them all out.  [classFoldOf] answers from it
-  ## where its shortcut does not reach, and the tests hold the shortcut to it.
+  ## 0x80, and [foldSourceMask] for the sources.  [classFoldOf] answers from
+  ## it where its shortcut does not reach, and the tests hold the shortcut to
+  ## it.
   result = ClassFold(flags: flags, derived: true)
   for b in 0'u8 .. 0x7F'u8:
     let r = Rune(int32(b))
@@ -128,14 +155,7 @@ proc classFoldExhaustive(node: Node, flags: RegexFlags): ClassFold =
       ):
         result.ascii.incl b
         break
-  if not classFoldsApply(node, flags):
-    return
-  for i, f in MultiCharFolds:
-    let src = Rune(f.source)
-    for atom in node.atoms:
-      if matchCcAtomWithFold(src, atom, flags):
-        result.folds = result.folds or (1'u32 shl i)
-        break
+  result.folds = foldSourceMask(node, flags)
 
 type FoldSourceRunes = object
   runes: array[4, int32] ## The source first, then what shares its fold.

@@ -931,7 +931,13 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool
 proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
 proc runContFromMachine(ctx: MatchContext, cont: ContId): bool
 proc unwindAbsentFrames(ctx: MatchContext, base: int)
-proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int
+proc findAbsentPos(
+  ctx: MatchContext,
+  absentBody: Node,
+  fromPos: int,
+  loopLeaf: Node = nil,
+  loopHi: int32 = -1,
+): int
 
 proc runCont(ctx: MatchContext, cont: ContId): bool
 
@@ -2097,8 +2103,8 @@ proc leadLeafEnd(ctx: MatchContext, node: Node): int {.inline.} =
   ## End offset of the leaf matched at ``ctx.pos``, or -1. One character test,
   ## no writes. ``nkString`` tests the whole run; only the lazy scan reaches it.
   ## A literal or class here is single-way ([isSingleWayLeaf]), as the search
-  ## pins for its lead leaf and the lazy scan checks before it runs, so its
-  ## plain way is its only one.
+  ## pins for its lead leaf and the lazy scan and [absentLoopStep] check
+  ## before they run, so its plain way is its only one.
   case node.kind
   of nkLiteral, nkEscapedLiteral, nkCharClass:
     when not defined(release):
@@ -3088,14 +3094,65 @@ proc absentBodyMatches(ctx: MatchContext, absentBody: Node): bool {.inline.} =
   result = matchWithCont(ctx, absentBody, TrueCont)
   dec ctx.absentScan
 
-proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int =
+static:
+  # [absentLoopStep] rests on this: no character folds both like a
+  # multi-character fold's source and like its expansion's first character,
+  # so a literal's plain way and its fold way never both fit at one place.
+  for f in MultiCharFolds:
+    doAssert simpleFold(Rune(f.source)) != simpleFold(Rune(f.expansion[0])),
+      "a fold source folds like its expansion's first character"
+
+proc absentLoopStep(ctx: MatchContext, leaf: Node, oneWay: bool): int =
+  ## End of the repetition of ``leaf`` from ``ctx.pos``, or -1 where it
+  ## refuses the character.  ``oneWay`` carries [isSingleWayLeaf]'s answer.
+  ## A literal with a multi-character fold steps by the way that fits:
+  ## ``(?i)ﬁ`` takes ``ﬁ`` or ``fi``, never both at one place, so its
+  ## repetitions still start at one place each.  A class has its plain way
+  ## alone here, since the parser leaves one holding a fold source out of the
+  ## loop, and a type or a string always has one way.
+  if oneWay:
+    return leadLeafEnd(ctx, leaf)
+  when not defined(release):
+    doAssert leaf.kind in {nkLiteral, nkEscapedLiteral, nkCharClass},
+      "a loop leaf with a second way that is no literal or class"
+  result = -1
+  var ways = leafWays(ctx, leaf)
+  while ways != 0:
+    let v = countTrailingZeroBits(ways)
+    ways = ways and (ways - 1)
+    let e = leafVariantAdvance(ctx, leaf, v)
+    if e >= 0:
+      when not defined(release):
+        doAssert result < 0 or e == result, "two ways of a loop leaf end apart"
+      result = e
+
+proc findAbsentPos(
+    ctx: MatchContext,
+    absentBody: Node,
+    fromPos: int,
+    loopLeaf: Node = nil,
+    loopHi: int32 = -1,
+): int =
   ## First pos at/after `fromPos` where `absentBody` matches, else
   ## `absentEnd`. Closed sub-matches only; restores `pos`. Measured against
   ## ``absentEnd``: a look-behind window must not narrow an absent range.
+  ##
+  ## Every character is a start, unless ``loopLeaf`` repeats in the loop
+  ## around the pattern (``absentLoopsOnExpr``): Oniguruma then tries the
+  ## pattern where each repetition starts and nowhere else, at no more than
+  ## ``loopHi`` starts (-1 for no bound) and none past the first character
+  ## the leaf refuses.  Past those E cannot reach, so the scan stops there.
   result = ctx.absentEnd
   let entryPos = ctx.pos
+  let savedLimit = ctx.lookLimit
+  let oneWay = loopLeaf != nil and isSingleWayLeaf(ctx, loopLeaf)
+  var startsLeft =
+    if loopLeaf == nil:
+      -1
+    else:
+      int(loopHi)
   var checkPos = fromPos
-  while checkPos < ctx.absentEnd:
+  while checkPos < ctx.absentEnd and startsLeft != 0:
     let saved = save(ctx)
     ctx.pos = checkPos
     if ctx.absentBodyMatches(absentBody):
@@ -3103,11 +3160,28 @@ proc findAbsentPos(ctx: MatchContext, absentBody: Node, fromPos: int): int =
       restore(ctx, saved)
       break
     restore(ctx, saved)
-    if checkPos >= ctx.absentEnd:
-      break
-    var r: Rune
-    nextCharAt(ctx.subject.oa, checkPos, r)
+    if loopLeaf != nil:
+      # Step as E does, but measured against ``absentEnd`` as above.
+      ctx.pos = checkPos
+      ctx.lookLimit = NoLookLimit
+      let next = absentLoopStep(ctx, loopLeaf, oneWay)
+      ctx.lookLimit = savedLimit
+      if next <= checkPos:
+        break
+      checkPos = next
+      if startsLeft > 0:
+        dec startsLeft
+    else:
+      var r: Rune
+      nextCharAt(ctx.subject.oa, checkPos, r)
   ctx.pos = entryPos
+
+proc findExprAbsentPos(ctx: MatchContext, node: Node, fromPos: int): int =
+  ## [findAbsentPos] for ``(?~|X|E)`` entered at ``fromPos``.  When E is the
+  ## loop around X (``absentLoopsOnExpr``), X runs only where E's
+  ## repetitions start, and never under ``{0}``; any other E has no
+  ## ``absentLoopLeaf``, and X runs at every character.
+  findAbsentPos(ctx, node.absentBody, fromPos, node.absentLoopLeaf, node.absentLoopHi)
 
 proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
   ## Recursive fallback only; the loop answers absent shapes itself.
@@ -3159,23 +3233,7 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
   of abExpression:
     # (?~|absent|expr) - match expr, limiting range to exclude absent
     let startPos = ctx.pos
-    let absentBody {.cursor.} = node.absentBody
-    # Find first position where absent matches
-    var absentPos = ctx.absentEnd
-    block findAbsent:
-      var checkPos = startPos
-      while checkPos < ctx.absentEnd:
-        let saved = save(ctx)
-        ctx.pos = checkPos
-        if ctx.absentBodyMatches(absentBody):
-          absentPos = checkPos
-          restore(ctx, saved)
-          break findAbsent
-        restore(ctx, saved)
-        if checkPos >= ctx.absentEnd:
-          break
-        var r: Rune
-        nextCharAt(ctx.subject.oa, checkPos, r)
+    let absentPos = findExprAbsentPos(ctx, node, startPos)
     # Limit matching range to [startPos, absentPos)
     let savedEnd = ctx.absentEnd
     ctx.pos = startPos
@@ -4521,7 +4579,7 @@ proc runMachine(
         of abExpression:
           # (?~|absent|expr): match expr narrowed, widen after.
           let startPos = ctx.pos
-          let absentPos = findAbsentPos(ctx, node.absentBody, startPos)
+          let absentPos = findExprAbsentPos(ctx, node, startPos)
           let savedEnd = ctx.absentEnd
           ctx.absentEnd = absentPos
           ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)

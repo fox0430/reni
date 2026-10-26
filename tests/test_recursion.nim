@@ -227,6 +227,86 @@ suite "Mutual recursion detection":
       expect RegexError:
         discard re(pattern)
 
+  test "a greedy repeat of one character is the loop around an absent pattern":
+    # Oniguruma runs the absent pattern in the repeat's own loop, so ``{0}``
+    # never runs it, nor marks the groups its calls reach.  What its parser
+    # makes of the expression counts: ``(?:a{0}){5}`` is ``a{0}``.
+    for pattern in [
+      "(?~|\\g<0>|a{0})", "(?~|\\g<0>|(?:a){0})", "(?~|\\g<0>|\\d{0})",
+      "(?~|\\g<0>|[ab]{0})", "(?~|\\g<0>|(?:a{0}){5})", "(((?~|(\\g<3>)|a{0})))",
+    ]:
+      check search("x", re(pattern)).matchSpan == 0 .. 0
+    # Two characters, a ``\w``, a lazy repeat or ``{1}`` are no such loop, and
+    # neither is a group that captured while the pattern was parsed.
+    for pattern in [
+      "(?~|\\g<0>|(?:ab){0})", "(?~|\\g<0>|\\w{0})", "(?~|\\g<0>|a{0}?)",
+      "(?~|\\g<0>|a{1})", "(?<n>(?~|\\g<n>|(a){0}))",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    # Oniguruma makes a ``\p{Word}`` outside ``[...]`` the node of ``\w``, in
+    # any spelling and either sense; inside, it is a class.
+    for pattern in [
+      "(?~|\\g<0>|\\p{Word}{0})", "(?~|\\g<0>|\\p{^Word}{0})",
+      "(?~|\\g<0>|\\P{Word}{0})", "(?~|\\g<0>|\\P{^Word}{0})",
+      "(?~|\\g<0>|\\p{w_O-r d}{0})", "(a|(?~|\\g<0>|\\p{Word}{0}))",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    for pattern in [
+      "(?~|\\g<0>|[\\p{Word}]{0})", "(?~|\\g<0>|[[:word:]]{0})",
+      "(?~|\\g<0>|\\p{Alnum}{0})",
+    ]:
+      check search("x", re(pattern)).matchSpan == 0 .. 0
+    # Nor is a ``[...]`` holding a character with a multi-character fold under
+    # ``(?i)``, which Oniguruma's parser makes an alternation: ``[ß]|ss``.  A
+    # negated class, ``\p{...}``, a literal and ``(?iI)`` take no such fold.
+    for pattern in [
+      "(?i)(?~|\\g<0>|[ß]{0})",
+      "(?i)(?~|\\g<0>|[ẞ]{0})",
+      "(?i)(?~|\\g<0>|[sﬁ]{0})",
+      "(?i)(?~|\\g<0>|[\\p{Ll}]{0})",
+      "(?i)(?~|\\g<0>|(?>[ß]{0}))",
+      "(?i:(?~|\\g<0>|(?:[ß]){0}))",
+      # Folds the matcher does not expand count too.
+      "(?i)(?~|\\g<0>|[ᾀ]{0})",
+      "(?i)(?~|\\g<0>|[ᾈ]{0})",
+      "(?i)(?~|\\g<0>|[ﬓ]{0})",
+      "(?i)(?~|\\g<0>|[\\p{Lt}]{0})",
+    ]:
+      expect RegexError:
+        discard re(pattern)
+    expect RegexError:
+      discard re("(?~|\\g<0>|[ß]{0})", {rfIgnoreCase})
+    for pattern in [
+      "(?i)(?~|\\g<0>|[^ß]{0})", "(?i)(?~|\\g<0>|\\p{Ll}{0})", "(?i)(?~|\\g<0>|ß{0})",
+      "(?iI)(?~|\\g<0>|[ß]{0})", "(?~|\\g<0>|[ß]{0})",
+    ]:
+      check search("x", re(pattern)).matchSpan == 0 .. 0
+    check search("ax", re("(?i)a(?-i)(?~|\\g<0>|[ß]{0})")).matchSpan == 0 .. 1
+    # Exact counts multiply only while Oniguruma's ``int`` holds the product.
+    # Past it Oniguruma refuses the pattern, and here the pair stays as
+    # written, so the expression is no loop and ``\g<0>`` is reached first.
+    check not search("a", re("(?~|x|(?:(?:(?:a{100000}){100000}){100000}){100000})")).found
+    expect RegexError:
+      discard re("(?~|\\g<0>|(?:(?:a{100000}){100000}){0})")
+
+  test "the matcher never runs the absent pattern a {0} loop holds either":
+    # Accepted for that reason, its recursion never ends, so running it at
+    # each position of a long subject only reached the step limit.  The spans
+    # are libonig 6.9.10's.
+    check search("a".repeat(20_000), re("(?~|a*\\g<0>|b{0})")).matchSpan == 0 .. 0
+    check search("a".repeat(1000), re("(?~|(a*)\\g<1>?\\g<0>|b{0})")).matchSpan == 0 .. 0
+    check search("a", re("(?~|(\\g<1>*+\\g<0>?+)?+|(?:a){0})")).matchSpan == 0 .. 0
+
+  test "an absent pattern's length is worked out where Oniguruma walks it":
+    # Group 1's length is being worked out when ``\1`` in the absent pattern
+    # is measured, so group 3, a call to group 1, counts as empty from then
+    # on, and ``\g<0>`` after it is reached before anything is consumed.
+    expect RegexError:
+      discard re("(?~(?~(?~\\1))|(a(\\3))|(\\g<1>)\\g<0>)")
+    check search("aaa", re("(?~(?~(?~\\2))|(a(\\3))|(\\g<1>)\\g<0>)")).found
+
   test "a conditional's yes branch starts where its condition ends":
     for pattern in [
       "(?<n>(?(<n>)\\g<n>|b))", "(?<n>(?(*FAIL)a|\\g<n>))",

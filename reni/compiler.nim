@@ -108,7 +108,10 @@ proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
     Node(
       kind: nkAbsent,
       absentKind: node.absentKind,
+      absentLoopsOnExpr: node.absentLoopsOnExpr,
       absentPos: node.absentPos,
+      absentLoopLo: node.absentLoopLo,
+      absentLoopHi: node.absentLoopHi,
       absentBody: demoteUnnamedCaptures(node.absentBody, indexMap),
       absentExpr: demoteUnnamedCaptures(node.absentExpr, indexMap),
     )
@@ -371,8 +374,17 @@ proc consumes(c: var RecursionCheck, node: Node): bool =
     result = slot >= 0 and c.groupConsumes(slot)
   of nkAbsent:
     # Only ``(?~|X|E)`` holds what ``E`` consumes; the other forms may stop
-    # where they start.
-    result = node.absentKind == abExpression and c.consumes(node.absentExpr)
+    # where they start.  An E that is the loop around X
+    # (``absentLoopsOnExpr``) consumes when it must run, and then works out X
+    # first, as it holds X.
+    if node.absentKind != abExpression:
+      result = false
+    elif node.absentLoopsOnExpr:
+      result = node.absentLoopLo > 0
+      if result:
+        discard c.consumes(node.absentBody)
+    else:
+      result = c.consumes(node.absentExpr)
   of nkConditional:
     var yes = node.condKind == ckRegexCond and c.consumes(node.condBody)
     if c.consumes(node.condYes):
@@ -463,18 +475,27 @@ proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8 =
   of nkLookaround:
     result = c.recursionFlags(node.lookBody, head)
   of nkAbsent:
-    # Oniguruma tries the absent pattern in a loop that may stop before it,
-    # so no recursion in it is one every path takes.
-    if node.absentBody != nil:
+    # Oniguruma tries the absent pattern X in a loop that may stop before it
+    # (``make_absent_engine``), so no recursion in it is one every path
+    # takes.  X stands in a sequence in that loop, so its length is worked
+    # out once it is walked, as is E's after it, in the sequence the tree of
+    # ``(?~|X|E)`` is.  An E that is the loop around X (``absentLoopsOnExpr``)
+    # is no part of that sequence, and E{0} never runs X.
+    let loops = node.absentLoopsOnExpr
+    if node.absentBody != nil and (not loops or node.absentLoopHi != 0):
       let flags = c.recursionFlags(node.absentBody, head)
       if (flags and RecursionInfinite) != 0:
         return flags
       result = flags and RecursionExist
-    if node.absentKind == abExpression:
+      if head:
+        discard c.consumes(node.absentBody)
+    if node.absentKind == abExpression and not loops:
       let flags = c.recursionFlags(node.absentExpr, head)
       if (flags and RecursionInfinite) != 0:
         return flags
       result = result or flags
+      if head:
+        discard c.consumes(node.absentExpr)
   of nkConditional:
     let cond = if node.condKind == ckRegexCond: node.condBody else: nil
     result = c.recursionFlags(cond, head)
@@ -596,7 +617,9 @@ proc markCalled(
 ) =
   ## Oniguruma's ``tune_call2``: mark the groups a call that can run reaches,
   ## adding each to ``pending`` for its body to be marked in turn.  Outside a
-  ## called body, a call under ``{0}`` cannot run.
+  ## called body, a call under ``{0}`` cannot run, nor one in the absent
+  ## pattern of ``(?~|X|E{0})``, where E is the loop around X
+  ## (``absentLoopsOnExpr``) and holds no call itself.
   if node == nil:
     return
   case node.kind
@@ -608,6 +631,9 @@ proc markCalled(
     return
   of nkQuantifier:
     if not inCall and effectiveQuantBounds(node.quantMin, node.quantMax).hi == 0:
+      return
+  of nkAbsent:
+    if not inCall and node.absentLoopsOnExpr and node.absentLoopHi == 0:
       return
   else:
     discard
@@ -1124,6 +1150,9 @@ proc mergeLiterals(node: Node): Node =
     Node(
       kind: nkAbsent,
       absentKind: node.absentKind,
+      absentLoopsOnExpr: node.absentLoopsOnExpr,
+      absentLoopLo: node.absentLoopLo,
+      absentLoopHi: node.absentLoopHi,
       absentBody: mergeLiterals(node.absentBody),
       absentExpr: mergeLiterals(node.absentExpr),
     )
@@ -2806,61 +2835,15 @@ proc normaliseInvertedRanges(node: Node) =
   for child in node.childNodes:
     normaliseInvertedRanges(child)
 
-type ReduceAction = enum
-  raAsIs ## leave the pair as it stands
-  raDel ## the outer repeat becomes the inner one
-  raStar ## the pair becomes ``*``
-  raPlus ## the pair becomes ``+``
-  raLazyStar ## the pair becomes ``*?``
-  raLazyOpt ## the pair becomes ``??``
-  raPlusLazyOpt ## the pair becomes ``(?:X+)??``
-
 proc quantTypeNum(node: Node): int {.inline.} =
-  ## Oniguruma's ``quantifier_type_num``: which of the six popular spellings
-  ## this repeat is -- ``?`` 0, ``*`` 1, ``+`` 2, ``??`` 3, ``*?`` 4, ``+?`` 5
-  ## -- or -1 for a counted one, which [ReduceTable] has no row for.
-  ## Possessives answer -1 and never reach the table anyway:
-  ## [reduceNestedQuantifier] turns them away first, since Oniguruma spells
-  ## one as ``(?>...)`` around a greedy repeat and so never has a possessive
-  ## repeat node to put in a row.
-  case node.quantKind
-  of qkGreedy:
-    if node.quantMin == 0:
-      if node.quantMax == 1:
-        0
-      elif node.quantMax < 0:
-        1
-      else:
-        -1
-    elif node.quantMin == 1 and node.quantMax < 0:
-      2
-    else:
-      -1
-  of qkLazy:
-    if node.quantMin == 0:
-      if node.quantMax == 1:
-        3
-      elif node.quantMax < 0:
-        4
-      else:
-        -1
-    elif node.quantMin == 1 and node.quantMax < 0:
-      5
-    else:
-      -1
-  of qkPossessive:
+  ## [quantTypeNum] of a repeat node.  Possessives answer -1 and never reach
+  ## [ReduceTable] anyway: [reduceNestedQuantifier] turns them away first,
+  ## since Oniguruma spells one as ``(?>...)`` around a greedy repeat and so
+  ## never has a possessive repeat node to put in a row.
+  if node.quantKind == qkPossessive:
     -1
-
-const ReduceTable: array[6, array[6, ReduceAction]] = [
-  # Oniguruma's ``ReduceTypeTable``, transcribed. Indexed ``[inner][outer]``,
-  # both by [quantTypeNum].
-  [raDel, raStar, raStar, raLazyOpt, raLazyStar, raAsIs], # inner ``?``
-  [raDel, raDel, raDel, raPlusLazyOpt, raPlusLazyOpt, raDel], # inner ``*``
-  [raStar, raStar, raDel, raAsIs, raPlusLazyOpt, raDel], # inner ``+``
-  [raDel, raLazyStar, raLazyStar, raDel, raLazyStar, raLazyStar], # inner ``??``
-  [raDel, raDel, raDel, raDel, raDel, raDel], # inner ``*?``
-  [raAsIs, raStar, raPlus, raLazyStar, raLazyStar, raDel], # inner ``+?``
-]
+  else:
+    quantTypeNum(node.quantMin, node.quantMax, node.quantKind == qkGreedy)
 
 proc setQuant(node: Node, lo, hi: int, kind: QuantKind) {.inline.} =
   node.quantMin = lo
@@ -3016,6 +2999,15 @@ proc tuneRepeats(node: Node, expand: bool) =
   ## ``expand`` carries [foldsAnywhere]'s answer, inverted: the reduction is
   ## safe under folding, [expandStringRepeat] is not.
   if node == nil:
+    return
+  if node.kind == nkAbsent and node.absentLoopsOnExpr:
+    # Oniguruma builds an expression that is the loop around the absent
+    # pattern from its one character and bounds, and never writes it out:
+    # ``a{3}`` stays three steps of ``a``, each a start for the absent
+    # pattern, not one ``aaa`` the matcher cannot step through
+    # (``findExprAbsentPos``).
+    tuneRepeats(node.absentBody, expand)
+    tuneRepeats(node.absentExpr, false)
     return
   for child in node.childNodes:
     tuneRepeats(child, expand)
@@ -3294,7 +3286,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # reads the flag.  A node this pass never reaches just scans.  Skipped when
   # the pattern has no ``(?~...)`` at all.
   if p.sawAbsent:
-    markEmptyAbsentFuncs(ast)
+    markAbsents(ast)
   # ``p.currentFlags`` only carries the isolated ``(?L)`` spelling: scoped
   # groups restore ``p.flags`` on exit. A scoped ``(?L:...)`` that spans the
   # whole pattern is the same global option, so lift it from the AST.

@@ -1,7 +1,7 @@
 import std/unicode
 from std/strutils import find
 
-import types, charclass, unicode_utils, stackguard
+import types, charclass, unicode_utils, stackguard, leafgate
 
 type Parser* = object
   src: string
@@ -993,6 +993,137 @@ proc setConditionRef(
 proc parseGroup(p: var Parser): Node
 proc parseAlternation(p: var Parser): Node
 
+type
+  ShapeLevel = object
+    stop: bool ## A possessive or atomic wrapper; a repeat when false.
+    lo, hi: int
+    greedy: bool
+
+  Shape = object
+    ## The node Oniguruma's parser makes of a pattern, as far as
+    ## [oneCharRepeat] asks: how many wrappers and repeats it has, the two
+    ## outermost of them, outermost first, and whether what they hold is one
+    ## character.  A repeat reduces with the outermost level alone, and no
+    ## shape of three levels is one character's repeat, so no more are kept:
+    ## a repeat costs the same however many it stands on.
+    levels: array[2, ShapeLevel]
+    depth: int
+    oneChar: bool
+
+proc wrap(shape: var Shape, level: ShapeLevel) =
+  ## Put ``level`` around what ``shape`` holds.
+  shape.levels[1] = shape.levels[0]
+  shape.levels[0] = level
+  inc shape.depth
+
+proc wrapRepeat(shape: var Shape, repeat: ShapeLevel, possessive: bool) =
+  ## Oniguruma's ``assign_quantifier_body``, with
+  ## ``onig_reduce_nested_quantifier``: put ``repeat`` around what ``shape``
+  ## holds.  ``X{1}`` is X, and a repeat of a repeat may become one.
+  if repeat.lo == 1 and repeat.hi == 1:
+    return
+  var outer = repeat
+  if shape.depth > 0 and not shape.levels[0].stop:
+    let inner = shape.levels[0]
+    let outerType = quantTypeNum(outer.lo, outer.hi, outer.greedy)
+    let innerType = quantTypeNum(inner.lo, inner.hi, inner.greedy)
+    if innerType >= 0 and outerType < 0:
+      # ``(?:a*){n,m}`` is ``(?:a*){n,n}``.
+      if innerType in 1 .. 2 and outer.hi > 1 and outer.greedy:
+        outer.hi = if outer.lo == 0: 1 else: outer.lo
+      shape.wrap(outer)
+    elif outerType < 0 or innerType < 0:
+      if outer.lo == outer.hi and inner.lo == inner.hi and
+          (inner.lo == 0 or outer.lo < int(high(int32)) div inner.lo):
+        # Two exact counts multiply while Oniguruma's ``int`` holds the
+        # product (``onig_positive_int_multiply``).  Past that it refuses
+        # the pattern; here the pair stays as written, as
+        # ``reduceNestedQuantifier`` leaves one past ``MaxRepeat``.
+        let n = outer.lo * inner.lo
+        shape.levels[0] = ShapeLevel(lo: n, hi: n, greedy: outer.greedy)
+      else:
+        shape.wrap(outer)
+    else:
+      case ReduceTable[innerType][outerType]
+      of raAsIs:
+        shape.wrap(outer)
+      of raDel:
+        discard
+      of raStar:
+        shape.levels[0] = ShapeLevel(lo: 0, hi: -1, greedy: true)
+      of raPlus:
+        shape.levels[0] = ShapeLevel(lo: 1, hi: -1, greedy: true)
+      of raLazyStar:
+        shape.levels[0] = ShapeLevel(lo: 0, hi: -1, greedy: false)
+      of raLazyOpt:
+        shape.levels[0] = ShapeLevel(lo: 0, hi: 1, greedy: false)
+      of raPlusLazyOpt:
+        shape.levels[0] = ShapeLevel(lo: 1, hi: -1, greedy: true)
+        shape.wrap(ShapeLevel(lo: 0, hi: 1, greedy: false))
+  else:
+    shape.wrap(outer)
+  if possessive:
+    shape.wrap(ShapeLevel(stop: true))
+
+proc shapeOf(node: Node, flags: RegexFlags): Shape =
+  ## ``flags`` are those in force at ``node``: no flag group lies on the way
+  ## to a node whose shape can be a loop's.
+  if node == nil:
+    return
+  case node.kind
+  of nkGroup:
+    # Oniguruma's parser drops a ``(?:...)``.
+    result = shapeOf(node.groupBody, flags)
+  of nkAtomicGroup:
+    result = shapeOf(node.atomicBody, flags)
+    result.wrap(ShapeLevel(stop: true))
+  of nkQuantifier:
+    # An inverted interval is a possessive one there, as here.
+    let (lo, hi) = effectiveQuantBounds(node.quantMin, node.quantMax)
+    let possessive =
+      node.quantKind == qkPossessive or isInvertedRange(node.quantMin, node.quantMax)
+    result = shapeOf(node.quantBody, flags)
+    result.wrapRepeat(
+      ShapeLevel(lo: lo, hi: hi, greedy: node.quantKind != qkLazy), possessive
+    )
+  of nkLiteral, nkEscapedLiteral:
+    result.oneChar = true
+  of nkCharClass:
+    # Unless Oniguruma's parser made it an alternation of the class and the
+    # strings its characters fold to, or a type: a ``\p{Word}`` outside
+    # ``[...]``, in either sense, is the node of ``\w`` there.
+    let wordType =
+      not node.bracketClass and node.atoms.len == 1 and
+      node.atoms[0].kind in {ccUnicodeProp, ccNegUnicodeProp} and
+      node.atoms[0].prop.kind == upWord
+    result.oneChar = not wordType and not classHoldsFoldSource(node, flags)
+  of nkString:
+    result.oneChar = node.runes.len == 1
+  of nkCharType:
+    # Oniguruma makes these classes, and ``\w``, ``.`` and the rest a type.
+    result.oneChar =
+      node.charType in
+      {ctDigit, ctNotDigit, ctSpace, ctNotSpace, ctHexDigit, ctNotHexDigit}
+  else:
+    discard
+
+proc oneCharRepeat(expr: Node, flags: RegexFlags): tuple[found: bool, lo, hi: int32] =
+  ## The bounds of ``expr`` when it is a greedy repeat of one character,
+  ## alone, possessive or in an atomic group: what Oniguruma's
+  ## ``is_simple_one_char_repeat`` looks for in the expression of
+  ## ``(?~|X|E)``, in the node its parser makes of E under ``flags``.  That
+  ## node drops each ``(?:...)`` and ``{1}``, and reduces a repeat of a repeat
+  ## where it can: ``(?:a{0}){5}`` is ``a{0}``.  One character is a literal,
+  ## a ``[...]``, a ``\p{...}``, ``\d``, ``\s`` or ``\h``, not a ``\w``,
+  ## ``\p{Word}`` or ``.``, and not a ``[...]`` holding a character with a
+  ## multi-character fold under ``(?i)``: ``(?i)[ß]`` is ``[ß]|ss`` there.
+  ## Every bound fits an ``int32``: a product past it is no reduction.
+  let shape = shapeOf(expr, flags)
+  let at = if shape.depth > 0 and shape.levels[0].stop: 1 else: 0
+  if shape.oneChar and shape.depth == at + 1 and not shape.levels[at].stop and
+      shape.levels[at].greedy:
+    result = (true, int32(shape.levels[at].lo), int32(shape.levels[at].hi))
+
 proc recordStart(p: Parser, node: Node, start: int) =
   ## Write ``start``, where ``node`` starts in the pattern, into [patternPos],
   ## for the error ``validateLookbehinds`` raises.  An offset past
@@ -1465,10 +1596,15 @@ proc parseGroup(p: var Parser): Node =
           if p.peek == '|':
             # (?~|absent|expr) - absent expression
             p.advance() # skip '|'
+            let exprFlags = p.flags
             let expr = p.parseRegex()
+            let loop = oneCharRepeat(expr, exprFlags)
             result = Node(
               kind: nkAbsent,
               absentKind: abExpression,
+              absentLoopsOnExpr: loop.found,
+              absentLoopLo: loop.lo,
+              absentLoopHi: loop.hi,
               absentBody: absentBody,
               absentExpr: expr,
             )

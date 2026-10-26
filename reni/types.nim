@@ -473,13 +473,28 @@ type
     of nkAbsent:
       absentKind*: AbsentKind
       absentEmpty*: bool
-        ## [isEmptyAbsentFunc]'s answer, filled in by [markEmptyAbsentFuncs]
+        ## [isEmptyAbsentFunc]'s answer, filled in by [markAbsents]
         ## on the compiled tree so the matcher need not walk the pattern each
         ## time it enters the function.  False on a node the pass never
         ## reached, which only costs the scan the flag lets the matcher skip.
+      absentLoopsOnExpr*: bool
+        ## ``(?~|X|E)`` whose E is a greedy repeat of one character
+        ## (``oneCharRepeat``), which Oniguruma makes the loop around X
+        ## (``make_absent_tree_for_simple_one_char_repeat``): E's bounds,
+        ## ``absentLoopLo`` and ``absentLoopHi``, then bound how often X runs.
+        ## Set by the parser, which reads E as Oniguruma's does, before
+        ## unnamed groups are demoted.
       absentPos*: int32 ## See ``lookPos``.
+      absentLoopLo*, absentLoopHi*: int32
+        ## E's bounds when ``absentLoopsOnExpr``, ``absentLoopHi`` -1 for no
+        ## upper bound.  Recorded with the flag, so no pass after the parser
+        ## reads them off E, which demotion and literal merging reshape.
       absentBody*: Node ## absent pattern (nil for abClear)
       absentExpr*: Node ## expression to match (for abExpression only)
+      absentLoopLeaf*: Node
+        ## The character E repeats when ``absentLoopsOnExpr``, found on the
+        ## compiled tree by [markAbsents], else nil.  Borrowed, not a child,
+        ## so ``childNodes`` skips it.
     of nkCalloutMax:
       maxCount*: int ## max repetition count
       maxTag*: string ## tag name (empty for default)
@@ -1637,9 +1652,10 @@ proc hasNonAsciiFoldEquiv(cp: int32): bool =
 
 const MultiCharFolds*:
   array[21, tuple[source: int32, expansion: array[3, int32], len: int]] = [
-  ## Every character whose case fold is more than one character, and what it
-  ## folds to.  Single source of truth: the fold lookups and the length
-  ## analysis below are all derived from it, so none of them can drift.
+  ## The characters whose multi-character case fold the matcher expands, and
+  ## what each folds to: 21 of the [AllMultiCharFoldSources].  Single source
+  ## of truth: the fold lookups and the length analysis below are all derived
+  ## from it, so none of them can drift.
   (0x00DF'i32, [0x0073'i32, 0x0073'i32, 0'i32], 2), # ß → ss
   (0x0130'i32, [0x0069'i32, 0x0307'i32, 0'i32], 2), # İ → i + combining dot above
   (0x0149'i32, [0x02BC'i32, 0x006E'i32, 0'i32], 2), # ŉ → ʼn
@@ -1661,6 +1677,43 @@ const MultiCharFolds*:
   (0xFB04'i32, [0x0066'i32, 0x0066'i32, 0x006C'i32], 3), # ﬄ → ffl
   (0xFB05'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬅ → st
   (0xFB06'i32, [0x0073'i32, 0x0074'i32, 0'i32], 2), # ﬆ → st
+]
+
+const AllMultiCharFoldSources*: array[29, (int32, int32)] = [
+  ## Every character whose full case fold is more than one character
+  ## (CaseFolding.txt status F), as ranges: the 104 Oniguruma's parser splits
+  ## a ``(?i)`` class on, ``[ᾀ]`` into ``[ᾀ]|ἀι``.  [MultiCharFolds] holds
+  ## the ones the matcher expands.  tests/test_unicode_data.nim holds this
+  ## list to ``unicodedb``, and [MultiCharFolds]' sources inside it.
+  (0x00DF'i32, 0x00DF'i32), # ß
+  (0x0130'i32, 0x0130'i32), # İ
+  (0x0149'i32, 0x0149'i32), # ŉ
+  (0x01F0'i32, 0x01F0'i32), # ǰ
+  (0x0390'i32, 0x0390'i32), # ΐ
+  (0x03B0'i32, 0x03B0'i32), # ΰ
+  (0x0587'i32, 0x0587'i32), # և
+  (0x1E96'i32, 0x1E9A'i32), # ẖ..ẚ
+  (0x1E9E'i32, 0x1E9E'i32), # ẞ
+  (0x1F50'i32, 0x1F50'i32), # ὐ
+  (0x1F52'i32, 0x1F52'i32), # ὒ
+  (0x1F54'i32, 0x1F54'i32), # ὔ
+  (0x1F56'i32, 0x1F56'i32), # ὖ
+  (0x1F80'i32, 0x1FAF'i32), # ᾀ..ᾯ
+  (0x1FB2'i32, 0x1FB4'i32), # ᾲ..ᾴ
+  (0x1FB6'i32, 0x1FB7'i32), # ᾶ ᾷ
+  (0x1FBC'i32, 0x1FBC'i32), # ᾼ
+  (0x1FC2'i32, 0x1FC4'i32), # ῂ..ῄ
+  (0x1FC6'i32, 0x1FC7'i32), # ῆ ῇ
+  (0x1FCC'i32, 0x1FCC'i32), # ῌ
+  (0x1FD2'i32, 0x1FD3'i32), # ῒ ΐ
+  (0x1FD6'i32, 0x1FD7'i32), # ῖ ῗ
+  (0x1FE2'i32, 0x1FE4'i32), # ῢ..ῤ
+  (0x1FE6'i32, 0x1FE7'i32), # ῦ ῧ
+  (0x1FF2'i32, 0x1FF4'i32), # ῲ..ῴ
+  (0x1FF6'i32, 0x1FF7'i32), # ῶ ῷ
+  (0x1FFC'i32, 0x1FFC'i32), # ῼ
+  (0xFB00'i32, 0xFB06'i32), # ﬀ..ﬆ
+  (0xFB13'i32, 0xFB17'i32), # ﬓ..ﬗ
 ]
 
 const MultiCharFoldStarts* = block:
@@ -2027,6 +2080,44 @@ proc effectiveQuantBounds*(quantMin, quantMax: int): tuple[lo, hi: int] {.inline
   else:
     (quantMin, quantMax)
 
+type ReduceAction* = enum
+  ## Oniguruma's ``ReduceType``: what a repeat of a repeat becomes, by
+  ## [ReduceTable].
+  raAsIs ## leave the pair as it stands
+  raDel ## the outer repeat becomes the inner one
+  raStar ## the pair becomes ``*``
+  raPlus ## the pair becomes ``+``
+  raLazyStar ## the pair becomes ``*?``
+  raLazyOpt ## the pair becomes ``??``
+  raPlusLazyOpt ## the pair becomes ``(?:X+)??``
+
+proc quantTypeNum*(lo, hi: int, greedy: bool): int {.inline.} =
+  ## Oniguruma's ``quantifier_type_num``: which of the six popular spellings
+  ## a repeat of ``{lo,hi}`` is -- ``?`` 0, ``*`` 1, ``+`` 2, ``??`` 3,
+  ## ``*?`` 4, ``+?`` 5 -- or -1 for a counted one, which [ReduceTable] has
+  ## no row for.  ``hi`` is negative for no upper bound.
+  let base = if greedy: 0 else: 3
+  if lo == 0 and hi == 1:
+    base
+  elif lo == 0 and hi < 0:
+    base + 1
+  elif lo == 1 and hi < 0:
+    base + 2
+  else:
+    -1
+
+const ReduceTable*: array[6, array[6, ReduceAction]] = [
+  # Oniguruma's ``ReduceTypeTable``, transcribed. Indexed ``[inner][outer]``,
+  # both by [quantTypeNum].  The parser reads it to see a repeat as
+  # Oniguruma's parser leaves it, the compiler to rewrite one.
+  [raDel, raStar, raStar, raLazyOpt, raLazyStar, raAsIs], # inner ``?``
+  [raDel, raDel, raDel, raPlusLazyOpt, raPlusLazyOpt, raDel], # inner ``*``
+  [raStar, raStar, raDel, raAsIs, raPlusLazyOpt, raDel], # inner ``+``
+  [raDel, raLazyStar, raLazyStar, raDel, raLazyStar, raLazyStar], # inner ``??``
+  [raDel, raDel, raDel, raDel, raDel, raDel], # inner ``*?``
+  [raAsIs, raStar, raPlus, raLazyStar, raLazyStar, raDel], # inner ``+?``
+]
+
 proc extractFirstCharUncached(
   node: Node, flags: RegexFlags, cache: FirstCharCache
 ): FirstCharInfo
@@ -2373,16 +2464,49 @@ proc matchesEverywhere(node: Node): bool =
   else:
     false
 
-proc markEmptyAbsentFuncs*(node: Node) =
-  ## Fill in ``absentEmpty`` on every absent function under ``node``.  Must
-  ## run on the final tree, before anything reads [lengthBounds]: the
-  ## compiler's rewrites rebuild nodes and would drop the flag.
+proc loopLeafOf(expr: Node): Node =
+  ## The leaf under ``expr``'s groups and repeats, or nil.  ``tuneRepeats``
+  ## leaves the repeats of an E that is the loop around X as written, so a
+  ## string of two or more here means a pass rewrote one.
+  var node {.cursor.} = expr
+  while node != nil:
+    case node.kind
+    of nkGroup:
+      node = node.groupBody
+    of nkAtomicGroup:
+      node = node.atomicBody
+    of nkQuantifier:
+      node = node.quantBody
+    of nkString:
+      return (if node.runes.len == 1: node else: nil)
+    of nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType:
+      return node
+    else:
+      return nil
+
+proc markAbsents*(node: Node) =
+  ## Fill in ``absentEmpty`` on every absent function under ``node``, and
+  ## ``absentLoopLeaf`` on every absent expression that is the loop around
+  ## its pattern.  Must run on the final tree, before anything reads
+  ## [lengthBounds]: the compiler's rewrites rebuild nodes and would drop
+  ## both.
   if node == nil:
     return
-  if node.kind == nkAbsent and node.absentKind == abFunction:
-    node.absentEmpty = matchesEverywhere(node.absentBody)
+  if node.kind == nkAbsent:
+    case node.absentKind
+    of abFunction:
+      node.absentEmpty = matchesEverywhere(node.absentBody)
+    of abExpression:
+      if node.absentLoopsOnExpr:
+        node.absentLoopLeaf = loopLeafOf(node.absentExpr)
+        # Without it the matcher would try X at every character and past
+        # E's bound (``findExprAbsentPos``): a pass has rewritten E.
+        doAssert node.absentLoopLeaf != nil,
+          "a pass rewrote the loop around an absent pattern"
+    else:
+      discard
   for child in node.childNodes:
-    markEmptyAbsentFuncs(child)
+    markAbsents(child)
 
 proc isEmptyAbsentFunc*(node: Node): bool {.inline.} =
   ## Whether ``node`` is an absent function whose pattern matches wherever the
@@ -2392,7 +2516,7 @@ proc isEmptyAbsentFunc*(node: Node): bool {.inline.} =
   ## pattern is judged by what it matches rather than how it is spelt
   ## ([matchesEverywhere]): any spelling left out would walk a look-behind
   ## back to 0 again (see ``nkAbsent`` in [lengthBounds]).  The verdict is
-  ## the one [markEmptyAbsentFuncs] cached at compile time.
+  ## the one [markAbsents] cached at compile time.
   node.kind == nkAbsent and node.absentEmpty
 
 func followedBy(a, b: LenBounds): LenBounds =

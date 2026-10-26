@@ -1188,6 +1188,37 @@ suite "repeat tuning":
     # stays variable-length and keeps its window.
     check search("ab", re("(?<=(?:a*){1,2}\\b)")).matchSpan == 2 .. 2
 
+  test "an absent expression's loop keeps its repeat and its leaf":
+    # Oniguruma builds ``(?~|X|a{3})`` from ``a`` and its bounds, so the
+    # matcher steps the leaf ``markAbsents`` records, and ``a{3}`` written out
+    # as ``aaa`` would leave it nothing to step.  An expression that is no such
+    # loop has no leaf.
+    proc loopLeaf(pattern: string): Node =
+      var found: Node
+      proc walk(node: Node) =
+        if node == nil:
+          return
+        if node.kind == nkAbsent and node.absentKind == abExpression:
+          found = node.absentLoopLeaf
+        for child in node.childNodes:
+          walk(child)
+
+      walk(re(pattern).ast)
+      found
+
+    for pattern in [
+      "(?~|b|a{3})", "(?~|b|(?:a){3})", "(?~|b|(?:a{2}){3})", "(?~|b|(?>a{3}))"
+    ]:
+      check shapes(pattern).len > 0
+      let leaf = loopLeaf(pattern)
+      check leaf != nil and leaf.kind in {nkLiteral, nkString}
+    check loopLeaf("(?~|b|[ab]*)").kind == nkCharClass
+    check loopLeaf("(?~|b|\\d+)").kind == nkCharType
+    check loopLeaf("(?~|b|(?:ab)*)") == nil
+    check loopLeaf("(?~|b|a*?)") == nil
+    # Outside an absent expression the repeat is still written out.
+    check re("(?:a){3}").ast.kind == nkString
+
 suite "lead anchor prefilter":
   # The prefilter only refuses: a wrong verdict drops matches, so pin both
   # the compiled set and the matches found.

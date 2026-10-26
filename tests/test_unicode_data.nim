@@ -1,5 +1,5 @@
-import std/[unittest, unicode]
-import pkg/unicodedb/[properties, scripts]
+import std/[strutils, unittest, unicode]
+import pkg/unicodedb/[casing, properties, scripts]
 import reni/[types, unicode_utils, unicode_props_data]
 import ./unicode_sets_data
 
@@ -95,3 +95,30 @@ suite "Unicode data alignment":
         if matchUnicodeProp(Rune(cp), p) != member:
           agree = false
       check agree
+
+  test "AllMultiCharFoldSources is every character with a multi-character fold":
+    # Oniguruma splits a ``(?i)`` class on each of them.  The parser asks the
+    # class's atoms with their simple folds, which answers as Oniguruma's
+    # plain membership only while no character outside the list shares a
+    # simple fold with one inside.
+    var agree = true
+    for cp in 0'i32 .. 0x10FFFF'i32:
+      if cp >= 0xD800 and cp <= 0xDFFF:
+        continue
+      var n = 0
+      for _ in casing.caseFold(Rune(cp)):
+        inc n
+      let listed = inRangeTable(cp, AllMultiCharFoldSources)
+      if listed != (n > 1):
+        checkpoint("U+" & toHex(cp, 4))
+        agree = false
+      if listed:
+        for v in caseFoldVariants(Rune(cp)):
+          if not inRangeTable(int32(v), AllMultiCharFoldSources):
+            checkpoint(
+              "U+" & toHex(int32(v), 4) & " shares a fold with U+" & toHex(cp, 4)
+            )
+            agree = false
+    check agree
+    for f in MultiCharFolds:
+      check inRangeTable(f.source, AllMultiCharFoldSources)

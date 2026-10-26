@@ -1525,6 +1525,33 @@ suite "Absent operator":
     check m.found
     check m.boundaries[0] == 0 .. 1
 
+  test "abExpression tries the absent pattern only where its loop reaches":
+    # A greedy repeat of one character runs the absent pattern where each of
+    # its repetitions starts, as Oniguruma does: at no more starts than its
+    # upper bound, and none past a character it refuses.  Scanning the rest
+    # of the subject from every start made these searches quadratic, and
+    # they reached the step limit.  Every answer is libonig 6.9.10's.
+    check not search("a".repeat(8000), re("(?~|zz|a?)(?!a)(?!$)")).found
+    check not search("a".repeat(8000), re("(?~|zz|a{0})(?!a)(?!$)")).found
+    check not search("b".repeat(8000), re("(?~|zz|a*)(?!b)(?!$)")).found
+    # Where the loop reaches the absent pattern, it narrows as before.
+    check search("aazza", re("(?~|zz|a*)")).matchSpan == 0 .. 2
+    check search("1zz", re("(?~|zz|\\d?)z")).matchSpan == 0 .. 2
+    check search("aaéa", re("(?~|é|[^b]+)")).matchSpan == 0 .. 2
+    # An exact count stays a repeat, each repetition a start: written out as
+    # one ``a...a`` it gave no step, and the scan went quadratic again.
+    check not search("aab", re("(?~|ab|a{2})")).found
+    check search("aaab", re("(?~|ab|a{2})")).matchSpan == 0 .. 2
+    for e in ["a{50}", "(?:a){50}", "(?:a{5}){10}", "(?>a{50})"]:
+      check not search("a".repeat(8000), re("(?~|zz|" & e & ")(?!a)(?!$)")).found
+    # A character with a multi-character fold repeats one way or the other at
+    # each start, ``ﬁ`` or ``fi`` under ``(?i)``, never both: the absent
+    # pattern is not tried inside a ``fi``.  The spans are libonig 6.9.10's.
+    check search("fifizz", re("(?i)(?~|i|ﬁ*)")).matchSpan == 0 .. 4
+    check search("fifi", re("(?i)(?~|i|ﬁ{0,3})")).matchSpan == 0 .. 4
+    check search("ssßsx", re("(?i)(?~|sx|ß*)")).matchSpan == 0 .. 4
+    check search("fiﬁi", re("(?i)(?~|i|ﬁ*)")).matchSpan == 0 .. 5
+
   test "abExpression alternation retries inside the narrowed range":
     # The loop un-narrows subjectEnd while walking out of the absent frame;
     # when the parent then fails, the second branch must retry narrowed.
