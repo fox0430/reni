@@ -1,6 +1,6 @@
 import std/[algorithm, tables, sets, unicode]
 
-import types, unicode_utils, parser, leafgate, lookbehind_tune
+import types, unicode_utils, parser, leafgate, lookbehind_tune, stackguard
 
 proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
   ## When named captures exist, convert unnamed nkCapture to nkGroup
@@ -197,13 +197,28 @@ const
   RecursionExist = 1'u8 ## The walk reached the group being checked.
   RecursionMust = 2'u8 ## ... on every path it took.
   RecursionInfinite = 4'u8 ## ... on a path that had consumed nothing.
+  MaxRecursionCheckSteps {.intdefine: "reniMaxRecursionCheckSteps".} = 100_000_000
+    ## Steps [checkNeverEndingRecursion] may take before it raises
+    ## ``RegexLimitError``.  Each group's check walks every group that shares a
+    ## cycle of calls with it, as Oniguruma's does, so a cycle costs the square
+    ## of the groups in it: a ring of N groups each calling the next takes 4N²
+    ## steps, 52 million for the 3,600 a release build's stack budget holds,
+    ## and N groups that each call one that calls them all take as many, at 6
+    ## to 8 ns each.  The 6,030 grammar patterns take at most 6,320.
+  MaxRecursionCheckRewalkSteps {.intdefine: "reniMaxRecursionCheckRewalkSteps".} =
+    10_000_000
+    ## Of those, the steps a check may take walking into groups it has walked
+    ## into before.  Inside a cycle of calls the walk goes down every path, as
+    ## Oniguruma's does: 9 groups that each call all 9 take 12.8 million steps,
+    ## 10 take 138 million and 11 take 1.6 billion.  A ring takes none, nor
+    ## does any grammar pattern.
 
 type RecursionCheck = object
   ## The state of [checkNeverEndingRecursion].  A slot is a group: slot 0 the
   ## whole pattern, which ``\g<0>`` calls, and slot ``k`` group ``k``.
   ast: Node
-  bodies: ptr seq[Node]
-  namedCaptures: ptr seq[(string, int)]
+  bodies: seq[Node]
+  namedCaptures: seq[(string, int)]
   called: seq[bool]
     ## A call that can run reaches the group (Oniguruma's ``CALLED``).  Only
     ## these groups are checked.
@@ -212,7 +227,8 @@ type RecursionCheck = object
     ## ``RECURSION``).  Only these groups are checked.
   component: seq[int]
     ## The group's strongly connected component, where a group leads to the
-    ## groups its body holds and calls.  Set for the groups a call reaches.
+    ## groups its body holds and calls.  Set for the groups a call reaches, -1
+    ## for the rest.
   componentEntered: seq[int] ## How many groups of each component the walk is inside.
   check: int ## The number of the check running, from 1.
   memo: seq[uint8]
@@ -222,6 +238,12 @@ type RecursionCheck = object
     ## goes the same way each time, and it leaves every length it needs
     ## worked out, so walking it again would change nothing.
   memoCheck: seq[int] ## The check each ``memo`` entry belongs to.
+  walked: seq[int]
+    ## The check that last walked into slot ``s`` with head ``h``, at
+    ## ``2*s+h``, for [checkBudget].
+  rewalking: int
+    ## How many of the walks the walk is inside went where their check had
+    ## walked into before.
   marked: seq[bool]
     ## Oniguruma's ``MARK1``: the group being checked, and the groups whose
     ## length is being worked out.  Both count as matching empty.
@@ -234,12 +256,31 @@ type RecursionCheck = object
   openRefs: HashSet[pointer]
     ## The backreferences written inside a group they read, which count as
     ## matching empty (``ND_ST_RECURSION`` on a backreference).
+  stackBase: int ## Where the check began, for [checkBudget].
+  steps: int ## The steps taken so far, for [checkBudget].
+  rewalkSteps: int ## The steps taken so far while ``rewalking``.
+
+template checkBudget(c: var RecursionCheck) =
+  ## Count a step of [consumes] or [recursionFlags], and raise
+  ## ``RegexLimitError`` past ``MaxRecursionCheckSteps`` or
+  ## ``MaxRecursionCheckRewalkSteps``, or before the native stack, or a debug
+  ## build's call depth, runs out.  Both follow calls, and a chain of calls is
+  ## as long as the pattern: ``MaxNestingDepth`` does not bound it.
+  inc c.steps
+  if c.steps > MaxRecursionCheckSteps:
+    raise newException(RegexLimitError, "compile step limit exceeded")
+  if c.rewalking > 0:
+    inc c.rewalkSteps
+    if c.rewalkSteps > MaxRecursionCheckRewalkSteps:
+      raise newException(RegexLimitError, "compile step limit exceeded")
+  if nearStackEnd(c.stackBase):
+    raise newException(RegexLimitError, "compile stack budget exceeded")
 
 proc slotBody(c: RecursionCheck, slot: int): Node =
   if slot == 0:
     c.ast
   else:
-    c.bodies[][slot - 1]
+    c.bodies[slot - 1]
 
 proc groupSlot(node: Node): int =
   ## The slot of the group ``node``, or -1 when it is not one.
@@ -255,7 +296,7 @@ proc callSlot(c: RecursionCheck, node: Node): int =
   ## The slot the call ``node`` runs, or -1 when there is no body to follow.
   if node.callIndex == 0 and node.callName.len == 0:
     return 0
-  let idx = callTarget(node, c.bodies[], c.namedCaptures[])
+  let idx = callTarget(node, c.bodies, c.namedCaptures)
   if idx < 0:
     -1
   else:
@@ -264,10 +305,10 @@ proc callSlot(c: RecursionCheck, node: Node): int =
 iterator refSlots(c: RecursionCheck, node: Node): int =
   ## The slots the backreference ``node`` reads.
   if node.kind == nkBackreference:
-    if node.backrefIndex >= 1 and node.backrefIndex <= c.bodies[].len:
+    if node.backrefIndex >= 1 and node.backrefIndex <= c.bodies.len:
       yield node.backrefIndex
   else:
-    for idx in c.namedCaptures[].namedGroupsRead(node.backrefName, node.backrefScope):
+    for idx in c.namedCaptures.namedGroupsRead(node.backrefName, node.backrefScope):
       yield idx + 1
 
 proc consumes(c: var RecursionCheck, node: Node): bool
@@ -289,6 +330,7 @@ proc consumes(c: var RecursionCheck, node: Node): bool =
   ## once one settles the answer, since working out a group fixes its length.
   if node == nil:
     return false
+  c.checkBudget()
   case node.kind
   of nkLiteral, nkEscapedLiteral, nkCharType, nkCharClass:
     result = true
@@ -354,13 +396,20 @@ proc enterGroup(c: var RecursionCheck, slot: int, head: bool): uint8 =
       else:
         RecursionExist or RecursionMust
   let component = c.component[slot]
+  when not defined(release):
+    # Debug builds only: in a release build the -1 fails the index below.
+    doAssert component >= 0, "a group outside every component"
   let fresh = c.componentEntered[component] == 0
   let key = 2 * slot + ord(head)
   if fresh and c.memoCheck[key] == c.check:
     return c.memo[key]
+  let rewalk = c.walked[key] == c.check
+  c.walked[key] = c.check
   c.entered[slot] = true
   inc c.componentEntered[component]
+  c.rewalking += ord(rewalk)
   result = c.recursionFlags(c.slotBody(slot), head)
+  c.rewalking -= ord(rewalk)
   dec c.componentEntered[component]
   c.entered[slot] = false
   if fresh:
@@ -373,6 +422,7 @@ proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8 =
   ## that group began.  Returns at once with ``RecursionInfinite``.
   if node == nil:
     return 0
+  c.checkBudget()
   case node.kind
   of nkConcat:
     var head = head
@@ -472,8 +522,13 @@ type ComponentSearch = object
   stack: seq[int]
   onStack: seq[bool]
   reached: int
+  components: int ## The components found so far, which number them.
+  path: seq[tuple[slot, edge, last: int]]
+    ## The slots being visited, each with the part of ``edges`` it has yet to
+    ## follow: the recursion of Tarjan's ``strongconnect``, kept here as a
+    ## chain of calls is as long as the pattern.
 
-proc connect(c: var RecursionCheck, t: var ComponentSearch, v: int) =
+proc reach(c: var RecursionCheck, t: var ComponentSearch, v: int) =
   inc t.reached
   t.order[v] = t.reached
   t.low[v] = t.reached
@@ -481,39 +536,54 @@ proc connect(c: var RecursionCheck, t: var ComponentSearch, v: int) =
   t.onStack[v] = true
   let first = t.edges.len
   c.collectEdges(c.slotBody(v), t.edges)
-  let last = t.edges.len
-  for i in first ..< last:
-    let w = t.edges[i]
-    if w == v:
-      c.recursive[v] = true
-    if t.order[w] == 0:
-      c.connect(t, w)
-      t.low[v] = min(t.low[v], t.low[w])
-    elif t.onStack[w]:
-      t.low[v] = min(t.low[v], t.order[w])
-  if t.low[v] == t.order[v]:
-    let component = c.componentEntered.len
-    c.componentEntered.add 0
-    while true:
-      let w = t.stack.pop()
-      t.onStack[w] = false
-      c.component[w] = component
+  t.path.add (v, first, t.edges.len)
+
+proc connect(c: var RecursionCheck, t: var ComponentSearch, root: int) =
+  c.reach(t, root)
+  while t.path.len > 0:
+    let v = t.path[^1].slot
+    let edge = t.path[^1].edge
+    if edge < t.path[^1].last:
+      inc t.path[^1].edge
+      let w = t.edges[edge]
       if w == v:
-        break
+        c.recursive[v] = true
+      if t.order[w] == 0:
+        c.reach(t, w)
+      elif t.onStack[w]:
+        t.low[v] = min(t.low[v], t.order[w])
+      continue
+    discard t.path.pop()
+    if t.low[v] == t.order[v]:
+      let component = t.components
+      inc t.components
+      while true:
+        let w = t.stack.pop()
+        t.onStack[w] = false
+        c.component[w] = component
+        if w == v:
+          break
+    if t.path.len > 0:
+      let u = t.path[^1].slot
+      t.low[u] = min(t.low[u], t.low[v])
 
 proc findComponents(c: var RecursionCheck, slots: int) =
   ## Fill ``c.component`` and ``c.recursive`` for the groups a call reaches,
   ## the only ones a check walks into: a group runs itself again when it
-  ## calls itself or shares its component.
+  ## calls itself or shares its component.  Then size ``c.componentEntered``,
+  ## one count for each component.
   var t = ComponentSearch(
     order: newSeq[int](slots), low: newSeq[int](slots), onStack: newSeq[bool](slots)
   )
   c.recursive = newSeq[bool](slots)
   c.component = newSeq[int](slots)
   for slot in 0 ..< slots:
+    c.component[slot] = -1
+  for slot in 0 ..< slots:
     if c.called[slot] and t.order[slot] == 0:
       c.connect(t, slot)
-  var size = newSeq[int](c.componentEntered.len)
+  c.componentEntered = newSeq[int](t.components)
+  var size = newSeq[int](t.components)
   for slot in 0 ..< slots:
     if t.order[slot] != 0:
       inc size[c.component[slot]]
@@ -521,9 +591,12 @@ proc findComponents(c: var RecursionCheck, slots: int) =
     if t.order[slot] != 0 and size[c.component[slot]] > 1:
       c.recursive[slot] = true
 
-proc markCalled(c: var RecursionCheck, node: Node, inCall: bool) =
-  ## Oniguruma's ``tune_call2``: mark the groups a call that can run reaches.
-  ## Outside a called body, a call under ``{0}`` cannot run.
+proc markCalled(
+    c: var RecursionCheck, node: Node, inCall: bool, pending: var seq[int]
+) =
+  ## Oniguruma's ``tune_call2``: mark the groups a call that can run reaches,
+  ## adding each to ``pending`` for its body to be marked in turn.  Outside a
+  ## called body, a call under ``{0}`` cannot run.
   if node == nil:
     return
   case node.kind
@@ -531,7 +604,7 @@ proc markCalled(c: var RecursionCheck, node: Node, inCall: bool) =
     let slot = c.callSlot(node)
     if slot >= 0 and not c.called[slot]:
       c.called[slot] = true
-      c.markCalled(c.slotBody(slot), true)
+      pending.add slot
     return
   of nkQuantifier:
     if not inCall and effectiveQuantBounds(node.quantMin, node.quantMax).hi == 0:
@@ -539,7 +612,7 @@ proc markCalled(c: var RecursionCheck, node: Node, inCall: bool) =
   else:
     discard
   for child in node.childNodes:
-    c.markCalled(child, inCall)
+    c.markCalled(child, inCall, pending)
 
 proc markOpenRefs(c: var RecursionCheck, node: Node, open: var seq[bool]) =
   ## Fill ``c.openRefs``, where ``open`` holds the groups around ``node``.
@@ -596,8 +669,20 @@ proc checkNeverEndingRecursion(
   ## ``\g<0>``, ``a|\g<0>``, ``(a\g<1>)`` and ``x|(?<=\g<0>)`` are rejected,
   ## ``a|b\g<0>`` and ``(?<n>a\g<n>){0}`` are not.  The rules are Oniguruma's
   ## to the letter, down to the lengths a check works out for the next.
+  ##
+  ## A walk that follows calls past ``MaxStackBytes`` raises
+  ## ``RegexLimitError``, as a ring of 30,000 groups each calling the next
+  ## does.  Oniguruma takes a minute over that one, and overflows its stack on
+  ## the same chain left open.  So does a check past
+  ## ``MaxRecursionCheckRewalkSteps``, as 9 groups that each call all 9 do,
+  ## where Oniguruma goes down every path too, and one past
+  ## ``MaxRecursionCheckSteps``, as 5,000 groups that each call one that calls
+  ## them all do.
   var c = RecursionCheck(
-    ast: ast, bodies: unsafeAddr bodies, namedCaptures: unsafeAddr namedCaptures
+    ast: ast,
+    bodies: bodies,
+    namedCaptures: namedCaptures,
+    stackBase: currentStackAddr(),
   )
   let slots = bodies.len + 1
   c.called = newSeq[bool](slots)
@@ -608,7 +693,11 @@ proc checkNeverEndingRecursion(
     c.minLen[slot] = -1
   c.memo = newSeq[uint8](2 * slots)
   c.memoCheck = newSeq[int](2 * slots)
-  c.markCalled(ast, false)
+  c.walked = newSeq[int](2 * slots)
+  var pending: seq[int]
+  c.markCalled(ast, false, pending)
+  while pending.len > 0:
+    c.markCalled(c.slotBody(pending.pop()), true, pending)
   c.findComponents(slots)
   if readsGroups:
     var open = newSeq[bool](slots)
@@ -617,20 +706,63 @@ proc checkNeverEndingRecursion(
   c.checkGroup(0)
   c.checkGroups(ast)
 
-proc containsAbsent(
+proc holdsAbsent(
     node: Node,
     bodies: seq[Node],
     namedCaptures: seq[(string, int)],
+    calledAbsent: seq[int8],
     visited: var HashSet[int],
+    pending: var seq[int],
 ): bool =
-  ## Check if a node transitively contains a ``(?~|...)`` form, which
-  ## [validateLookbehinds] rejects when written in a look-behind directly.  The
-  ## absent function ``(?~pattern)`` -- ``(?~)`` included -- is allowed
-  ## there, as in Oniguruma, but its pattern is searched like any other body:
-  ## ``(?<=\g<1>)((?~(?~|a)))`` is rejected, as it is written in place.
+  ## Whether ``node`` holds a ``(?~|...)`` form in place, or calls a group
+  ## known to, for [containsAbsent].  The groups it calls that are not known
+  ## either way go to ``pending``, each once.
+  if node == nil:
+    return false
+  case node.kind
+  of nkAbsent:
+    if node.absentKind != abFunction:
+      return true
+  of nkSubexpCall:
+    let idx = callTarget(node, bodies, namedCaptures)
+    if idx >= 0:
+      if calledAbsent[idx] > 0:
+        return true
+      if calledAbsent[idx] == 0 and idx notin visited:
+        visited.incl(idx)
+        pending.add idx
+    return false
+  else:
+    discard
+  for child in node.childNodes:
+    if holdsAbsent(child, bodies, namedCaptures, calledAbsent, visited, pending):
+      return true
+  false
+
+proc containsAbsent(
+    group: int,
+    bodies: seq[Node],
+    namedCaptures: seq[(string, int)],
+    calledAbsent: var seq[int8],
+): bool =
+  ## Check if the 0-based group ``group`` transitively contains a ``(?~|...)``
+  ## form, which [validateLookbehinds] rejects when written in a look-behind
+  ## directly.  The absent function ``(?~pattern)`` -- ``(?~)`` included -- is
+  ## allowed there, as in Oniguruma, but its pattern is searched like any
+  ## other body: ``(?<=\g<1>)((?~(?~|a)))`` is rejected, as it is written in
+  ## place.
   ##
-  ## Calls are followed to any depth.  Oniguruma follows only the first
-  ## (``check_called_node_in_look_behind`` has no case for a call), so it
+  ## ``calledAbsent`` keeps the answers, by group: 0 until known, 1 when it
+  ## holds one, -1 when not.  A "no" is kept for every group the search went
+  ## through, as each calls only groups it went through too or knew were
+  ## clean, so however many look-behinds call into one chain, the chain is
+  ## searched once.  A "yes" is
+  ## kept only for ``group``: a group the search went through may reach the
+  ## form only through ``group``, or not at all.
+  ##
+  ## Calls are followed to any depth, from a list rather than by recursion, as
+  ## a chain of calls is as long as the pattern.  Oniguruma follows only the
+  ## first (``check_called_node_in_look_behind`` has no case for a call), so it
   ## compiles ``(?<=\g<1>)(\g<2>)((?~|))``, and the range clear then escapes
   ## the look-behind.  reni rejects that on purpose.
   ##
@@ -642,23 +774,17 @@ proc containsAbsent(
   ## engines, so following it would only reject what Oniguruma accepts.  A
   ## recursive call through a group, ``((?~|a)|(?<=x\g<1>))``, is followed and
   ## rejected, which Oniguruma does not do.
-  if node == nil:
-    return false
-  case node.kind
-  of nkAbsent:
-    if node.absentKind != abFunction:
+  if calledAbsent[group] != 0:
+    return calledAbsent[group] > 0
+  var visited = [group].toHashSet
+  var pending = @[group]
+  while pending.len > 0:
+    let body = bodies[pending.pop()]
+    if holdsAbsent(body, bodies, namedCaptures, calledAbsent, visited, pending):
+      calledAbsent[group] = 1
       return true
-  of nkSubexpCall:
-    let idx = callTarget(node, bodies, namedCaptures)
-    if idx >= 0 and idx notin visited:
-      visited.incl(idx)
-      return containsAbsent(bodies[idx], bodies, namedCaptures, visited)
-    return false
-  else:
-    discard
-  for child in node.childNodes:
-    if containsAbsent(child, bodies, namedCaptures, visited):
-      return true
+  for idx in visited:
+    calledAbsent[idx] = -1
   false
 
 proc validateLookbehinds(
@@ -691,12 +817,8 @@ proc validateLookbehinds(
   ##
   ## A called body is checked only for absent operators ([containsAbsent]), as
   ## ``check_called_node_in_look_behind`` does, so ``(?<=\g<1>)(a\z)``
-  ## compiles.  ``calledAbsent`` keeps that answer for each group called (0
-  ## until asked, 1 when it holds one, -1 when not), so a group called from
-  ## many look-behinds is walked once.  Only an answer asked from here is
-  ## kept: inside [containsAbsent], a group reached again through a cycle
-  ## reads as clean, so the answer for a group it passes through may be
-  ## partial.
+  ## compiles.  ``calledAbsent`` keeps that answer for each group, so a group
+  ## called from many look-behinds is searched once.
   ##
   ## The error gives the position where the rejected node starts, as a parser
   ## error does.  For an absent operator reached through a call, that is the
@@ -742,13 +864,8 @@ proc validateLookbehinds(
   of nkSubexpCall:
     if inBehind:
       let idx = callTarget(node, bodies, namedCaptures)
-      if idx >= 0:
-        if calledAbsent[idx] == 0:
-          var visited = initHashSet[int]()
-          calledAbsent[idx] =
-            if containsAbsent(bodies[idx], bodies, namedCaptures, visited): 1 else: -1
-        if calledAbsent[idx] > 0:
-          reject()
+      if idx >= 0 and containsAbsent(idx, bodies, namedCaptures, calledAbsent):
+        reject()
     return
   else:
     discard

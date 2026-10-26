@@ -13,7 +13,7 @@
 
 import std/unicode
 
-import types, unicode_utils
+import types, unicode_utils, stackguard
 
 proc isSimpleRepeatBody(node: Node): bool {.inline.} =
   ## Repeat bodies the look-behind reduction handles: strings, char types,
@@ -66,6 +66,7 @@ type
       ## By [NodeId]: a repeat's body span, once measured; see
       ## [repeatBodySpan].  Empty unless [initGroupSpans] was given the
       ## numbering.
+    stackBase: int ## Where measuring began, for [charSpan]'s stack check.
 
 const CharSpanCap = 1 shl 30
   ## Where a count saturates, as Oniguruma's ``distance_add`` and
@@ -250,6 +251,10 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
   ## which keeps a look-behind rather than dropping it.
   if node == nil:
     return spanOf(0)
+  # A group is measured through the calls and references in it, and a chain
+  # of those is as long as the pattern.
+  if nearStackEnd(g.stackBase):
+    raise newException(RegexLimitError, "compile stack budget exceeded")
   case node.kind
   of nkLiteral, nkEscapedLiteral, nkCharClass:
     spanOf(1)
@@ -352,6 +357,7 @@ proc initGroupSpans*(root: Node, names: seq[(string, int)], nodeCount = 0): Grou
     names: names,
     bodySpans: newSeq[CharSpan](nodeCount),
     bodyKnown: newSeq[bool](nodeCount),
+    stackBase: currentStackAddr(),
   )
 
 proc repeatBodyMayBeEmpty*(q: Node, g: var GroupSpans): bool =

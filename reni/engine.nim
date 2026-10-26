@@ -910,8 +910,6 @@ const TrackCallDepth = compileOption("stacktrace")
   ## Whether to also guard frame count. Debug builds abort uncatchably at
   ## ``nimCallDepthLimit`` calls, so bytes alone would let them overrun first.
 
-const NimCallDepthLimit {.intdefine: "nimCallDepthLimit".} = 2000
-
 const MaxNativeDepth = NimCallDepthLimit - 100
   ## Frame ceiling for ``TrackCallDepth``: 6 per ``runMachine`` entry plus
   ## ``chainDepth``. Over-approximates so Nim's abort never fires first.

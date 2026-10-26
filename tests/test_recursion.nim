@@ -1,8 +1,8 @@
 import std/[unittest, strutils]
 
 import ../reni
-import ../reni/engine
-import ../reni/types
+import ../reni/[engine, types, parser]
+import ../reni/compiler {.all.}
 
 # Subroutine calls, recursion, and the recursions the compiler turns away.
 # Split out of ``test_engine.nim`` because ``refc`` allows 3500 module-level
@@ -254,3 +254,46 @@ suite "Mutual recursion detection":
     for i in 1 .. 40:
       levels.add "(?<a" & $i & ">\\g<a" & $(i - 1) & ">\\g<a" & $(i - 1) & ">)"
     check re("(?<r>(?<a0>x)" & levels & "(?:\\g<r>)?)").captureCount == 42
+
+  test "a check that would go down too many paths gives up":
+    # Each of the 12 groups calls all 12, so inside the cycle the walk goes
+    # down every path, as Oniguruma's does: billions of steps.
+    var calls: seq[string]
+    for i in 1 .. 12:
+      calls.add "\\g<" & $i & ">"
+    let group = "(a(?:" & calls.join("|") & "))"
+    expect RegexLimitError:
+      discard re(group.repeat(12))
+
+  test "a cycle each check walks once is not cut short":
+    # 2,000 groups each call a hub that calls them all, so each one's check
+    # walks the whole cycle: 16 million steps, though none into a group the
+    # check has walked into before.
+    var hub = "(b"
+    for i in 2 .. 2_001:
+      hub.add "|\\g<" & $i & ">"
+    hub.add ")"
+    check re(hub & "(a\\g<1>)".repeat(2_000)).captureCount == 2_001
+
+proc searchAbsent(pattern: string): (bool, seq[int8]) =
+  ## Whether group 1 of ``pattern`` reaches a ``(?~|...)`` form, and the
+  ## answers kept for each group.
+  var p = initParser(pattern)
+  let ast = p.parseRegex()
+  var bodies: seq[Node]
+  var flags: seq[RegexFlags]
+  collectGroupBodies(ast, bodies, flags)
+  var calledAbsent = newSeq[int8](bodies.len)
+  result[0] = containsAbsent(0, bodies, p.namedCaptures, calledAbsent)
+  result[1] = calledAbsent
+
+suite "Absent operators reached through a look-behind's call":
+  test "a search that finds none keeps that for every group it went through":
+    # So look-behinds that each call into one chain search it once: 20,000
+    # of them into a chain of 20,000 took 10 seconds searching it anew each.
+    check searchAbsent("(\\g<2>)(a\\g<3>)(\\g<1>)(b)") == (false, @[-1'i8, -1, -1, 0])
+
+  test "a search that finds one keeps that for the group asked only":
+    # Group 3 holds the form and group 2 does not, but only group 1 was asked
+    # about.
+    check searchAbsent("(\\g<2>\\g<3>)(b)((?~|a))") == (true, @[1'i8, 0, 0])

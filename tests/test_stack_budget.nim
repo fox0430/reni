@@ -61,3 +61,43 @@ suite "the parser measures the same stack budget the matcher does":
         # first: goto exceptions spend a few hundred bytes on one, and
         # ``refc`` frames carry no destructor bookkeeping.
         check sawLevelCap
+
+suite "the compiler's walks that follow calls measure the same stack budget":
+  test "a ring of calls is answered, never overflowed":
+    # Each group calls the next and the last calls the first, so checking one
+    # walks the whole ring: 30,000 groups, far past the default budget.
+    var ring = ""
+    for i in 1 .. 30_000:
+      ring.add "(a\\g<" & $(i mod 30_000 + 1) & ">?)"
+    expect RegexLimitError:
+      discard re(ring)
+
+  test "an open chain of calls is marked without recursion":
+    # No group here runs itself again, so none is walked, but finding that out
+    # follows the chain, 100,000 calls long.
+    var chain = ""
+    for i in 1 ..< 100_000:
+      chain.add "(a\\g<" & $(i + 1) & ">?)"
+    chain.add "(a)"
+    check re(chain).captureCount == 100_000
+
+  test "a look-behind's call down a chain is answered, never overflowed":
+    # The group a look-behind calls is searched for absent operators through
+    # each call in turn, from a list, then measured through them, which runs
+    # past the budget: 100,000 groups.
+    var chain = "(?<=\\g<1>)"
+    for i in 1 ..< 100_000:
+      chain.add "(a\\g<" & $(i + 1) & ">?)"
+    chain.add "(a)"
+    expect RegexLimitError:
+      discard re(chain)
+
+  test "a repeat's body measured down a chain is answered, never overflowed":
+    # A backreference has the empty check measure every repeat's body, here
+    # through the 100,000 groups each one calls in turn.
+    var chain = ""
+    for i in 1 ..< 100_000:
+      chain.add "(a\\g<" & $(i + 1) & ">*)"
+    chain.add "(a)\\1"
+    expect RegexLimitError:
+      discard re(chain)
