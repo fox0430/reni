@@ -10,6 +10,14 @@ type Parser* = object
   captureCount*: int
   namedCaptures*: seq[(string, int)]
   depth: int
+  reach: int
+    ## The deepest level a node parsed so far in the innermost open group
+    ## sits at, where a group is a level and so is a repeat of a repeat:
+    ## ``a{1}{1}`` is one deeper than ``a{1}``.  [MaxNestingDepth] bounds it,
+    ## as ``depth`` alone cannot: a repeat comes after what it repeats, so it
+    ## deepens a tree whose groups have all closed.  A group's level counts
+    ## once its body opens, so ``(*FAIL)``, which has none, is no deeper than
+    ## an atom.
   stackBase: int
     ## Parse start frame for the byte-budget check.
     ## Level caps alone cannot bound bytes since per-level cost varies.
@@ -97,6 +105,13 @@ proc error(p: Parser, msg: string, at: int) {.noreturn.} =
 
 proc error(p: Parser, msg: string) {.noreturn.} =
   p.error(msg, p.pos)
+
+template enterLevel(p: Parser, level: untyped) =
+  ## Count one more level in ``level``, a group's or a repeat's, and refuse
+  ## it past [MaxNestingDepth].
+  inc level
+  if level > MaxNestingDepth:
+    p.error("nesting too deep")
 
 proc expect(p: var Parser, ch: char) =
   if p.peek != ch:
@@ -255,7 +270,26 @@ proc skipWhitespaceAndComments(p: var Parser) =
     else:
       break
 
-proc parseQuantifier(p: var Parser, body: Node): Node =
+proc skipComment(p: var Parser): bool =
+  ## Skip the ``(?#...)`` comment at ``p.pos``, if one starts there.  As in
+  ## Oniguruma, a backslash escapes the character after it, so ``(?#\))`` is
+  ## one comment, and the pattern may not end inside one.
+  if not (
+    p.peek == '(' and p.pos + 2 < p.src.len and p.src[p.pos + 1] == '?' and
+    p.src[p.pos + 2] == '#'
+  ):
+    return false
+  p.pos += 3
+  while not p.atEnd and p.peek != ')':
+    if p.peek == '\\':
+      p.advance()
+    p.advance()
+  p.expect(')')
+  true
+
+proc parseQuantifier(p: var Parser, body: Node, reach: var int): Node =
+  ## Apply the repeat at ``p.pos`` to ``body``, whose deepest level is
+  ## ``reach``.
   var qmin, qmax: int
   var isBrace = false
   var braceHasComma = false
@@ -332,6 +366,7 @@ proc parseQuantifier(p: var Parser, body: Node): Node =
   # For brace quantifiers in Oniguruma:
   # - '+' after {..} is always chaining (a new quantifier), never possessive
   # - '?' after {n} (no comma) is chaining, after {n,m} is lazy suffix
+  let repeatEnd = p.pos
   p.skipWhitespaceAndComments()
   var qkind = qkGreedy
   if not p.atEnd:
@@ -347,9 +382,15 @@ proc parseQuantifier(p: var Parser, body: Node): Node =
       else:
         qkind = qkPossessive
         p.advance()
+  # Without a suffix the repeat ends before the whitespace looked past, and
+  # an error below points there.  The caller skips it again.
+  if qkind == qkGreedy:
+    p.pos = repeatEnd
 
   # Check for quantifier chain overflow (only for exact-count chains)
   if body.kind == nkQuantifier:
+    # A repeat of a repeat is a level deeper, as a group is.
+    p.enterLevel(reach)
     let innerMin = body.quantMin
     let innerMax = body.quantMax
     # Only error when both quantifiers are exact or have the same min/max
@@ -1187,7 +1228,8 @@ proc repeatApplies(p: var Parser, body: Node): bool =
     return true
   if p.peek == '{':
     let bracePos = p.pos
-    discard p.parseQuantifier(body)
+    var reach = 0 # no repeat here, so no level to count
+    discard p.parseQuantifier(body, reach)
     if p.pos == bracePos:
       return false
     p.pos = bracePos
@@ -1195,31 +1237,54 @@ proc repeatApplies(p: var Parser, body: Node): bool =
     p.error("target of repeat operator not specified")
   p.error("target of repeat operator is not repeatable")
 
-proc parseQuantified(p: var Parser): Node =
-  var body = p.parseAtom()
+proc parseRepeats(p: var Parser, body: var Node, reach: var int) =
+  ## Apply the repeats at ``p.pos`` to ``body``, each to the one before:
+  ## ``a?{2}``, ``a*{0}``, ``a+?{2}``.  A ``(?#...)`` comment parts none of
+  ## them, as in Oniguruma, so ``a(?#c)*{2}`` chains as ``a*{2}`` does.
+  ## ``reach`` is the deepest level of ``body``, which each repeat of a
+  ## repeat takes one further.
   if p.inLiteralQuote:
-    return body # no quantifiers inside \Q...\E
-  # Empty node from \E — return as-is so parseConcat can attach quantifier to prev atom
-  if body.kind == nkConcat and body.children.len == 0:
-    return body
-  # Support quantifier chaining: a?{2}, a*{0}, a+?{2}
+    return # no quantifiers inside \Q...\E
   var first = true
   while true:
     p.skipWhitespaceAndComments()
-    if p.atEnd or p.peek notin {'*', '+', '?', '{'}:
+    let ch = p.peek
+    if ch == '(':
+      if p.skipComment():
+        continue
+      break
+    if ch notin {'*', '+', '?', '{'}:
       break
     if first:
       first = false
       if not p.repeatApplies(body):
         break
     let posBefore = p.pos
-    body = p.parseQuantifier(body)
+    body = p.parseQuantifier(body, reach)
     if p.pos == posBefore:
       break # '{' was literal, not a quantifier
-  body
+
+proc parseQuantified(p: var Parser, reach: var int): Node =
+  ## Parse an atom and its repeats, and set ``reach`` to the deepest level
+  ## they take the tree to.
+  let groupReach = p.reach
+  p.reach = p.depth
+  result = p.parseAtom()
+  # The empty node of ``\Q``, ``\E`` or ``(?)`` is no atom and adds no level:
+  # parseConcat gives a repeat after it to the atom before.
+  if result.kind == nkConcat and result.children.len == 0:
+    p.reach = groupReach
+    return
+  reach = p.reach
+  p.parseRepeats(result, reach)
+  p.reach = max(groupReach, reach)
 
 proc parseConcat(p: var Parser): Node =
   var nodes: seq[Node]
+  var lastReach = 0 # the deepest level of ``nodes[^1]``
+  # A branch is a body, so the group it opens in reaches its level even with
+  # nothing in it: ``(?:)`` is a level, where the bodiless ``(*FAIL)`` is not.
+  p.reach = max(p.reach, p.depth)
   let savedConcatCount = p.concatNodeCount
   p.concatNodeCount = 0
   while not p.atEnd:
@@ -1231,28 +1296,12 @@ proc parseConcat(p: var Parser): Node =
     if ch == '|' or ch == ')':
       if not p.inLiteralQuote:
         break
-    # Skip comments (?#...), allowing trailing quantifiers to attach to previous atom
-    if ch == '(' and p.pos + 2 < p.src.len and p.src[p.pos + 1] == '?' and
-        p.src[p.pos + 2] == '#':
-      p.advance()
-      p.advance()
-      p.advance()
-      while not p.atEnd and p.peek != ')':
-        p.advance()
-      if not p.atEnd:
-        p.advance() # skip ')'
-      # If a quantifier follows and there's a previous atom, re-quantify it
-      if not p.inLiteralQuote:
-        p.skipWhitespaceAndComments()
-      if nodes.len > 0 and not p.atEnd and p.peek in {'*', '+', '?', '{'} and
-          p.repeatApplies(nodes[^1]):
-        var lastNode = nodes.pop()
-        p.concatNodeCount = nodes.len
-        lastNode = p.parseQuantifier(lastNode)
-        nodes.add(lastNode)
-        p.concatNodeCount = nodes.len
+    # A comment is no atom: [parseRepeats] has given the repeats after one to
+    # the atom before it.  Inside \Q...\E it is text.
+    if ch == '(' and not p.inLiteralQuote and p.skipComment():
       continue
-    let node = p.parseQuantified()
+    var reach = 0
+    let node = p.parseQuantified(reach)
     # Isolated flag group (?i) applies to the rest of the enclosing group,
     # including across alternation branches. Restructure the AST so the flag
     # wraps the remaining regex as a scoped flag group.
@@ -1272,7 +1321,11 @@ proc parseConcat(p: var Parser): Node =
       # ``(?:(?I)a)|b`` alike.  Raise the flag only after the body is parsed,
       # so the body's own nodes -- the ``ab`` of ``(?I)ab`` -- are not counted.
       let isolatedNeedsExclusive = (node.flagsOn * LeadingOnlyFlags).card > 0
+      # The rest sits a level deeper, in the group this one wraps it in, as
+      # Oniguruma counts it too: ``(?i)(?i)...`` nests like ``(?i:(?i:...))``.
+      p.enterLevel(p.depth)
       let rest = p.parseAlternation()
+      dec p.depth
       nodes.add(
         Node(
           kind: nkFlagGroup,
@@ -1285,17 +1338,14 @@ proc parseConcat(p: var Parser): Node =
       if isolatedNeedsExclusive:
         p.requiresExclusive = true
       break
-    # Skip empty nodes from \E; if a quantifier follows, attach to previous atom
+    # Skip empty nodes from \E; the repeats after one go to the atom before
     if node.kind == nkConcat and node.children.len == 0:
-      if not p.inLiteralQuote and nodes.len > 0 and not p.atEnd and
-          p.peek in {'*', '+', '?', '{'}:
-        var lastNode = nodes.pop()
-        p.concatNodeCount = nodes.len
-        lastNode = p.parseQuantifier(lastNode)
-        nodes.add(lastNode)
-        p.concatNodeCount = nodes.len
+      if not p.inLiteralQuote and nodes.len > 0:
+        p.parseRepeats(nodes[^1], lastReach)
+        p.reach = max(p.reach, lastReach)
       continue
     nodes.add(node)
+    lastReach = reach
     p.concatNodeCount = nodes.len
     # (?Ii:...) requires being the sole node in the pattern
     if p.requiresExclusive and nodes.len > 1:
@@ -1547,9 +1597,7 @@ proc parseConditional(p: var Parser): Node =
 
 proc parseGroup(p: var Parser): Node =
   p.expect('(')
-  inc p.depth
-  if p.depth > MaxNestingDepth:
-    p.error("nesting too deep")
+  p.enterLevel(p.depth)
   # Level cap is a complexity limit; this is the resource guard.
   # Parser levels are cheap, so check every level.
   if stackUsedFrom(p.stackBase) > MaxStackBytes:
@@ -1648,12 +1696,6 @@ proc parseGroup(p: var Parser): Node =
       p.advance()
       let body = p.parseRegex()
       result = Node(kind: nkAtomicGroup, atomicBody: body)
-    of '#':
-      # (?#...) comment group
-      p.advance() # skip '#'
-      while not p.atEnd and p.peek != ')':
-        p.advance()
-      result = Node(kind: nkGroup, groupBody: Node(kind: nkConcat, children: @[]))
     of 'y':
       # (?y{g}) or (?y{w}) — grapheme mode flag
       p.advance() # skip 'y'

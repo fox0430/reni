@@ -651,6 +651,13 @@ suite "Step 10: Unicode properties and remaining features":
     check r.ast.runes[0] == Rune('a')
     check r.ast.runes[1] == Rune('b')
 
+  test "a comment ends at its own close paren":
+    # As in Oniguruma, a backslash escapes the character after it, and a
+    # pattern that ends inside a comment is an error (-118).
+    check search("ab", re("a(?#x\\)y)b")).matchSpan == 0 .. 2
+    for pattern in ["a(?#xyz", "(?#", "a*(?#x", "a(?#\\"]:
+      check compileError(pattern).startsWith("expected ')'")
+
   test "\\K keep anchor":
     let r = re("\\K")
     check r.ast.kind == nkAnchor
@@ -736,6 +743,68 @@ suite "Bug fixes and validation":
   test "large quantifier second number raises error":
     expect RegexError:
       discard re("a{1,99999999999999999999}")
+
+  test "a repeat of a repeat counts toward the nesting cap":
+    # A repeat is no level, but a repeat of one is: ``a{1}{1}`` nests a repeat
+    # in a repeat, one level of the tree as a group is.  Oniguruma counts
+    # every repeat toward its larger parse depth limit instead, half what a
+    # group costs it, and gives up on 30,000 of them as well.
+    check search("a", re("a" & "{1}".repeat(257))).matchSpan == 0 .. 1
+    check compileError("a" & "{1}".repeat(258)) == "nesting too deep at position 775"
+    # ``(?x)`` nests the rest a level down, so the 257th repeat is too deep,
+    # and the position is where it ends, not past the space after it.
+    check compileError("(?x)a" & " {1}".repeat(258)) ==
+      "nesting too deep at position 1033"
+    # A group with no body is no deeper than an atom.
+    check compileError("(*FAIL)" & "{1}".repeat(257) & "|a") == ""
+    check compileError("(*FAIL)" & "{1}".repeat(258) & "|a").startsWith(
+      "nesting too deep"
+    )
+    # After a comment or ``\Q\E``, a repeat goes to the atom before, and nests.
+    check compileError("a" & "(?#)*".repeat(300)).startsWith("nesting too deep")
+    check compileError("a" & "\\Q\\E*".repeat(300)).startsWith("nesting too deep")
+    # An empty node is no level, so a group holding only one nests no deeper
+    # for the atom before the group.
+    let deep = "a" & "{1}".repeat(250)
+    for empty in ["\\E", "\\Q\\E", "(?)"]:
+      check compileError(deep & "(?:" & empty & ")" & "{1}".repeat(10)) == ""
+    # Nor does it drop the deeper level of an atom before it in the group, so
+    # the repeats after the group still count from there.
+    let inner = "(?:a" & "{1}".repeat(255) & ")"
+    for empty in ["\\E", "\\Q\\E", "(?)"]:
+      let pattern = "(?:" & inner & "b" & empty & ")" & "{1}".repeat(255)
+      check compileError(pattern).startsWith("nesting too deep")
+    # One repeat on each group adds nothing to the groups' own levels, where
+    # counting every repeat would make these 150 groups 301 levels.  A setjmp
+    # build runs out of stack budget before that (see test_stack_budget).
+    when not compileOption("exceptions", "setjmp"):
+      check compileError("(?:".repeat(150) & "a*" & ")*".repeat(150)) == ""
+
+  test "a comment or an empty node parts no chain of repeats":
+    # Oniguruma's tokenizer skips a comment, so the repeats on both sides of
+    # one chain as in ``a*{2}``.  ``\E`` is nothing outside \Q...\E either.
+    check search("aa{2}", re("a(?#)*{2}")).matchSpan == 0 .. 2
+    check search("aa", re("a(?#)**")).matchSpan == 0 .. 2
+    check search("aaa{2}", re("a\\E*{2}")).matchSpan == 0 .. 3
+    check search("aa", re("a\\E(?#)*")).matchSpan == 0 .. 2
+    # Inside \Q...\E a comment is text, and so is the repeat after it.
+    check search("a(?#)*", re("\\Qa(?#)*\\E")).matchSpan == 0 .. 6
+
+  test "the repeats of a group nest below the deepest level inside it":
+    # They come after the group has closed: here 2 groups and 199 nested
+    # repeats inside, and 199 or 49 more outside.  That bounds the depth of
+    # the tree, and is reni's rule: Oniguruma counts the repeats after a group
+    # from the group's own level, whatever nests inside it.
+    let inner = "(?:a" & "{1}".repeat(200) & ")"
+    check compileError("(?:" & inner & "{1}".repeat(200) & ")").startsWith(
+      "nesting too deep"
+    )
+    check search("a", re("(?:" & inner & "{1}".repeat(50) & ")")).found
+
+  test "an isolated flag group nests the rest of its group":
+    # ``(?i)(?i)a`` nests as ``(?i:(?i:a))`` does, in Oniguruma too.
+    check search("A", re("(?i)".repeat(256) & "a")).found
+    check compileError("(?i)".repeat(257) & "a").startsWith("nesting too deep")
 
   test "a condition number past 32 bits is a pattern":
     # Oniguruma's ``scan_number`` gives up past ``high(int32)``, and the

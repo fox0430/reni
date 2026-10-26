@@ -183,6 +183,11 @@ suite "Step 2: Anchors":
     expect(RegexError):
       discard re("(?i){2}")
     check search("aa", re("a(?#c){2}")).matchSpan == 0 .. 2
+    # ``\E`` is nothing outside \Q...\E, so the repeat after one is still on
+    # the anchor.  PCRE2, which reni takes \Q...\E from, rejects ``^\E*`` as
+    # it does ``^*``; Oniguruma's syntax has no \Q...\E and reads ``\E`` as E.
+    for pattern in ["^\\E*", "\\b\\E{2}", "^\\Q\\E?"]:
+      check compileError(pattern).startsWith("target of repeat operator")
 
 suite "Step 3: Dot and character types":
   test ". matches any char except newline":
