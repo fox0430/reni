@@ -1634,6 +1634,26 @@ suite "absent range and zero-width assertions":
     # ...and gone once ``(?~|)`` clears it.
     check spans("a", "(?~|a)(?~|)\\b") == "0..0 / 1..1 / 0..0"
 
+  test "backtracking past (?~|) narrows the range again":
+    # A branch retried after the clear has failed meets the range the clear
+    # widened, not the subject end.
+    check spans("a", "(?~|a)(?:(?~|)x|)a") == "none / none / none"
+    check spans("a", "(?~|a)(?:(?~|)(?!)|)a") == "none / none / none"
+    check spans("ab", "(?~|b)(?:(?~|)ab|a)b") == "none / none / none"
+    check spans("abc", "(?~|ab)(?:(?~|)abc|a)b") == "none / none / none"
+    check spans("b", "(?~|b)(?:|b)(?~|)\\z") == "1..1 / 1..1 / none"
+    check spans("b", "\\A(?~|b)(?:|b)(?~|)\\z") == "none / none / none"
+    # A choice made after the clear keeps the wide range, and so does an
+    # atomic group around it; a repeat backtracking past it narrows it.
+    check spans("a", "(?~|a)(?~|)(?:x|)a") == "0..1 / 0..1 / 0..1"
+    check spans("a", "(?~|a)(?>(?~|))a") == "0..1 / 0..1 / 0..1"
+    check spans("a", "(?~|a)(?:(?~|)b)?a") == "none / none / none"
+    check spans("a", "(?~|a)(?:(?~|))*a") == "0..1 / 0..1 / 0..1"
+    # Backtracking past an atomic group narrows it again as well, and a clear
+    # in a body that fails with no choice of its own is put back by the group.
+    check spans("b", "(?~|b)(?:|b)(?>(?~|))\\z") == "1..1 / 1..1 / none"
+    check spans("a", "(?~|a)(?:(?>(?~|)x)|)a") == "none / none / none"
+
 suite "Callout verbs":
   test "MAX basic limits repetitions":
     let m = search("aaaaa", re("(?:a(*MAX{3}))*"))
@@ -4642,16 +4662,18 @@ suite "literal alternation trie":
     check not search("int8 ", re("(?>int|int8)\\b")).found
     check search("int ", re("(?>int|int8)\\b")).matchSpan == 0 .. 3
 
-  test "a branch the narrowed end cut short is still offered once it widens":
-    # ``(?~|...)`` pulls ``subjectEnd`` in and ``(?~|)`` pushes it back out
-    # again, so a branch that does not fit while the end is narrow has to stay
-    # reachable afterwards.  The choice point therefore hangs on how many
-    # branches are untried, never on which of them the subject spells under
-    # the end at hand.
+  test "a branch the narrowed end cut short stays cut short on the way back":
+    # ``(?~|...)`` pulls the absent end in and ``(?~|)`` pushes it back out,
+    # but backtracking past ``(?~|)`` pulls it in again, so a branch that does
+    # not fit while the end is narrow is not offered after the widening fails.
+    # libonig 6.9.10 finds no match in any of these.
     check hasTrie("(?~|bX)(a|ab)(?~|)X")
-    check search("abX", re("(?~|bX)(a|ab)(?~|)X")).matchSpan == 0 .. 3
-    check search("abcd", re("(?~|c)(ab|abcd|aa|abx)(?~|)\\b")).matchSpan == 0 .. 4
-    check search("abcabc", re("(?~|b)(?:a|abc|abcd)(?~|)ab")).matchSpan == 0 .. 5
+    check not search("abX", re("(?~|bX)(a|ab)(?~|)X")).found
+    check not search("abcd", re("(?~|c)(ab|abcd|aa|abx)(?~|)\\b")).found
+    check not search("abcabc", re("(?~|b)(?:a|abc|abcd)(?~|)ab")).found
+    # An atomic group around the clear puts the end back too, so the walk on
+    # the way back sees the end the choice was pushed under.
+    check not search("abX", re("(?~|bX)(a|ab)(?>(?~|))X")).found
 
   test "nothing matches at the end of the subject":
     check not search("in", re("(int|uint|float)")).found

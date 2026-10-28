@@ -368,7 +368,7 @@ type
     chUndoFlags ## put back the flags a group boundary restored
     chUndoFlagsGM ## put back the flags and grapheme mode a flag group restored
     chUndoCapture ## put back the span, flags and stack entry a capture wrote
-    chUndoAbsentEnd ## put back the ``absentEnd`` an absent range narrowed
+    chUndoAbsentEnd ## re-narrow the ``absentEnd`` a range's end or ``(?~|)`` widened
     chWidenAbsentEnd ## widen the ``absentEnd`` an absent marker narrowed
     chAbsentFunc ## absent function: retry the continuation shorter
     chUndoPos ## rewind the position a backreference advanced
@@ -1356,15 +1356,17 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
   #
   # Serves the ``runCont`` path; the loop answers markers inline.
   let base = ctx.framesLen
+  # A failed walk takes back the ``(?~|)`` widenings too, which leave no frame.
+  let entryEnd = ctx.absentEnd
   var i = idx
   # Head of the ``ckRestoreAbsentEnd`` chain for the tail walk.
   var tail = cont
+  var ok: bool
   while true:
     if i >= nodes.len:
       # Run the chained tail through the loop, then unwind.
-      let ok = runContFromMachine(ctx, tail)
-      unwindAbsentFrames(ctx, base)
-      return ok
+      ok = runContFromMachine(ctx, tail)
+      break
     let node = nodes[i]
     # Under an enclosing scan the markers are not shortcuts but refusals, so
     # let the general path answer them; see ``absentScan``.
@@ -1392,16 +1394,18 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       continue
     if i + 1 >= nodes.len:
       # Last child: its continuation *is* ``tail``, so skip the frame entirely.
-      let ok = matchWithCont(ctx, nodes[i], tail)
-      unwindAbsentFrames(ctx, base)
-      return ok
+      ok = matchWithCont(ctx, nodes[i], tail)
+      break
     let fid = pushFrame(
       ctx,
       Frame(kind: ckSeqContinue, parent: tail, sNode: parent.id, sIdx: int32(i + 1)),
     )
-    let ok = matchWithCont(ctx, nodes[i], fid)
-    unwindAbsentFrames(ctx, base)
-    return ok
+    ok = matchWithCont(ctx, nodes[i], fid)
+    break
+  unwindAbsentFrames(ctx, base)
+  if not ok:
+    ctx.absentEnd = entryEnd
+  ok
 
 proc unwindAbsentFrames(ctx: MatchContext, base: int) =
   ## Pop frames pushed by ``matchSeqCont`` and widen each ``absentEnd`` they
@@ -2278,10 +2282,10 @@ proc altBranchPossible(node: Node, i: int, b: uint8, hasByte: bool): bool {.inli
 proc nextAltBranch(node: Node, start: int, b: uint8, hasByte: bool): int {.inline.} =
   ## First alternative at or after ``start`` that ``altBranchPossible``
   ## admits, or -1.  Callers hold the next *untried* index and run this again
-  ## on every visit, so the test always sees the state at the moment it runs:
-  ## ``subjectEnd`` can change while a branch executes (``(?~|)`` clears it
-  ## with no undo), and a branch passed over while the end was narrow has to
-  ## stay reachable once it widens.
+  ## when they backtrack, instead of storing its answer at the push.  The
+  ## answer is the same either way -- backtracking undoes every change to
+  ## ``subjectEnd`` made after the push, ``(?~|)``'s included -- so the second
+  ## run is put off until a backtrack needs it.
   var i = start
   while i < node.alternatives.len:
     if altBranchPossible(node, i, b, hasByte):
@@ -2301,8 +2305,8 @@ proc nextTrieBranch(
   ## both match here (``int`` and ``int8`` at ``int8``) -- which is why the
   ## terminals carry their index.
   ##
-  ## Re-walked on each backtrack rather than cached, for the reason
-  ## [nextAltBranch] gives: ``subjectEnd`` moves under a running match.
+  ## Walked again on each backtrack rather than at the push, as
+  ## [nextAltBranch] is run again.
   result = (idx: -1'i32, endPos: 0)
   var p = ctx.pos
   if p >= ctx.subjectEnd or uint8(ctx.subject[p]) notin trie.firstBytes:
@@ -3193,8 +3197,12 @@ proc matchAbsent(ctx: MatchContext, node: Node, cont: ContId): bool =
   case node.absentKind
   of abClear:
     # (?~|) - always matches empty, widens ``absentEnd`` to the subject end
+    let savedEnd = ctx.absentEnd
     ctx.absentEnd = ctx.subject.len
-    return runCont(ctx, cont)
+    let ok = runCont(ctx, cont)
+    if not ok:
+      ctx.absentEnd = savedEnd
+    return ok
   of abFunction:
     if node.isEmptyAbsentFunc:
       # (?~), (?~a*) - match empty and nothing else ([isEmptyAbsentFunc]).
@@ -3981,6 +3989,17 @@ proc runMachine(
     if ctx.steps > ctx.stepLimit:
       raise newException(RegexLimitError, "match step limit exceeded")
 
+  template clearAbsentEnd(): untyped =
+    ## ``(?~|)``: widen ``absentEnd`` to the subject end, leaving an undo that
+    ## narrows it again on backtracking.  The undo is left out when the end is
+    ## already there, and on ``ckRestoreAbsentEnd``'s terms when this machine
+    ## has no choice left: failing then leaves the machine, and its caller
+    ## puts the end back.
+    if ctx.absentEnd != ctx.subject.len:
+      if ctx.choicesLen > choiceBase:
+        ctx.pushChoice Choice(kind: chUndoAbsentEnd, useAbsentPos: ctx.absentEnd)
+      ctx.absentEnd = ctx.subject.len
+
   while true:
     case mode
     of mMatch:
@@ -4056,8 +4075,7 @@ proc runMachine(
             chargeTrieBranch()
             if pick.idx + 1 < node.alternatives.len:
               # The next *untried* branch, as under the hints: the walk runs
-              # again on backtrack, so a branch that spells nothing here is
-              # not passed over for good.
+              # again on backtrack (``nextTrieBranch``).
               ctx.pushChoice Choice(
                 kind: chAltTrie,
                 aNode: node.id,
@@ -4110,9 +4128,8 @@ proc runMachine(
           else:
             if first + 1 < node.alternatives.len:
               # The stored index is the next *untried* branch, not the next
-              # one the hints admitted for this state.  The filter is re-run
-              # on every backtrack, so a branch it passes over here is not
-              # passed over for good.
+              # one the hints admit: the filter runs again on backtrack, under
+              # the same end and byte (``nextAltBranch``).
               ctx.pushChoice Choice(
                 kind: chAltHinted,
                 aNode: node.id,
@@ -4568,8 +4585,8 @@ proc runMachine(
           continue
         case node.absentKind
         of abClear:
-          # (?~|): always empty; no undo.
-          ctx.absentEnd = ctx.subject.len
+          # (?~|): always empty; widen, narrowing again on backtracking.
+          clearAbsentEnd()
           mode = mCont
         of abRange:
           # (?~|absent): narrow range, widen on failure.
@@ -4738,7 +4755,7 @@ proc runMachine(
             )
             inc seqIdx
           elif mk.kind == nkAbsent and mk.absentKind == abClear:
-            ctx.absentEnd = ctx.subject.len
+            clearAbsentEnd()
             inc seqIdx
           else:
             break
@@ -4908,14 +4925,13 @@ proc runMachine(
           ctx.choices[top].aIdx = int32(idx + 1)
         mode = mMatch
       of chAltHinted:
-        # As ``chAlt``, but a branch is only tried when the hints admit it
-        # for the state at hand.  ``aIdx`` is the next raw alternative index
-        # left untried, so the filter runs again on every backtrack and its
-        # verdict is never cached past a ``subjectEnd`` change: ``(?~|)``
-        # widens the end with no undo, and a branch passed over under the
-        # narrow end can still match under the wide one.  Telling the two
-        # kinds apart is what keeps an unhinted alternation at exactly its
-        # old cost -- the case dispatch already had to happen.
+        # As ``chAlt``, but a branch is only tried when the hints admit it.
+        # ``aIdx`` is the next raw alternative index left untried, and the
+        # filter runs here rather than at the push; backtracking has put
+        # ``subjectEnd`` back by now, so it answers as it would have there
+        # (``nextAltBranch``).  Telling the two kinds apart is what keeps an
+        # unhinted alternation at exactly its old cost -- the case dispatch
+        # already had to happen.
         ctx.altCheckPop(top)
         ctx.pos = ctx.choices[top].aPos
         ctx.keepStart = ctx.choices[top].aKeepStart

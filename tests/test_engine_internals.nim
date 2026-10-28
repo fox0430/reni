@@ -1946,17 +1946,17 @@ suite "an alternation passes over branches whose first byte cannot match":
     # ...and does not disturb what follows it on the way back out.
     check search("zzzz", re("z(?:aaa|bbb|ccc)|zz")).matchSpan == 0 .. 2
 
-  test "a branch passed over under a narrow end is retried once it widens":
-    # ``(?~|b)`` narrows the subject end to the byte before ``b``, and
-    # ``(?~|)`` clears the limit for good.  At the narrow end there is no byte
-    # in front of the matcher, so the ``b`` branch cannot be admitted; when
-    # the continuation clears the end and then fails, the branch has to be
-    # there to backtrack into.  A hint decision cached from entry time -- the
-    # end it was made under is not the end backtracking sees -- loses it.
-    check search("b", re("\\A(?~|b)(?:|b)(?~|)\\z")).matchSpan == 0 .. 1
-    check search("b", re("(?~|b)(?:|b)(?~|)\\z")).matchSpan == 0 .. 1
+  test "a branch passed over under a narrow end stays passed over on the way back":
+    # ``(?~|b)`` narrows the subject end to the byte before ``b``.  At the
+    # narrow end there is no byte in front of the matcher, so the ``b`` branch
+    # cannot be admitted.  When the continuation widens the end with ``(?~|)``
+    # and then fails, backtracking past the widening narrows the end again, so
+    # the branch is still out: the end the hint decision was made under is the
+    # end backtracking sees.  Oniguruma's answers; the match is at 1.
+    check not search("b", re("\\A(?~|b)(?:|b)(?~|)\\z")).found
+    check search("b", re("(?~|b)(?:|b)(?~|)\\z")).matchSpan == 1 .. 1
     # The passed-over branch need not be the one right after the first.
-    check search("b", re("(?~|b)(?:|b|b)(?~|)\\z")).matchSpan == 0 .. 1
+    check search("b", re("(?~|b)(?:|b|b)(?~|)\\z")).matchSpan == 1 .. 1
     # ``(?~)`` is not a clear: the limit stays narrow and the branch out.
     check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 1 .. 1
 
