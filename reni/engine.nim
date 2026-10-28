@@ -988,9 +988,11 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
   ## A ``{.cursor.}`` borrow is *not* exempt, though ORC would make the field
   ## copyable: ``refc`` implements no ``{.cursor.}``, so such a field
   ## reinstates exactly the corruption ``storeSlot`` below describes.
-  result = newStmtList()
+  # ``checks`` is assigned to ``result`` at the end, not aliased to it here:
+  # Nim 2.4 moves ``result`` into the closure ``walk`` captures it through
+  # when that alias is ``result``'s last use, and the macro then returns nil.
   let
-    checks = result
+    checks = newStmtList()
     tname = t.getTypeInst[1].strVal
   proc walk(n: NimNode) =
     case n.kind
@@ -1043,6 +1045,7 @@ macro requireBitwiseCopyable(t: typedesc): untyped =
       walkObject(impl[2][1][0])
 
   walkObject(t.getTypeInst[1])
+  result = checks
 
 template storeSlot(dst, src: untyped) =
   ## Move ``src`` into the popped buffer slot ``dst``.
