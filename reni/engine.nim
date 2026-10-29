@@ -32,7 +32,7 @@ type
     ckFlagGroup ## After flag group body, restore flags / grapheme mode.
     ckQuantGreedyMore ## Greedy quantifier: try one more rep, then fall back.
     ckQuantLazyMore ## Lazy quantifier: try one more rep, then fall back.
-    ckRestoreAbsentEnd ## Absent abRange/abExpression: restore ``absentEnd``.
+    ckRestoreAbsentEnd ## Absent abExpression: widen ``absentEnd`` back after ``expr``.
     ckEndCheckPos ## Lookbehind: succeed iff ctx.pos == targetPos.
     ckFindLongestRec ## findLongest top level: record longest, return false.
 
@@ -368,7 +368,8 @@ type
     chUndoFlags ## put back the flags a group boundary restored
     chUndoFlagsGM ## put back the flags and grapheme mode a flag group restored
     chUndoCapture ## put back the span, flags and stack entry a capture wrote
-    chUndoAbsentEnd ## re-narrow the ``absentEnd`` a range's end or ``(?~|)`` widened
+    chUndoAbsentEnd
+      ## re-narrow the ``absentEnd`` ``(?~|)`` or an absent expression's end widened
     chWidenAbsentEnd ## widen the ``absentEnd`` an absent marker narrowed
     chAbsentFunc ## absent function: retry the continuation shorter
     chUndoPos ## rewind the position a backreference advanced
@@ -930,7 +931,6 @@ proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool
 proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool
 proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
 proc runContFromMachine(ctx: MatchContext, cont: ContId): bool
-proc unwindAbsentFrames(ctx: MatchContext, base: int)
 proc findAbsentPos(
   ctx: MatchContext,
   absentBody: Node,
@@ -1351,40 +1351,25 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
     parent.children
 
   # Walk consecutive absent markers iteratively so long marker runs do not
-  # consume native stack where no guard observes them. Narrowed ends are kept
-  # in ``ckRestoreAbsentEnd`` frames for explicit unwind.
+  # consume native stack where no guard observes them.  A marker's end
+  # outlives the sequence (see ``runMachine``'s ``abRange`` arm), so only a
+  # failed walk puts it back.
   #
   # Serves the ``runCont`` path; the loop answers markers inline.
   let base = ctx.framesLen
-  # A failed walk takes back the ``(?~|)`` widenings too, which leave no frame.
   let entryEnd = ctx.absentEnd
   var i = idx
-  # Head of the ``ckRestoreAbsentEnd`` chain for the tail walk.
-  var tail = cont
   var ok: bool
   while true:
     if i >= nodes.len:
-      # Run the chained tail through the loop, then unwind.
-      ok = runContFromMachine(ctx, tail)
+      ok = runContFromMachine(ctx, cont)
       break
     let node = nodes[i]
     # Under an enclosing scan the markers are not shortcuts but refusals, so
     # let the general path answer them; see ``absentScan``.
     if node.kind == nkAbsent and node.absentKind == abRange and not ctx.absentSuppressed:
       # (?~|absent): narrow range to exclude absent.
-      let rangeStart = ctx.pos
-      let absentPos = findAbsentPos(ctx, node.absentBody, rangeStart)
-      let savedEnd = ctx.absentEnd
-      ctx.absentEnd = absentPos
-      tail = pushFrame(
-        ctx,
-        Frame(
-          kind: ckRestoreAbsentEnd,
-          parent: tail,
-          reSavedEnd: savedEnd,
-          reAbsentPos: absentPos,
-        ),
-      )
+      ctx.absentEnd = findAbsentPos(ctx, node.absentBody, ctx.pos)
       inc i
       continue
     if node.kind == nkAbsent and node.absentKind == abClear and not ctx.absentSuppressed:
@@ -1393,27 +1378,19 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
       inc i
       continue
     if i + 1 >= nodes.len:
-      # Last child: its continuation *is* ``tail``, so skip the frame entirely.
-      ok = matchWithCont(ctx, nodes[i], tail)
+      # Last child: its continuation *is* ``cont``, so skip the frame entirely.
+      ok = matchWithCont(ctx, nodes[i], cont)
       break
     let fid = pushFrame(
       ctx,
-      Frame(kind: ckSeqContinue, parent: tail, sNode: parent.id, sIdx: int32(i + 1)),
+      Frame(kind: ckSeqContinue, parent: cont, sNode: parent.id, sIdx: int32(i + 1)),
     )
     ok = matchWithCont(ctx, nodes[i], fid)
     break
-  unwindAbsentFrames(ctx, base)
+  ctx.framesLen = base
   if not ok:
     ctx.absentEnd = entryEnd
   ok
-
-proc unwindAbsentFrames(ctx: MatchContext, base: int) =
-  ## Pop frames pushed by ``matchSeqCont`` and widen each ``absentEnd`` they
-  ## narrowed.
-  while ctx.framesLen > base:
-    dec ctx.framesLen
-    if ctx.frames[ctx.framesLen].kind == ckRestoreAbsentEnd:
-      ctx.absentEnd = ctx.frames[ctx.framesLen].reSavedEnd
 
 proc matchEncodedBytes(ctx: MatchContext, target: Rune, p: int): int =
   ## [matchBytes] for a character of more than one byte.
@@ -4000,6 +3977,16 @@ proc runMachine(
         ctx.pushChoice Choice(kind: chUndoAbsentEnd, useAbsentPos: ctx.absentEnd)
       ctx.absentEnd = ctx.subject.len
 
+  template narrowAbsentEnd(absentBody: Node): untyped =
+    ## ``(?~|absent)``: narrow ``absentEnd`` to the first place ``absentBody``
+    ## matches, leaving an undo that widens it again on backtracking.  No
+    ## frame: the range outlives the group it stands in (see the ``abRange``
+    ## arm).
+    let absentPos = findAbsentPos(ctx, absentBody, ctx.pos)
+    let savedEnd = ctx.absentEnd
+    ctx.absentEnd = absentPos
+    ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
+
   while true:
     case mode
     of mMatch:
@@ -4434,8 +4421,13 @@ proc runMachine(
             # the window back on both exits.
             ctx.enterLookaroundBody(NoLookLimit)
             if matchDiscardedBody(ctx, node.lookBody, TrueCont):
-              # Keep the captures the lookahead body made.
+              # Keep the captures the lookahead body made, and the absent
+              # range it moved (see the ``abRange`` arm).  The rollback
+              # ``keepLookCaptures`` leaves restores the range with the
+              # other scalars.
+              let bodyEnd = ctx.absentEnd
               keepLookCaptures(ctx, node, saved)
+              ctx.absentEnd = bodyEnd
               restoreStackLens(ctx, stackSnap)
               mode = mCont
             else:
@@ -4589,12 +4581,14 @@ proc runMachine(
           clearAbsentEnd()
           mode = mCont
         of abRange:
-          # (?~|absent): narrow range, widen on failure.
-          let rangeStart = ctx.pos
-          let absentPos = findAbsentPos(ctx, node.absentBody, rangeStart)
-          let savedEnd = ctx.absentEnd
-          ctx.absentEnd = absentPos
-          ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
+          # (?~|absent): narrow the range until a clear or another range
+          # moves it, whatever group this stands in.  Backtracking widens it
+          # again, and so does the end of an enclosing absent expression's
+          # ``expr`` (``ckRestoreAbsentEnd``).  Oniguruma writes
+          # ``right_range`` nowhere else, and its undo is a ``PUSH_SUPER``
+          # entry, which the cut that ends an atomic group or a look-ahead
+          # leaves in place.
+          narrowAbsentEnd(node.absentBody)
           mode = mCont
         of abExpression:
           # (?~|absent|expr): match expr narrowed, widen after.
@@ -4740,19 +4734,7 @@ proc runMachine(
               mk.absentKind in {abRange, abClear}:
             break
           if mk.kind == nkAbsent and mk.absentKind == abRange:
-            let absentPos = findAbsentPos(ctx, mk.absentBody, ctx.pos)
-            let savedEnd = ctx.absentEnd
-            ctx.absentEnd = absentPos
-            ctx.pushChoice Choice(kind: chWidenAbsentEnd, wsSavedEnd: savedEnd)
-            cont = pushFrame(
-              ctx,
-              Frame(
-                kind: ckRestoreAbsentEnd,
-                parent: cont,
-                reSavedEnd: savedEnd,
-                reAbsentPos: absentPos,
-              ),
-            )
+            narrowAbsentEnd(mk.absentBody)
             inc seqIdx
           elif mk.kind == nkAbsent and mk.absentKind == abClear:
             clearAbsentEnd()
@@ -4874,8 +4856,8 @@ proc runMachine(
           else:
             startLazy(body, minRep, maxRep, count, parent, pure)
       of ckRestoreAbsentEnd:
-        # Walking out of a marker: widen end, leaving an undo to re-narrow
-        # when backtracking retries inside the narrowed region.
+        # Walking out of an absent expression's ``expr``: widen the end,
+        # leaving an undo to re-narrow when backtracking retries inside it.
         if ctx.choicesLen > choiceBase:
           ctx.pushChoice Choice(
             kind: chUndoAbsentEnd, useAbsentPos: ctx.frames[cont].reAbsentPos
