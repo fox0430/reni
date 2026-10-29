@@ -1069,16 +1069,19 @@ suite "a delegated construct in a quantifier body stays inside the budget":
     # The last delegated shape: its fixed alternatives used to be retried
     # from a native loop counter, so 10_000 levels could not fit any budget.
     # The remainder lives in a heap entry now, holding no native frame per
-    # repetition.
-    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 10_000) == dqMatched
+    # repetition.  A ``(?:...)`` that opens a condition's body is the one
+    # place a repeat still sits on the look-behind (Oniguruma's
+    # ``group_head``): the group passes through, entering no frame of its own.
+    check delegatedOutcome("(?:()(?(1)(?:(?<=a|xy))?a))*b", 10_000) == dqMatched
+    check delegatedOutcome("(?:((?<=a|xy))?a)*b", 10_000) == dqMatched
 
   test "delegated shapes match well inside the budget":
     # Small repetition counts match on every build: no remaining shape holds
     # a native frame per repetition, so no guard is left to fire early here.
-    check delegatedOutcome("(?:(?~|x)a)*b", 10) == dqMatched
-    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 10) == dqMatched
-    check delegatedOutcome("(?:(?~|x)a)*b", 100) == dqMatched
-    check delegatedOutcome("(?:(?<=a|xy)?a)*b", 100) == dqMatched
+    for reps in [10, 100]:
+      check delegatedOutcome("(?:(?~|x)a)*b", reps) == dqMatched
+      check delegatedOutcome("(?:()(?(1)(?:(?<=a|xy))?a))*b", reps) == dqMatched
+      check delegatedOutcome("(?:((?<=a|xy))?a)*b", reps) == dqMatched
 
   test "a group around a lookbehind repeats without overflowing the stack":
     # ``runCont`` used to walk continuation-chain links by native recursion,

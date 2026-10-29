@@ -35,7 +35,12 @@ proc genPattern(r: var Rand): string =
   of 0 .. 3:
     Pre[r.below(Pre.len)] & "(?<=" & lit & ")" & body & Post[r.below(Post.len)]
   of 4:
-    "(?:(?<=" & lit & ")" & body & ")+"
+    # A ``(?:...)`` of the look-behind alone takes no repeat, as in
+    # Oniguruma; a capture of it does.
+    if body.len == 0:
+      "((?<=" & lit & "))+"
+    else:
+      "(?:(?<=" & lit & ")" & body & ")+"
   of 5:
     "((?<=" & lit & ")" & body & ")" & Post[r.below(Post.len)]
   of 6:
@@ -43,7 +48,7 @@ proc genPattern(r: var Rand): string =
   of 7:
     "(?<=" & lit & ")(?<=" & lit & ")" & body
   of 8:
-    "(?<=" & lit & ")?" & body
+    "((?<=" & lit & "))?" & body
   else:
     body & "(?<=" & lit & ")" & Post[r.below(Post.len)]
 

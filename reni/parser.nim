@@ -3,6 +3,19 @@ from std/strutils import find
 
 import types, charclass, unicode_utils, stackguard, leafgate
 
+type RepeatTarget = enum
+  ## What Oniguruma's parser says of a repeat of a node
+  ## (``is_invalid_quantifier_target``, -114).
+  rtTakes ## any repeat
+  rtRefuses
+    ## none: an anchor, a look-around, a callout or a verb, a ``(?:...)``
+    ## around one, or an alternation with one for a branch
+  rtGroupHead
+    ## the first repeat, as a ``(?:...)`` around a node that refuses does
+    ## where it opens a body (``prs_exp``'s ``group_head``): a ``{1}`` drops
+    ## the group, as ``x{1,1} ==> x`` does, and leaves the body to refuse the
+    ## next one: ``(?(a)(?:^){1}?|b)`` is -114
+
 type Parser* = object
   src: string
   pos: int
@@ -39,6 +52,20 @@ type Parser* = object
     ## to Oniguruma's parser, or its one node is a group whose body is:
     ## ``ab\Q\E``, ``(?:ab\Q\E)``.  [splitRun] reads it for the group just
     ## parsed, the one whose body that concat was.
+  repeatTarget: RepeatTarget
+    ## What Oniguruma's parser says of a repeat of the node parsed last, with
+    ## the repeats it took.  A sequence takes any, even of one node and an
+    ## empty quote (``(?:\Q\E^)+``), and so does a group Oniguruma keeps a
+    ## node of: ``(^)+``, ``(?>^)+``, ``(?i:^)+``.  [parseAtom] sets it for
+    ## the atom it returns, [parseGroup] for a group, after its body,
+    ## [parseQuantified] for its repeats, [parseConcat] and [parseAlternation]
+    ## for the body.
+  atGroupHead: bool
+    ## The next atom opens a conditional's body or an absent operator's,
+    ## where Oniguruma's parser holds a ``(?:...)`` in a list of its own
+    ## (``prs_exp``'s ``group_head``), and a list refuses no repeat:
+    ## ``(?(a)(?:^)+|b)`` compiles ([rtGroupHead]).  [parseAtom] takes it,
+    ## and the first branch's [parseConcat] drops it if no atom did: ``(?~)``.
   sawPlainGroup*: bool
     ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
     ## skip [flattenLiteralGroups] when there is nothing to find.
@@ -474,18 +501,6 @@ proc parseQuantifier(p: var Parser, body: Node, reach: var int): Node =
     quantKind: qkind,
     quantBody: body,
   )
-
-proc isQuantifiable(node: Node): bool =
-  ## Check if a node can be the target of a quantifier.
-  case node.kind
-  of nkAnchor:
-    false
-  of nkFlagGroup:
-    node.flagBody != nil # scoped (?i:...) is quantifiable; isolated (?i) is not
-  of nkLookaround:
-    true # (?=abc){0}, (?=(a))?
-  else:
-    true
 
 proc parseEscape(p: var Parser): Node =
   p.expect('\\')
@@ -1097,7 +1112,7 @@ proc setConditionRef(
       p.error("invalid relative conditional reference '(?(" & $r.number & "))'")
 
 # Forward declarations
-proc parseGroup(p: var Parser): Node
+proc parseGroup(p: var Parser, atHead = false): Node
 proc parseAlternation(p: var Parser): Node
 
 type
@@ -1241,6 +1256,11 @@ proc recordStart(p: Parser, node: Node, start: int) =
 proc parseAtom(p: var Parser): Node =
   if p.atEnd:
     p.error("unexpected end of pattern")
+  let atHead = p.atGroupHead
+  p.atGroupHead = false
+  # Only an anchor refuses a repeat here; [parseGroup] says it for a group,
+  # the only one to see its body.
+  p.repeatTarget = rtTakes
 
   if p.inLiteralQuote:
     # Inside \Q...\E: check for \E terminator
@@ -1259,8 +1279,10 @@ proc parseAtom(p: var Parser): Node =
   of '\\':
     result = p.parseEscape()
     p.recordStart(result, start)
+    if result.kind == nkAnchor:
+      p.repeatTarget = rtRefuses
   of '(':
-    result = p.parseGroup()
+    result = p.parseGroup(atHead)
     p.recordStart(result, start)
   of '.':
     p.advance()
@@ -1268,9 +1290,11 @@ proc parseAtom(p: var Parser): Node =
   of '^':
     p.advance()
     result = Node(kind: nkAnchor, anchor: akLineBegin)
+    p.repeatTarget = rtRefuses
   of '$':
     p.advance()
     result = Node(kind: nkAnchor, anchor: akLineEnd)
+    p.repeatTarget = rtRefuses
   of '[':
     let (newPos, node) = parseCharClass(p.src, p.pos, p.flags, p.stackBase)
     p.pos = newPos
@@ -1284,13 +1308,16 @@ proc parseAtom(p: var Parser): Node =
     let r = p.advanceRune()
     result = Node(kind: nkLiteral, rune: r)
 
-proc repeatApplies(p: var Parser, body: Node): bool =
-  ## Whether the repeat operator at ``p.pos`` applies to ``body``.  A ``{``
+proc repeatApplies(p: var Parser, body: Node, refuses: bool): bool =
+  ## Whether the repeat operator at ``p.pos`` applies to ``body``, which
+  ## ``refuses`` a repeat if [Parser.repeatTarget] says so of it.  A ``{``
   ## that opens no interval does not: it is a literal after anything, and
   ## Oniguruma matches ``\G{a`` (the sassdoc grammar) and ``(?i){a`` against
-  ## ``{a``.  Any other repeat of an anchor or an isolated option group is an
-  ## error, whether it follows at once or after a ``(?#...)`` comment.
-  if isQuantifiable(body):
+  ## ``{a``.  Any other repeat of a node that refuses one, or of an isolated
+  ## option group, is an error, whether it follows at once or after a
+  ## ``(?#...)`` comment.
+  let isolated = body.kind == nkFlagGroup and body.flagBody == nil
+  if not refuses and not isolated:
     return true
   if p.peek == '{':
     let bracePos = p.pos
@@ -1299,19 +1326,28 @@ proc repeatApplies(p: var Parser, body: Node): bool =
     if p.pos == bracePos:
       return false
     p.pos = bracePos
-  if body.kind == nkFlagGroup and body.flagBody == nil:
+  if isolated:
     p.error("target of repeat operator not specified")
   p.error("target of repeat operator is not repeatable")
 
-proc parseRepeats(p: var Parser, body: var Node, reach: var int) =
+proc parseRepeats(
+    p: var Parser,
+    body: var Node,
+    reach: var int,
+    target: RepeatTarget,
+    stopAtRefusal = false,
+): RepeatTarget =
   ## Apply the repeats at ``p.pos`` to ``body``, each to the one before:
   ## ``a?{2}``, ``a*{0}``, ``a+?{2}``.  A ``(?#...)`` comment parts none of
   ## them, as in Oniguruma, so ``a(?#c)*{2}`` chains as ``a*{2}`` does.
   ## ``reach`` is the deepest level of ``body``, which each repeat of a
-  ## repeat takes one further.
+  ## repeat takes one further.  ``target`` is what [Parser.repeatTarget]
+  ## said of ``body``; the result says it of ``body`` with its repeats.
+  ## With ``stopAtRefusal`` a repeat ``body`` refuses ends the chain, left
+  ## to the caller, rather than raising.
+  result = target
   if p.inLiteralQuote:
     return # no quantifiers inside \Q...\E
-  var first = true
   while true:
     p.skipWhitespaceAndComments()
     let ch = p.peek
@@ -1321,14 +1357,20 @@ proc parseRepeats(p: var Parser, body: var Node, reach: var int) =
       break
     if ch notin {'*', '+', '?', '{'}:
       break
-    if first:
-      first = false
-      if not p.repeatApplies(body):
-        break
+    if result == rtRefuses and stopAtRefusal:
+      break
+    if not p.repeatApplies(body, result == rtRefuses):
+      break
     let posBefore = p.pos
     body = p.parseQuantifier(body, reach)
     if p.pos == posBefore:
       break # '{' was literal, not a quantifier
+    # A ``{1}`` leaves what it repeats, as ``x{1,1} ==> x`` does in
+    # Oniguruma's parser, and any other repeat a quantifier, which takes any.
+    if body.quantMin != 1 or body.quantMax != 1:
+      result = rtTakes
+    elif result == rtGroupHead:
+      result = rtRefuses
 
 proc parseQuantified(p: var Parser, reach: var int): Node =
   ## Parse an atom and its repeats, and set ``reach`` to the deepest level
@@ -1342,20 +1384,23 @@ proc parseQuantified(p: var Parser, reach: var int): Node =
     p.reach = groupReach
     return
   reach = p.reach
-  p.parseRepeats(result, reach)
+  p.repeatTarget = p.parseRepeats(result, reach, p.repeatTarget)
   p.reach = max(groupReach, reach)
 
 proc parseConcat(p: var Parser): Node =
   var nodes: seq[Node]
   var lastReach = 0 # the deepest level of ``nodes[^1]``
+  var lastTarget = rtTakes # what [repeatTarget] said of ``nodes[^1]``
   # A branch is a body, so the group it opens in reaches its level even with
   # nothing in it: ``(?:)`` is a level, where the bodiless ``(*FAIL)`` is not.
   p.reach = max(p.reach, p.depth)
   let savedConcatCount = p.concatNodeCount
   p.concatNodeCount = 0
   # The concat is more than one string to Oniguruma's parser once it holds
-  # more nodes than this; see the empty nodes below.
+  # more nodes than this, or a bare ``\E`` or ``(?)``; see the empty nodes
+  # below.
   var partedPast = high(int)
+  var bareEmpty = false # a bare ``\E`` or ``(?)`` was skipped
   var quoted = false # a ``\Q...\E`` quote is open
   p.bodyParted = false
   while not p.atEnd:
@@ -1373,6 +1418,7 @@ proc parseConcat(p: var Parser): Node =
       continue
     var reach = 0
     let node = p.parseQuantified(reach)
+    let target = p.repeatTarget
     # Isolated flag group (?i) applies to the rest of the enclosing group,
     # including across alternation branches. Restructure the AST so the flag
     # wraps the remaining regex as a scoped flag group.
@@ -1406,16 +1452,19 @@ proc parseConcat(p: var Parser): Node =
           graphemeMode: node.graphemeMode,
         )
       )
+      lastTarget = rtTakes # an option group Oniguruma keeps a node of
       if isolatedNeedsExclusive:
         p.requiresExclusive = true
       break
     # Skip empty nodes: ``\Q`` opening a quote, the ``\E`` closing it, a bare
-    # ``\E`` and ``(?)``.  The repeats after one go to the atom before.  To
+    # ``\E`` and ``(?)``.  The repeats after one go to the atom before, unless
+    # it refuses them and the node closes a quote (see below).  To
     # Oniguruma's parser a quote is a string of its own, even empty, and a
     # bare ``\E`` the letter E, and ``(?)`` is read as ``(?:)``, so the concat
     # is more than one string with a quote and anything before or after it,
     # ``a\Qb\E``, ``ab\Q\E``, ``\Qa\Eb``, or with ``\E`` or ``(?)`` anywhere.
     if node.kind == nkConcat and node.children.len == 0:
+      let closesQuote = quoted and not p.inLiteralQuote
       if p.inLiteralQuote:
         quoted = true
         if nodes.len > 0:
@@ -1424,10 +1473,24 @@ proc parseConcat(p: var Parser): Node =
         quoted = false
         partedPast = min(partedPast, nodes.len)
       else:
-        partedPast = -1
+        bareEmpty = true
       if not p.inLiteralQuote and nodes.len > 0:
-        p.parseRepeats(nodes[^1], lastReach)
-        p.reach = max(p.reach, lastReach)
+        # The quote, a string to Oniguruma even when empty, takes the
+        # repeats the atom before refuses, and they repeat nothing:
+        # ``(?=a)\Q\E+``, and the ``?`` of ``(?(a)(?:^)\Q\E{1}?|b)``, whose
+        # group the ``{1}`` drops.  They nest from the quote's own level, not
+        # from the atom's.  A bare ``\E`` and ``(?)`` take none: they are
+        # nothing, as in PCRE2, so ``^\E*`` is ``^*``.  Oniguruma reads that
+        # ``\E`` as the letter E, which reni does not, and rejects ``(?)``
+        # outright (-119).
+        if lastTarget != rtRefuses or not closesQuote:
+          lastTarget = p.parseRepeats(nodes[^1], lastReach, lastTarget, closesQuote)
+          p.reach = max(p.reach, lastReach)
+        if lastTarget == rtRefuses and closesQuote:
+          var nothing = Node(kind: nkConcat, children: @[])
+          var reach = p.depth
+          discard p.parseRepeats(nothing, reach, rtTakes)
+          p.reach = max(p.reach, reach)
       continue
     # A repeat that splits a run of characters takes the last alone, after
     # the rest.
@@ -1435,6 +1498,7 @@ proc parseConcat(p: var Parser): Node =
       nodes.add p.splitRun(node)
     nodes.add(node)
     lastReach = reach
+    lastTarget = target
     p.concatNodeCount = nodes.len
     # (?Ii:...) requires being the sole node in the pattern
     if p.requiresExclusive and nodes.len > 1:
@@ -1449,8 +1513,14 @@ proc parseConcat(p: var Parser): Node =
   # ``(?:(?:ab\Q\E){1})``: that body is the concat whose end set
   # [bodyParted] last, as no other atom here parses one, and a node with no
   # body leaves it as reset above.
-  p.bodyParted = nodes.len > partedPast or nodes.len == 1 and p.bodyParted
+  let quoteParted = nodes.len > partedPast
+  p.bodyParted = bareEmpty or quoteParted or nodes.len == 1 and p.bodyParted
+  # A list refuses no repeat, nor does a parted concat of one node, which is
+  # a list to Oniguruma's parser: ``(?:\Q\E^)+``.  A bare ``\E`` or ``(?)``
+  # parts none here: it is nothing to reni, so ``(?:^\E)+`` is ``(?:^)+``.
+  p.repeatTarget = if nodes.len == 1 and not quoteParted: lastTarget else: rtTakes
   p.concatNodeCount = savedConcatCount
+  p.atGroupHead = false
   case nodes.len
   of 0:
     Node(kind: nkConcat, children: @[])
@@ -1464,12 +1534,15 @@ proc parseAlternation(p: var Parser): Node =
   if p.peek != '|':
     return first
   var alts = @[first]
+  var refuses = p.repeatTarget == rtRefuses # one branch that does is enough
   let savedBranch = p.inNonFirstBranch
   p.inNonFirstBranch = true
   while p.peek == '|':
     p.advance() # skip '|'
     alts.add(p.parseConcat())
+    refuses = refuses or p.repeatTarget == rtRefuses
   p.inNonFirstBranch = savedBranch
+  p.repeatTarget = if refuses: rtRefuses else: rtTakes
   Node(kind: nkAlternation, alternatives: alts)
 
 proc parseRegex*(p: var Parser): Node =
@@ -1655,6 +1728,10 @@ proc parseConditional(p: var Parser): Node =
     p.branchlessNames.add((condName, p.pos))
 
   let yesStart = p.pos
+  # A body that opens with ``|`` has no yes-branch, and Oniguruma's parser
+  # starts it after the bar: the no-branch opens it.
+  let noOpens = p.peek == '|'
+  p.atGroupHead = not noOpens
   var yes = p.parseConcat()
   if p.pos != yesStart and yes.kind == nkConcat and yes.children.len == 0:
     # ``(?#...)``, ``\Q\E`` and extended-mode whitespace/comments are erased
@@ -1667,6 +1744,7 @@ proc parseConditional(p: var Parser): Node =
   var no: Node = nil
   if p.peek == '|':
     p.advance()
+    p.atGroupHead = noOpens
     no = p.parseRegex()
   # A bare name may name a group, which ``resolveBareNameConditions`` turns
   # into a ``ckNamedRef``, saying then that it reads one.  Every other
@@ -1689,7 +1767,9 @@ proc parseConditional(p: var Parser): Node =
     condBody: condBodyNode,
   )
 
-proc parseGroup(p: var Parser): Node =
+proc parseGroup(p: var Parser, atHead = false): Node =
+  ## ``atHead``: the group opens a conditional's body or an absent
+  ## operator's; see [Parser.atGroupHead].
   p.expect('(')
   p.enterLevel(p.depth)
   # Level cap is a complexity limit; this is the resource guard.
@@ -1703,10 +1783,12 @@ proc parseGroup(p: var Parser): Node =
   # wrappers a [LeadingOnlyFlags] group may sit in; those two put it back.
   let outerAtOptionPrefix = p.atOptionPrefix
   p.atOptionPrefix = false
+  var target = rtTakes # what [repeatTarget] says of the group
 
   if p.peek == '*':
     p.advance() # skip '*'
     result = p.parseCalloutVerb()
+    target = rtRefuses # a callout or a verb is one of Oniguruma's gimmicks
   elif p.peek == '?':
     p.advance() # skip '?'
     case p.peek
@@ -1721,6 +1803,11 @@ proc parseGroup(p: var Parser): Node =
       let body = p.parseRegex()
       p.sawPlainGroup = true
       result = Node(kind: nkGroup, groupBody: body)
+      # Oniguruma's parser leaves no node of the group, so a repeat of it is
+      # one of its body, unless the group opens a body there.
+      target = p.repeatTarget
+      if atHead and target == rtRefuses:
+        target = rtGroupHead
     of '~':
       # (?~...) absent operator
       p.advance() # skip '~'
@@ -1735,6 +1822,7 @@ proc parseGroup(p: var Parser): Node =
           result = Node(kind: nkAbsent, absentKind: abClear)
         else:
           # Parse absent pattern (up to '|' or ')')
+          p.atGroupHead = true
           let absentBody = p.parseConcat()
           if p.peek == '|':
             # (?~|absent|expr) - absent expression
@@ -1758,6 +1846,7 @@ proc parseGroup(p: var Parser): Node =
         # (?~pattern) - absent function. ``(?~)`` is one with an empty
         # pattern, as in Oniguruma: it matches empty and leaves the range
         # alone. The range clear is ``(?~|)``.
+        p.atGroupHead = true
         let body = p.parseRegex()
         result = Node(kind: nkAbsent, absentKind: abFunction, absentBody: body)
     of '<':
@@ -1979,6 +2068,7 @@ proc parseGroup(p: var Parser): Node =
 
   p.expect(')')
   dec p.depth
+  p.repeatTarget = if result.kind == nkLookaround: rtRefuses else: target
   # Restore flags for all groups EXCEPT isolated flag groups (?i),
   # which intentionally modify the enclosing scope's flags
   if not (result.kind == nkFlagGroup and result.flagBody == nil):
