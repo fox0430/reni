@@ -1654,6 +1654,56 @@ suite "absent range and zero-width assertions":
     check spans("b", "(?~|b)(?:|b)(?>(?~|))\\z") == "1..1 / 1..1 / none"
     check spans("a", "(?~|a)(?:(?>(?~|)x)|)a") == "none / none / none"
 
+  test "a range outlives the group that sets it":
+    # Oniguruma moves ``right_range`` only at a range, a clear or a
+    # backtrack, so the end of a group, a call or a condition leaves it.
+    check spans("ab", "(?:(?~|b)a)b") == "none / none / none"
+    check spans("ab", "((?~|b)a)b") == "none / none / none"
+    check spans("ab", "(?:(?~|b)a|x)b") == "none / none / none"
+    check spans("ab", "(?:(?~|b)a)*b") == "1..2 / 1..2 / none"
+    check spans("ab", "(?>(?~|b)a)b") == "none / none / none"
+    check spans("ab", "(?:(?~|b)a)++b") == "none / none / none"
+    check spans("ab", "((?~|b)a){0}\\g<1>b") == "none / none / none"
+    check spans("ab", "(?i:(?~|b)a)b") == "none / none / none"
+    check spans("ab", "(?((?~|b)a)b|c)") == "none / none / none"
+    # So does a clear after it in the same group, under an outer range.
+    check spans("b", "(?~|b)(?:(?~|a)(?~|))b") == "0..1 / 0..1 / 0..1"
+    check spans("ab", "(?~|b)(?:(?~|a)(?~|))b") == "1..2 / 1..2 / none"
+    check spans("b", "(?~|b)(?>(?~|a)(?~|))b") == "0..1 / 0..1 / 0..1"
+    check spans("b", "(?~|b)(?:(?~|a))(?~|)b") == "0..1 / 0..1 / 0..1"
+    check spans("ab", "(?~|c)(?:(?~|b)a)(?~|)b") == "0..2 / 0..2 / 0..2"
+    # An absent expression still widens back after its ``expr``, and takes
+    # a range inside ``expr`` with it.
+    check spans("ab", "(?:(?~|b|a))b") == "0..2 / 0..2 / 0..2"
+    check spans("ab", "(?~|x|(?~|b)a)b") == "0..2 / 0..2 / 0..2"
+
+  test "a look-ahead keeps the range its body moved":
+    # The undo Oniguruma leaves is a ``PUSH_SUPER`` entry, which the
+    # look-ahead's cut keeps: the range holds after the look-ahead, and
+    # backtracking past it puts the old one back.
+    check spans("ab", "(?=(?~|b)).b") == "none / none / none"
+    check spans("ab", "(?=a(?~|b))ab") == "none / none / none"
+    check spans("a", "(?~|a)(?=(?~|))a") == "0..1 / 0..1 / 0..1"
+    check spans("b", "(?~|b)(?=(?~|))(?:|b)\\z") == "0..1 / 1..1 / 0..1"
+    check spans("bb", "(?~|b)(?:|b)(?=(?~|))b") == "0..1 / 1..2 / 0..1"
+    check spans("b", "(?~|b)(?:|b)(?=(?~|))\\z") == "1..1 / 1..1 / none"
+    check spans("ab", "(?:|a)(?=(?~|b))ab") == "none / none / none"
+
+  test "a negative look-ahead puts back the range its body moved, unlike in Oniguruma":
+    # When the body matches, Oniguruma's ``POP_TO_MARK`` drops the body's
+    # ``PUSH_SUPER`` undo without running it.  The write then leaks into the
+    # backtracking until an older range undo pops: libonig gives 0..1, none
+    # and 0..2 for the three patterns below.  Mirroring that at the
+    # look-ahead alone would match libonig on the first two but not the
+    # third: there backtracking pops a repeat's choice, which puts the range
+    # back from its snapshot.  So the assertion leaves the range as it found
+    # it.
+    check spans("b", "(?~|b)(?:(?!(?~|))|)b") == "none / none / none"
+    check spans("ab", "(?:(?!(?~|b))|)ab") == "0..2 / 0..2 / 0..2"
+    check spans("ab", "(?~|b)a*(?!(?~|)b)ab") == "none / none / none"
+    # A body that fails puts it back in both engines.
+    check spans("a", "(?~|a)(?!(?~|)x)a") == "none / none / none"
+
 suite "Callout verbs":
   test "MAX basic limits repetitions":
     let m = search("aaaaa", re("(?:a(*MAX{3}))*"))
