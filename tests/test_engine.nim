@@ -183,10 +183,18 @@ suite "Step 2: Anchors":
     expect(RegexError):
       discard re("(?i){2}")
     check search("aa", re("a(?#c){2}")).matchSpan == 0 .. 2
-    # ``\E`` is nothing outside \Q...\E, so the repeat after one is still on
-    # the anchor.  PCRE2, which reni takes \Q...\E from, rejects ``^\E*`` as
-    # it does ``^*``; Oniguruma's syntax has no \Q...\E and reads ``\E`` as E.
-    for pattern in ["^\\E*", "\\b\\E{2}", "^\\Q\\E?"]:
+    # A quote is a string to Oniguruma even when empty, so it takes the
+    # repeat an anchor before it refuses, and the repeat repeats nothing.
+    # A bare ``\E`` is nothing, as in PCRE2, which reni takes it from, so
+    # ``^\E*`` is ``^*``, and ``(?:^\E)+`` is ``(?:^)+``: Oniguruma's ``\E``
+    # is the letter E, which no reading of reni's matches.  ``(?)`` takes
+    # none and parts no group (-119 in Oniguruma).
+    check search("aab", re("^\\Q\\E?")).matchSpan == 0 .. 0
+    check search("ab", re("\\b\\Q\\E{2}")).matchSpan == 0 .. 0
+    for pattern in [
+      "^\\E*", "\\b\\E{2}", "(?=a)\\E+", "^\\Q\\E\\E*", "^(?)+", "(?:^\\E)+",
+      "(?:\\E^)+", "(?:^(?))+", "(?:(?)(?=a)\\E)*", "(?:^\\E|a)+",
+    ]:
       check compileError(pattern).startsWith("target of repeat operator")
 
 suite "Step 3: Dot and character types":
@@ -708,6 +716,41 @@ suite "Steps 10-11: Atomic, lookaround":
     let m = search("abbbz", re("(?<=a.*\\w)z"))
     check m.found
     check m.boundaries[0] == 4 .. 5
+
+  test "a look-around repeats inside a group":
+    # Oniguruma repeats no look-around (-114), but it does repeat a capture
+    # group around one, and an alternation whose branch holds one in a
+    # sequence.  These are the PCRE2 suite's repeated assertions so spelled,
+    # with PCRE2's answers for the originals, groups one further on; libonig
+    # 6.9.10 agrees on all but the conditional, whose ``(?(?=`` it does not
+    # read (-113).
+    check search("xyz", re("((?=abc)){0}xyz")).matchSpan == 0 .. 3
+    check not search("xyz", re("((?=abc)){1}xyz")).found
+    check search("aaaaa", re("^((?!a)){0}\\w+")).matchSpan == 0 .. 5
+    var m = search("ab", re("((?=(a)))?."))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[2] == 0 .. 1
+    check search("bc", re("((?=(a)))?.")).boundaries[2] == UnsetSpan
+    m = search("ab", re("((?=(a)))??."))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[2] == UnsetSpan
+    m = search("abcxyz", re("((?<=(abc)))?xyz"))
+    check m.matchSpan == 3 .. 6
+    check m.boundaries[2] == 0 .. 3
+    m = search("pqrxyz", re("((?<=(abc)))?xyz"))
+    check m.matchSpan == 3 .. 6
+    check m.boundaries[2] == UnsetSpan
+    # The look-ahead branch matches empty before ``b``, which ends the repeat
+    # there unless ``\z`` sends it on through ``.``.
+    m = search("abc", re("(?:a|((?=b))|.)*"))
+    check m.matchSpan == 0 .. 1
+    check m.boundaries[1] == 1 .. 1
+    check search("abc", re("(?:a|(?=b)(?:)|.)*")).matchSpan == 0 .. 1
+    check search("abc", re("(?:a|((?=b))|.)*\\z")).matchSpan == 0 .. 3
+    let cond = re("(?(?=0)((?=00))?00765|(?!3).56)")
+    check search("00765", cond).matchSpan == 0 .. 5
+    check search("456", cond).matchSpan == 0 .. 3
+    check not search("356", cond).found
 
 suite "Isolated flags and chaining":
   test "isolated flag across alternation":
@@ -3105,18 +3148,23 @@ suite "look-behind body window":
     # What the reduction leaves has to read as fixed-length for the body to go
     # unclipped, and ``lengthBounds`` is what reads it.  Answering -1 for
     # something that plainly consumes nothing is the failure mode, and it is
-    # silent: the look-behind simply stops holding.  ``(?:\b)+`` was that --
-    # an unbounded repeat answered -1 without looking at what it repeats --
+    # silent: the look-behind simply stops holding.  ``(?:\b\b)+`` was that
+    # -- an unbounded repeat answered -1 without looking at what it repeats --
     # and so was ``(?(...)\b|\b)``, a conditional answering -1 with two
-    # branches of the same length.  Oniguruma compiles none of these, so they
-    # are reni's own rule followed through.  The conditions are look-behinds: a
-    # look-ahead condition is a look-ahead in the body, which a look-behind may
-    # not hold.
+    # branches of the same length.  The repeats are of two ``\b``: Oniguruma
+    # repeats no lone anchor.  It agrees on the bounded ones and holds no
+    # look-behind through ``(?:\b\b)+``, nor through any other unbounded
+    # repeat at least once of a body that consumes nothing (``(\b)+``,
+    # ``(?>\b)+``, ``(?:\b\b){2,}``; ``*`` and ``{1,1000}`` hold), so
+    # that row is reni's own rule followed through, as are the conditions,
+    # which it reads as no conditions at all (-113).  The conditions are
+    # look-behinds: a look-ahead condition is a look-ahead in the body, which a
+    # look-behind may not hold.
     for pattern in [
       "(?<=a*\\b)a", # the shape they all have to match
-      "(?<=a*(?(?<=a)\\b|\\b))a", "(?<=a*(?(?<=z)\\b|\\b))a", "(?<=a*(?:\\b){1,2})a",
-      "(?<=a*(?:\\b){1})a", "(?<=a*(?:\\b){2})a", "(?<=a*(?:\\b)+)a",
-      "(?<=a*(?:(?:\\b){1,2}){1,2})a",
+      "(?<=a*(?(?<=a)\\b|\\b))a", "(?<=a*(?(?<=z)\\b|\\b))a", "(?<=a*(?:\\b\\b){1,2})a",
+      "(?<=a*(?:\\b\\b){1})a", "(?<=a*(?:\\b\\b){2})a", "(?<=a*(?:\\b\\b)+)a",
+      "(?<=a*(?:(?:\\b\\b){1,2}){1,2})a",
     ]:
       let m = search("abcd", re(pattern))
       check m.found
@@ -3131,7 +3179,7 @@ suite "look-behind body window":
 
     # The negative reads the same body, so the two stay complements.
     check not search("abcd", re("(?<!a*(?(?<=a)\\b|\\b))a")).found
-    check not search("abcd", re("(?<!a*(?:\\b){1,2})a")).found
+    check not search("abcd", re("(?<!a*(?:\\b\\b){1,2})a")).found
 
     # A repeat that can consume is not zero-width: a later iteration runs
     # behind the ``\b``, which is ``(?<=a*\bz*)``'s case by another spelling.

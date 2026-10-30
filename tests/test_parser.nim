@@ -756,14 +756,25 @@ suite "Bug fixes and validation":
     # and the position is where it ends, not past the space after it.
     check compileError("(?x)a" & " {1}".repeat(258)) ==
       "nesting too deep at position 1033"
-    # A group with no body is no deeper than an atom.
-    check compileError("(*FAIL)" & "{1}".repeat(257) & "|a") == ""
-    check compileError("(*FAIL)" & "{1}".repeat(258) & "|a").startsWith(
+    # A group with no body is no deeper than an atom.  ``(?~|)`` is one that
+    # takes a repeat; ``(*FAIL)`` is one too, and takes none.
+    check compileError("(?~|)" & "{1}".repeat(257) & "|a") == ""
+    check compileError("(?~|)" & "{1}".repeat(258) & "|a").startsWith(
       "nesting too deep"
     )
     # After a comment or ``\Q\E``, a repeat goes to the atom before, and nests.
     check compileError("a" & "(?#)*".repeat(300)).startsWith("nesting too deep")
     check compileError("a" & "\\Q\\E*".repeat(300)).startsWith("nesting too deep")
+    # The repeats an empty quote takes from an atom that refuses them nest
+    # from the quote's level, however deep that atom is.
+    let deepLook = "(?=" & "(?:".repeat(200) & "a" & ")".repeat(200) & ")\\Q\\E"
+    check compileError(deepLook & "{1}".repeat(257)) == ""
+    check compileError(deepLook & "{1}".repeat(258)).startsWith("nesting too deep")
+    # They reach as deep as the atom's own would, for the group around them.
+    for atom in ["a", "(?=a)"]:
+      let quoted = "(?:" & atom & "\\Q\\E" & "{1}".repeat(256) & ")"
+      check compileError(quoted & "{1}") == ""
+      check compileError(quoted & "{1}{1}").startsWith("nesting too deep")
     # An empty node is no level, so a group holding only one nests no deeper
     # for the atom before the group.
     let deep = "a" & "{1}".repeat(250)
@@ -1185,3 +1196,100 @@ suite "(?I) and (?L) may only open a pattern":
     check accepts("(?I:(?W)a)")
     check accepts("(?I:(?:a))")
     check accepts("(?I)(?i:a)")
+
+suite "a repeat of an anchor, a look-around or a verb is an error":
+  # Oniguruma rejects a repeat whose target is an anchor, a look-around, a
+  # callout or a verb, or an alternation with one for a branch (-114).  A
+  # ``(?:...)`` leaves no node of its own there, so it is its body that is
+  # judged, and a sequence of more than one node always takes a repeat.  Every
+  # expectation below is libonig 6.9.10's under ``ONIG_SYNTAX_ONIGURUMA``, the
+  # spans from a forward search of "aab".
+  test "an assertion or a verb, alone or as a branch, takes no repeat":
+    for pattern in [
+      "(?=a)+", "(?!a)*", "(?<=a)?", "(?<!a){2}", "(?=a){0}", "(?=a)?+", "(*FAIL)*",
+      "(*MAX{1}){2}", "(*COUNT)+", "(*CMP{x,<,1})+", "(*SKIP)+", "(?:(?=a))+", "(?:^)+",
+      "(?:(?:\\b))+", "(?:(?=a)){1}", "(?i)(?=a)+", "(?:a|^)+", "(?:^|a)?", "(?:|^)+",
+      "(?:(?:^|b)|a)+", "(?:a*|(?=b))+", "(?:\\K|a)+", "(?:(*FAIL)|a)?", "(?=a)(?#c)+",
+      "(?:(?#c)^)+", "(?:^(?#c))+", "(?=(?:^)+)",
+    ]:
+      check compileError(pattern).startsWith("target of repeat operator")
+
+  test "a group Oniguruma keeps, or a sequence, takes one":
+    for (pattern, span) in [
+      ("(?:^a)+", 0 .. 1),
+      ("(?:(?=a)(?=a))+", 0 .. 0),
+      ("(a|^)+", 0 .. 2),
+      ("(^)+", 0 .. 0),
+      ("(?>^)+", 0 .. 0),
+      ("(?i:(?=a))+", 0 .. 0),
+      ("(?~a)+", 0 .. 0),
+      ("(?~|a|b)+", 2 .. 3),
+      ("(?:a|(?i)^)+", 0 .. 2),
+      ("(?:(?i)^)+", 0 .. 0),
+      ("(?:^(?i))+", 0 .. 0),
+    ]:
+      check search("aab", re(pattern)).matchSpan == span
+    # A ``{`` that opens no interval is a literal after anything.
+    check search("{x", re("(?=\\{){x")).matchSpan == 0 .. 2
+
+  test "a (?:...) that opens a condition's or an absent operator's body takes one":
+    # There Oniguruma's parser holds the group in a list of its own
+    # (``group_head``), so only the body's first atom is let off.
+    for (pattern, span) in [
+      ("(?(a)(?:^)+|b)", 2 .. 3),
+      ("(?(a)|(?:^)+)", 0 .. 1),
+      ("(?(a)(?#c)(?:^)+|b)", 2 .. 3),
+      ("(?(a)(?:(?:^))+|b)", 2 .. 3),
+      ("(?((?=a))(?:(?<=x)|q)+|b)", 2 .. 3),
+      ("(?~(?:^)+)", 0 .. 0),
+      ("(?~|(?:^)+)", 0 .. 0),
+      ("(?~|(?:^)+|b)", 2 .. 3),
+    ]:
+      check search("aab", re(pattern)).matchSpan == span
+    check not search("aab", re("(a)(?(1)(?:^)+|b)")).found
+    for pattern in [
+      "(?(a)b|(?:^)+)", "(?(a)||(?:^)+)", "(?(a)(?i)(?:^)+|b)", "(?(a)(?:^)(?:^)+|b)",
+      "(?(a)(?:(?:^)+)|b)", "(?(a)(?=x)+|b)", "(?(a)(*SKIP)+|b)", "(?x)(?(a) |(?:^)+)",
+      "(?~|a|(?:^)+)", "(?~a(?:^)+)", "(?~)(?:^)+", "(?~|)(?:^)+",
+    ]:
+      check compileError(pattern).startsWith("target of repeat operator")
+
+  test "a {1} drops a body's opening (?:...), and its body takes no next repeat":
+    # Oniguruma's parser lets the group off for its first repeat only, and a
+    # ``{1}`` leaves what it repeats (``x{1,1} ==> x``): the bare anchor.
+    for pattern in [
+      "(?(a)(?:^){1}?|b)", "(?(a)(?:^){1}+|b)", "(?(a)(?:^){1}{2}|b)",
+      "(?(a)(?:^){1,1}??|b)", "(?(a)(?:^){1}(?#c)?|b)", "(?(a)(?:(?=x)){1}?|b)",
+      "(?(a)(?:^|b){1}?|c)", "(?(a)|(?:^){1}?)", "(?~(?:^){1}?)", "(?~|(?:^){1}*|b)",
+      "(?x)(?(a)(?:^){1} ?|b)", "(?(a)(?:^)\\E{1}\\E?|b)",
+    ]:
+      check compileError(pattern).startsWith("target of repeat operator")
+    # Any other repeat leaves a quantifier, which takes any; a ``{1}`` of
+    # that leaves it too.  A ``{`` that opens no interval is a literal.
+    for (pattern, span) in [
+      ("(?(a)(?:^){1}|b)", 2 .. 3),
+      ("(?(a)(?:^){1,1}?|b)", 2 .. 3),
+      ("(?(a)(?:^)?{1}+|b)", 0 .. 1),
+      ("(?(a)(?:^){2}{1}?|b)", 0 .. 1),
+      ("(?(a)(?:^){1}{a|b)", 2 .. 3),
+    ]:
+      check search("aab", re(pattern)).matchSpan == span
+    # After an empty quote the group takes the ``{1}``, as an atom takes the
+    # repeats it can, and the quote the ``?`` the anchor left refuses.
+    check search("aab", re("(?(a)(?:^)\\Q\\E{1}?|b)")).matchSpan == 2 .. 3
+    check search("aab", re("(?(a)(?:^){1}\\Q\\E?|b)")).matchSpan == 2 .. 3
+
+  test "an empty quote parts a group's body, and takes a repeat its target refuses":
+    # A quote is a string of its own to Oniguruma's parser even when empty,
+    # with ``\Q...\E`` quoting on, so the body below is a sequence.  A repeat
+    # after an empty one goes to the atom before, as in PCRE2, which reni
+    # takes ``\Q...\E`` from, unless that atom refuses it: then the quote
+    # takes it, as in Oniguruma, and it repeats nothing.  Oniguruma gives every
+    # such repeat to the quote: ``a\Q\E+`` on "aaa" is 0..1 there, 0..3 here.
+    check search("aab", re("(?:\\Q\\E^)+")).matchSpan == 0 .. 0
+    check search("aab", re("(?:(?=a)\\Q\\E)+")).matchSpan == 0 .. 0
+    check compileError("(?:\\Q\\E^|a)+") == ""
+    check search("aab", re("(?=a)\\Q\\E+")).matchSpan == 0 .. 0
+    check search("aab", re("(?=a)\\Q\\E{2}\\Q\\E*")).matchSpan == 0 .. 0
+    check not search("aab", re("(*FAIL)\\Q\\E*")).found
+    check search("aaa", re("a\\Q\\E+")).matchSpan == 0 .. 3

@@ -1348,8 +1348,8 @@ suite "leading look-behind scan":
     check lb("(?>(?<=\\.)\\w)") == (true, ".", 1)
     # Optional: the body need not stand at the start at all.
     check lb("(?:(?<=\\.)\\w)?x") == (false, "", 0)
-    check lb("(?<=\\.)?\\w+") == (false, "", 0)
-    check all(".ab", "(?<=\\.)?\\w+") == @["ab"]
+    check lb("((?<=\\.))?\\w+") == (false, "", 0)
+    check all(".ab", "((?<=\\.))?\\w+") == @["ab"]
 
   test "only the positive behind form states bytes, and only a literal one":
     check lb("(?<!\\.)\\w+") == (false, "", 0)
