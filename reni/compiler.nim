@@ -2870,8 +2870,9 @@ proc reduceNestedQuantifier(node: Node) =
   ## not write the same group -- and so does a possessive on either side,
   ## which in Oniguruma is an atomic group and therefore not a repeat node the
   ## pair could be read from.
-  if node.quantMin == 1 and node.quantMax == 1:
-    return # Oniguruma's ``assign_quantifier_body`` leaves ``X{1}`` alone.
+  ##
+  ## No ``X{1}`` reaches here: [tuneRepeats] has made each one ``X``, so
+  ## ``(?:a*){1}+`` comes as the ``(?:a*)+`` it is.
   let inner = peelBareGroups(node.quantBody)
   if inner == nil or inner.kind != nkQuantifier:
     return
@@ -3012,6 +3013,17 @@ proc tuneRepeats(node: Node, expand: bool) =
   for child in node.childNodes:
     tuneRepeats(child, expand)
   if node.kind == nkQuantifier:
+    if node.quantMin == 1 and node.quantMax == 1:
+      # Oniguruma keeps no ``X{1}`` (``prs_exp``: ``x{1,1} ==> x``), so a
+      # repeat or look-behind around one works on ``X`` itself: ``\1{1}+`` is
+      # the ``\1+`` that pins to ``\1``, ``(?<=(?:a|bc){1})`` an alternation.
+      # None is possessive: the parser reads ``X{1}+`` as ``(?:X{1})+``, and
+      # [normaliseInvertedRanges] leaves ``min < max``.  Runs after
+      # [mergeLiterals], so ``(?i)ss{1}`` does not match ``ß`` here as it does
+      # in Oniguruma.
+      let body = node.quantBody
+      node[] = body[]
+      return
     reduceNestedQuantifier(node)
     if expand:
       expandStringRepeat(node)
@@ -3275,7 +3287,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # Pin a look-behind body's leading repeats to their lower bound, and drop or
   # divide the look-behinds Oniguruma does.  Runs before every pass that reads
   # bounds; a reduced body may become fixed-length.
-  tuneLookBehinds(ast, namedCaptures, flags)
+  tuneLookBehinds(ast, namedCaptures, flags, p.sawGroupRead or p.sawCall)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).

@@ -185,6 +185,18 @@ type
       ## body holding one runs under a window for that.  See ``nkAbsent`` in
       ## [lengthBounds].
 
+  LookAlt* = object
+    ## One branch of a look-behind body that is an alternation, as
+    ## ``lookAlts`` holds it.
+    bounds*: LenBounds
+      ## [lengthBounds] of the branch, filled in by
+      ## ``annotateLookaroundBounds``.
+    unclipped*: bool
+      ## As ``lookUnclipped``, for the branch the matcher runs on its own: a
+      ## branch of a divided look-behind (``lookDivided``) or of a negative
+      ## one.  Set by ``tuneLookBehinds``, which sizes ``lookAlts`` for it.
+    chars*: int32 ## As ``lookChars``, for the branch: read only when ``unclipped``.
+
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
     ## parsed trees; node kinds may change at any time without notice.
@@ -400,6 +412,20 @@ type
         ## reference; see [namedGroupsRead].
     of nkLookaround:
       lookKind*: LookaroundKind
+      lookUnclipped*: bool
+        ## Look-behind only, set by ``tuneLookBehinds``: the body runs once,
+        ## from ``lookChars`` characters back and with no window, although
+        ## [lengthBounds] gives it no fixed width.  Oniguruma decides the
+        ## window on a length in characters, which a body holding a
+        ## backreference or a call shows apart from the length in bytes
+        ## (``charsBackStart`` in ``engine``), so only such a body is marked.
+        ## A branch the matcher runs on its own is marked in ``lookAlts``
+        ## instead.
+      lookChars*: uint16
+        ## The body's length in characters, when ``lookUnclipped``: at most
+        ## Oniguruma's 65,535, past which ``tuneLookBehinds`` rejects a
+        ## look-behind.  This and ``lookUnclipped`` sit in the padding before
+        ## ``lookPos``.
       lookPos*: int32
         ## The byte offset in the pattern where this look-around starts, which
         ## the error ``validateLookbehinds`` raises gives as its position.
@@ -419,7 +445,7 @@ type
         ## at every position.  Filled in by ``annotateLookaroundBounds``; only
         ## usable while ``lookBoundsFlags`` matches the flags in force, since a
         ## subexpression call can reach the same lookaround under others.
-      lookAlts*: seq[LenBounds]
+      lookAlts*: seq[LookAlt]
         ## [lengthBounds] of each alternative when ``lookBody`` is an
         ## alternation, empty otherwise. Cached because ``altWindow`` runs per
         ## attempt.
@@ -2466,8 +2492,9 @@ proc matchesEverywhere(node: Node): bool =
 
 proc loopLeafOf(expr: Node): Node =
   ## The leaf under ``expr``'s groups and repeats, or nil.  ``tuneRepeats``
-  ## leaves the repeats of an E that is the loop around X as written, so a
-  ## string of two or more here means a pass rewrote one.
+  ## writes no string out of the repeats of an E that is the loop around X --
+  ## it only drops an ``X{1}`` there -- so a string of two or more here means
+  ## a pass rewrote one.
   var node {.cursor.} = expr
   while node != nil:
     case node.kind
@@ -2715,11 +2742,15 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
   case node.kind
   of nkLookaround:
     node.lookBounds = lengthBounds(node.lookBody, flags, gm)
-    node.lookAlts = @[]
+    # ``tuneLookBehinds`` may have sized ``lookAlts`` already, to mark a
+    # branch unclipped.
     let peeled = peelBareGroups(node.lookBody)
     if peeled != nil and peeled.kind == nkAlternation:
-      for alt in peeled.alternatives.view:
-        node.lookAlts.add(lengthBounds(alt, flags, gm))
+      node.lookAlts.setLen(peeled.alternatives.len)
+      for i, alt in peeled.alternatives.view:
+        node.lookAlts[i].bounds = lengthBounds(alt, flags, gm)
+    else:
+      node.lookAlts.setLen(0)
     node.lookBoundsFlags = flags
     node.lookBoundsGm = gm
     node.lookBoundsValid = true
