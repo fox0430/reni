@@ -1243,7 +1243,13 @@ proc assignEmptyOwners(node: Node, unclaimed: var seq[int], env: var EmptyCheckE
   ## negative one's groups, harmlessly since it keeps none of them; reni's
   ## ``(?(?!X)...)`` keeps X's captures, and two such owned groups could move
   ## each other back and forth forever.  ``X{1}`` claims nothing, as Oniguruma
-  ## parses it to ``X``.
+  ## parses a written one to ``X``.  The ones that reach here were made: the
+  ## look-behind reduction pins ``a+`` to one, over a body that is never
+  ## empty and holds no group, and [reduceNestedQuantifier] makes
+  ## ``(?:a*){1,3}`` one.  Oniguruma lets that last kind claim, and no answer
+  ## moves: a group under its ``*`` or ``+`` goes to that repeat when the
+  ## repeat's body may be empty, and cannot change in an iteration that
+  ## matches empty when it may not.
   if node == nil:
     return
   let mark = unclaimed.len
@@ -1258,7 +1264,7 @@ proc assignEmptyOwners(node: Node, unclaimed: var seq[int], env: var EmptyCheckE
     assignEmptyOwners(child, unclaimed, env)
   case node.kind
   of nkQuantifier:
-    if node.quantMax != 0 and not (node.quantMin == 1 and node.quantMax == 1) and
+    if node.quantMax != 0 and not node.isOneRepeat and
         node.repeatBodyMayBeEmpty(env.spans):
       for i in mark ..< unclaimed.len:
         if unclaimed[i] < env.owner.len:
@@ -2871,8 +2877,11 @@ proc reduceNestedQuantifier(node: Node) =
   ## which in Oniguruma is an atomic group and therefore not a repeat node the
   ## pair could be read from.
   ##
-  ## No ``X{1}`` reaches here: [tuneRepeats] has made each one ``X``, so
-  ## ``(?:a*){1}+`` comes as the ``(?:a*)+`` it is.
+  ## No ``X{1}`` written in the pattern reaches here: the parser has made
+  ## each one ``X``, so ``(?:a*){1}+`` comes as the ``(?:a*)+`` it is.  The
+  ## counted-outer rule below makes one, ``(?:a*){1,3}`` is ``(?:a*){1}``,
+  ## and Oniguruma keeps it too: a repeat around it meets a counted inner
+  ## one, so ``(?:(?:a*){1,3})*`` stays a pair there as here.
   let inner = peelBareGroups(node.quantBody)
   if inner == nil or inner.kind != nkQuantifier:
     return
@@ -3013,17 +3022,9 @@ proc tuneRepeats(node: Node, expand: bool) =
   for child in node.childNodes:
     tuneRepeats(child, expand)
   if node.kind == nkQuantifier:
-    if node.quantMin == 1 and node.quantMax == 1:
-      # Oniguruma keeps no ``X{1}`` (``prs_exp``: ``x{1,1} ==> x``), so a
-      # repeat or look-behind around one works on ``X`` itself: ``\1{1}+`` is
-      # the ``\1+`` that pins to ``\1``, ``(?<=(?:a|bc){1})`` an alternation.
-      # None is possessive: the parser reads ``X{1}+`` as ``(?:X{1})+``, and
-      # [normaliseInvertedRanges] leaves ``min < max``.  Runs after
-      # [mergeLiterals], so ``(?i)ss{1}`` does not match ``ß`` here as it does
-      # in Oniguruma.
-      let body = node.quantBody
-      node[] = body[]
-      return
+    # No pass before this one makes an ``X{1}``; [reduceNestedQuantifier] may
+    # make this node one, after the check.
+    doAssert not node.isOneRepeat, "tuneRepeats: parseConcat drops every X{1} written"
     reduceNestedQuantifier(node)
     if expand:
       expandStringRepeat(node)

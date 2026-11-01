@@ -2117,6 +2117,11 @@ type ReduceAction* = enum
   raLazyOpt ## the pair becomes ``??``
   raPlusLazyOpt ## the pair becomes ``(?:X+)??``
 
+proc isOneRepeat*(node: Node): bool {.inline.} =
+  ## Whether ``node`` is ``X{1}``, lazy ``X{1,1}?`` too: a repeat
+  ## Oniguruma's parser drops (``x{1,1} ==> x``).
+  node.kind == nkQuantifier and node.quantMin == 1 and node.quantMax == 1
+
 proc quantTypeNum*(lo, hi: int, greedy: bool): int {.inline.} =
   ## Oniguruma's ``quantifier_type_num``: which of the six popular spellings
   ## a repeat of ``{lo,hi}`` is -- ``?`` 0, ``*`` 1, ``+`` 2, ``??`` 3,
@@ -2493,8 +2498,8 @@ proc matchesEverywhere(node: Node): bool =
 proc loopLeafOf(expr: Node): Node =
   ## The leaf under ``expr``'s groups and repeats, or nil.  ``tuneRepeats``
   ## writes no string out of the repeats of an E that is the loop around X --
-  ## it only drops an ``X{1}`` there -- so a string of two or more here means
-  ## a pass rewrote one.
+  ## it only reduces a repeat of a repeat there -- so a string of two or more
+  ## here means a pass rewrote one.
   var node {.cursor.} = expr
   while node != nil:
     case node.kind

@@ -50,8 +50,8 @@ type Parser* = object
   bodyParted: bool
     ## Whether the concat [parseConcat] returned last is more than one string
     ## to Oniguruma's parser, or its one node is a group whose body is:
-    ## ``ab\Q\E``, ``(?:ab\Q\E)``.  [splitRun] reads it for the group just
-    ## parsed, the one whose body that concat was.
+    ## ``ab\Q\E``, ``a{1}b``, ``(?:ab\Q\E)``.  [splitRun] reads it for the
+    ## group just parsed, the one whose body that concat was.
   repeatTarget: RepeatTarget
     ## What Oniguruma's parser says of a repeat of the node parsed last, with
     ## the repeats it took.  A sequence takes any, even of one node and an
@@ -66,6 +66,9 @@ type Parser* = object
     ## (``prs_exp``'s ``group_head``), and a list refuses no repeat:
     ## ``(?(a)(?:^)+|b)`` compiles ([rtGroupHead]).  [parseAtom] takes it,
     ## and the first branch's [parseConcat] drops it if no atom did: ``(?~)``.
+  sawOne: bool
+    ## True once a ``{1}`` has been parsed, so [parseConcat] can skip looking
+    ## for one to drop when there is none.
   sawPlainGroup*: bool
     ## True once a ``(?:...)`` with a body has been parsed, so the compiler can
     ## skip [flattenLiteralGroups] when there is nothing to find.
@@ -323,17 +326,28 @@ func underOnes(node: Node): Node =
   ## ``node`` under the ``{1}`` repeats around it, which Oniguruma's parser
   ## drops.
   result = node
-  while result.kind == nkQuantifier and result.quantMin == 1 and result.quantMax == 1:
+  while result.isOneRepeat:
     result = result.quantBody
+
+proc dropOnes(node: Node): Node =
+  ## ``node`` without the ``{1}`` repeats in the chain on top of it, which
+  ## Oniguruma's parser drops (``x{1,1} ==> x``): ``a{1}*{1}`` is ``a*``.
+  ## The repeats under the top one are rewritten in place.
+  result = underOnes(node)
+  var q = result
+  while q.kind == nkQuantifier:
+    q.quantBody = underOnes(q.quantBody)
+    q = q.quantBody
 
 func plainRun(node: Node, run: var seq[Node]): bool =
   ## Collect the characters of ``node`` when it is one string to Oniguruma's
   ## parser, through any ``(?:...)`` and ``{1}`` around it, which that parser
   ## drops: characters written plain or escaped as themselves, ``a\.b``, or
-  ## one ``\Q...\E`` quote alone, and a ``{1}`` on the last, ``ab{1}``.
-  ## ``(?:a(?:b))``, ``(?:a\tb)`` and ``a{1}b`` are two or more.  A body
-  ## parted by a quote or an empty node, ``(?:a\Qb\E)``, ``(?:ab\Q\E)``,
-  ## looks the same here: the caller checks [Parser.bodyParted].
+  ## one ``\Q...\E`` quote alone.  ``(?:a(?:b))`` and ``(?:a\tb)`` are two or
+  ## more.  A body parted by a quote, an empty node or a ``{1}`` before its
+  ## last character, ``(?:a\Qb\E)``, ``(?:ab\Q\E)``, ``(?:a{1}b)``, looks the
+  ## same here, as [parseConcat] has dropped that ``{1}``: the caller checks
+  ## [Parser.bodyParted].
   if node == nil:
     return false
   let node = underOnes(node)
@@ -342,17 +356,10 @@ func plainRun(node: Node, run: var seq[Node]): bool =
     run.add node
     true
   of nkConcat:
-    for i, child in node.children.view:
-      # A ``{1}`` drops without parting the string, but ends it: only the
-      # last character may carry one.
-      let c =
-        if i == node.children.high:
-          underOnes(child)
-        else:
-          child
-      if c.kind != nkLiteral:
+    for child in node.children.view:
+      if child.kind != nkLiteral:
         return false
-      run.add c
+      run.add child
     true
   of nkGroup:
     plainRun(node.groupBody, run)
@@ -371,7 +378,7 @@ proc splitRun(p: Parser, node: Node): seq[Node] =
   var split: Node = nil
   var q = node
   while q.kind == nkQuantifier:
-    if not (q.quantMin == 1 and q.quantMax == 1):
+    if not q.isOneRepeat:
       split = q
     q = q.quantBody
   if split == nil or split.quantBody.kind != nkQuantifier:
@@ -1141,9 +1148,8 @@ proc wrap(shape: var Shape, level: ShapeLevel) =
 proc wrapRepeat(shape: var Shape, repeat: ShapeLevel, possessive: bool) =
   ## Oniguruma's ``assign_quantifier_body``, with
   ## ``onig_reduce_nested_quantifier``: put ``repeat`` around what ``shape``
-  ## holds.  ``X{1}`` is X, and a repeat of a repeat may become one.
-  if repeat.lo == 1 and repeat.hi == 1:
-    return
+  ## holds, where a repeat of a repeat may become one.  No ``X{1}`` comes
+  ## here: [parseConcat] has dropped each one before E is measured.
   var outer = repeat
   if shape.depth > 0 and not shape.levels[0].stop:
     let inner = shape.levels[0]
@@ -1200,6 +1206,8 @@ proc shapeOf(node: Node, flags: RegexFlags): Shape =
     result = shapeOf(node.atomicBody, flags)
     result.wrap(ShapeLevel(stop: true))
   of nkQuantifier:
+    doAssert not node.isOneRepeat,
+      "shapeOf: parseConcat drops every X{1} before E is measured"
     # An inverted interval is a possessive one there, as here.
     let (lo, hi) = effectiveQuantBounds(node.quantMin, node.quantMax)
     let possessive =
@@ -1367,10 +1375,12 @@ proc parseRepeats(
       break # '{' was literal, not a quantifier
     # A ``{1}`` leaves what it repeats, as ``x{1,1} ==> x`` does in
     # Oniguruma's parser, and any other repeat a quantifier, which takes any.
-    if body.quantMin != 1 or body.quantMax != 1:
+    if not body.isOneRepeat:
       result = rtTakes
-    elif result == rtGroupHead:
-      result = rtRefuses
+    else:
+      p.sawOne = true
+      if result == rtGroupHead:
+        result = rtRefuses
 
 proc parseQuantified(p: var Parser, reach: var int): Node =
   ## Parse an atom and its repeats, and set ``reach`` to the deepest level
@@ -1509,12 +1519,26 @@ proc parseConcat(p: var Parser): Node =
   # ``(?I:a)|b`` while taking ``(?I:a|b)``, where the bar is inside the body.
   if p.requiresExclusive and nodes.len == 1 and not p.atEnd and p.peek != ')':
     p.error("invalid combination of options")
+  # No repeat can come to a node now, so its ``{1}`` drops, as Oniguruma's
+  # parser drops one, and the characters on both sides meet the passes that
+  # join them: ``(?i)s{1}s`` and ``(?i)s(?:s){1}`` are the ``ss`` that
+  # matches ``ß``.  The checks above, the split and the levels, have read
+  # them already.  A ``{1}`` before the last node still ended a string
+  # there: ``a{1}b`` is two.
+  var onesParted = false
+  if p.sawOne:
+    for i in 0 ..< nodes.len:
+      if nodes[i].kind == nkQuantifier:
+        if i < nodes.high and nodes[i].isOneRepeat:
+          onesParted = true
+        nodes[i] = dropOnes(nodes[i])
   # A concat of one node is parted when that node's body is,
   # ``(?:(?:ab\Q\E){1})``: that body is the concat whose end set
   # [bodyParted] last, as no other atom here parses one, and a node with no
   # body leaves it as reset above.
   let quoteParted = nodes.len > partedPast
-  p.bodyParted = bareEmpty or quoteParted or nodes.len == 1 and p.bodyParted
+  p.bodyParted =
+    bareEmpty or quoteParted or onesParted or nodes.len == 1 and p.bodyParted
   # A list refuses no repeat, nor does a parted concat of one node, which is
   # a list to Oniguruma's parser: ``(?:\Q\E^)+``.  A bare ``\E`` or ``(?)``
   # parts none here: it is nothing to reni, so ``(?:^\E)+`` is ``(?:^)+``.

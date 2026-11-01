@@ -864,6 +864,24 @@ suite "Bug fixes and validation":
     check search("xa", re("x(?:ab){1}\\Q\\E?")).matchSpan == 0 .. 1
     check search("xa", re("x(?:ab){1}\\E?")).matchSpan == 0 .. 1
 
+  test "a {1} drops before the characters on both sides of it join":
+    # Oniguruma's parser drops ``X{1}``, and the ``(?:...)`` of one string
+    # with it, so under ``(?i)`` the characters on both sides are one string,
+    # which a multi-character fold matches: ``ss`` is ``ß``.
+    for pattern in [
+      "(?i)ss{1}", "(?i)s{1}s", "(?i)s(?:s){1}", "(?i)(?:s){1}s", "(?i)s{1}{1}s",
+      "(?i)s{1,1}?s", "(?i)(?:s(?:s){1})", "(?i)s(?:s{1}){1}", "(?i)s{1}(?#c)s",
+      "(?i)(?x)s {1}s", "(?i)s{1}\\Q\\Es",
+    ]:
+      check search("ß", re(pattern)).matchSpan == 0 .. 2
+    check search("\u{FB00}", re("(?i)f(?:f){1}")).matchSpan == 0 .. 3
+    # A repeat after the ``{1}``, a capture, an atomic group or an option
+    # group keeps them apart, as there.
+    for pattern in [
+      "(?i)s{1}+s", "(?i)s{1}?s", "(?i)(s){1}s", "(?i)(?>s){1}s", "(?i:s){1}s"
+    ]:
+      check not search("ß", re(pattern)).found
+
   test "a repeat that splits a run of characters still nests a level":
     # As the dropped ``{1}`` counts toward Oniguruma's parse depth, and as
     # ``(?:a){1}?`` counts here.  A setjmp build runs out of stack budget
@@ -1123,6 +1141,12 @@ suite "(?I) and (?L) may only open a pattern":
     check accepts("(?I)ab+")
     check accepts("(?:(?I:a+))")
     check accepts("(?i:(?I:a)+)")
+    # A ``{1}`` is no quantifier: Oniguruma's parser drops it.  The repeat
+    # after one is.
+    check accepts("(?I:a){1}")
+    check accepts("(?:(?I:a)){1}{1}")
+    check accepts("(?L:a){1,1}?")
+    check not accepts("(?I:a){1}+")
 
   test "an isolated flag group after an exclusive group is rejected":
     # An isolated ``(?flags)`` still counts as a sibling of what precedes it,
