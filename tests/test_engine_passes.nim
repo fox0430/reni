@@ -1102,6 +1102,19 @@ suite "repeat tuning":
     check shapes("(?:[ab]*){0,4}") == @[(0, 1, qkGreedy), (0, -1, qkGreedy)]
     check shapes("(?:[ab]+){3,5}") == @[(3, 3, qkGreedy), (1, -1, qkGreedy)]
 
+  test "a repeat of one is its body, as Oniguruma parses it":
+    # ``x{1,1} ==> x`` in ``prs_exp``: no such node is left, so a repeat
+    # around one takes the body, and collapses with it where that is a
+    # repeat too.
+    check shapes("(?:a*){1}+") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a){1}*") == @[(0, -1, qkGreedy)]
+    check shapes("(?:a{1,1}?)+") == @[(1, -1, qkGreedy)]
+    check shapes("(a){1}+") == @[(1, -1, qkGreedy)]
+    check shapes("(?:a*){1}") == @[(0, -1, qkGreedy)]
+    check shapes("a{1}") == newSeq[(int, int, QuantKind)]()
+    check search("aaa", re("(?:a*){1}+")).matchSpan == 0 .. 3
+    check search("aab", re("(a){1}+b")).captureSpan(1) == 1 .. 2
+
   test "a lazy-optional inner collapses for every outer":
     # The ``??`` row of the table, all six cells. Each pair becomes a lazy
     # repeat: ``raDel`` keeps the inner ``??``, every other cell becomes

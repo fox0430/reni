@@ -738,7 +738,7 @@ proc nextScanPos*(s: string, p: int): int {.inline.} =
     return s.len
   min(p + encLen(s[p].uint8), s.len)
 
-proc leftAdjustCharHead(s: string, p: int): int {.inline.} =
+proc leftAdjustCharHead(s: string | Subject, p: int): int {.inline.} =
   ## Walk back to the nearest non-continuation byte (Oniguruma
   ## ``utf8_left_adjust_char_head``). Used by all backward walks.
   var q = p
@@ -2464,6 +2464,69 @@ proc resolveCapture(ctx: MatchContext, capIdx: int, level: int, leveled: bool): 
   else:
     ctx.captures[capIdx]
 
+proc foldedBackrefEnd(ctx: MatchContext, cap: Span, windowEnd: int): int =
+  ## [backrefEnd] under ``(?i)``: Oniguruma's ``string_cmp_ic``.  The subject
+  ## must hold as many bytes as the group before ``windowEnd``, and its first
+  ## that many are the window the comparison reads.  Each character of the
+  ## group and the character at the same place in the window fold
+  ## ([caseFoldBytesAt]) to the same bytes, one for one: ``ß`` does not match
+  ## ``ss``, since ``ß`` folds to ``ss`` and the ``s`` at its place to ``s``.
+  ##
+  ## So the window can run out before the group does, which fails, and the
+  ## match can end short of it: ``(?i)(ſ)\1`` takes the one byte of ``s``
+  ## from ``"ſsx"``, and finds nothing in ``"ſs"``.  A character the window
+  ## ends inside folds as [caseFoldBytesAt] reads a cut one, and is taken
+  ## whole: ``(?i)(sã)\1`` matches ``"sãſã"``, its window ending on the
+  ## ``\xC3`` of ``ã``.
+  ##
+  ## ``windowEnd`` is ``subjectEnd``, Oniguruma's ``right_range``, apart from
+  ## a reference written with a level, which Oniguruma measures against the
+  ## end of the subject (``backref_match_at_nested_level``).  The match, and
+  ## the character the window ends inside, still end by ``subjectEnd``, as a
+  ## case-sensitive leveled one does; only on a malformed subject does that
+  ## fail where Oniguruma goes on past it.
+  let n = cap.b - cap.a
+  if n == 0:
+    return ctx.pos
+  let e = ctx.pos + n
+  if e > windowEnd:
+    return -1
+  let asciiOnly = rfIgnoreCaseAscii in ctx.flags
+  var s1 = cap.a
+  var s2 = ctx.pos
+  var f1, f2: FoldBytes
+  while s1 < cap.b:
+    let c1 = ctx.subject[s1]
+    let c2 = ctx.subject[s2]
+    if c1 < '\x80' and c2 < '\x80':
+      if c1 != c2 and asciiFoldByte(uint8(c1)) != asciiFoldByte(uint8(c2)):
+        return -1
+      inc s1
+      inc s2
+    else:
+      block folded:
+        let n = encLen(c1.uint8)
+        if c1 == c2 and s1 + n <= cap.b and s2 + n <= e:
+          # The same whole character folds the same.
+          var i = 1
+          while i < n and ctx.subject[s1 + i] == ctx.subject[s2 + i]:
+            inc i
+          if i == n:
+            s1 += n
+            s2 += n
+            break folded
+        let n1 = caseFoldBytesAt(ctx.subject.oa, s1, cap.b, asciiOnly, f1)
+        let n2 = caseFoldBytesAt(ctx.subject.oa, s2, e, asciiOnly, f2)
+        if n1 < 0 or n1 != n2 or not equalMem(addr f1[0], addr f2[0], n1):
+          return -1
+    if s2 >= e:
+      if s1 < cap.b:
+        return -1
+      break
+  if s2 > ctx.subjectEnd:
+    return -1
+  s2
+
 proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int =
   ## End position if capture `capIdx` matches here, else -1. Pure predicate
   ## shared by the loop and the recursive fallback.
@@ -2471,66 +2534,7 @@ proc backrefEnd(ctx: MatchContext, capIdx: int, level: int, leveled: bool): int 
   if cap.a < 0:
     return -1 # unset capture
   if rfIgnoreCase in ctx.flags:
-    # Compare rune by rune with case fold. Also handle multi-character folds
-    # (e.g. ß ↔ ss) symmetrically on both captured and subject sides.
-    var sp = cap.a
-    var mp = ctx.pos
-    while sp < cap.b:
-      if mp >= ctx.subjectEnd:
-        return -1
-      let mpBefore = mp
-      var sr, mr: Rune
-      nextCharAt(ctx.subject.oa, sp, sr)
-      nextCharAt(ctx.subject.oa, mp, mr)
-      if sr == mr or caseInsensitiveMatch(sr, mr, ctx.flags):
-        continue
-      let multiFold = multiCharFoldsApply(ctx.flags)
-      # Forward multi-char fold: captured rune folds to multiple subject runes.
-      block forwardFold:
-        if not multiFold:
-          break forwardFold
-        let fold = getMultiCharFold(sr)
-        if fold.len == 0:
-          break forwardFold
-        var tp = mpBefore
-        var ok = true
-        for j in 0 ..< fold.len:
-          if tp >= ctx.subjectEnd:
-            ok = false
-            break
-          var tr: Rune
-          nextCharAt(ctx.subject.oa, tp, tr)
-          if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
-            ok = false
-            break
-        if ok:
-          mp = tp
-          continue
-      # Reverse multi-char fold: subject rune folds to multiple captured runes.
-      block reverseFold:
-        if not multiFold:
-          break reverseFold
-        let fold = getMultiCharFold(mr)
-        if fold.len == 0:
-          break reverseFold
-        if not caseInsensitiveMatch(sr, fold.runes[0], ctx.flags):
-          break reverseFold
-        var tp = sp
-        var ok = true
-        for j in 1 ..< fold.len:
-          if tp >= cap.b:
-            ok = false
-            break
-          var tr: Rune
-          nextCharAt(ctx.subject.oa, tp, tr)
-          if not caseInsensitiveMatch(tr, fold.runes[j], ctx.flags):
-            ok = false
-            break
-        if ok:
-          sp = tp
-          continue
-      return -1
-    return mp # use actual bytes consumed, not capture byte length
+    return foldedBackrefEnd(ctx, cap, if leveled: ctx.subject.len else: ctx.subjectEnd)
   else:
     let capLen = cap.b - cap.a
     if ctx.pos + capLen > ctx.subjectEnd:
@@ -2758,7 +2762,7 @@ proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
 
 proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.inline.} =
   if ctx.boundsUsable(node) and i < node.lookAlts.len:
-    node.lookAlts[i]
+    node.lookAlts[i].bounds
   else:
     lengthBounds(alt, ctx.flags, ctx.graphemeMode)
 
@@ -2769,7 +2773,8 @@ proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
   ## (``compile_anchor_look_behind_node``): a fixed one steps back a known
   ## amount and runs against the real subject, anything else runs clipped to
   ## the position it has to end at.  A fixed-length body that backtracks must
-  ## not get a window, so the test is not "may as well clip".
+  ## not get a window, so the test is not "may as well clip".  A body fixed
+  ## in characters alone runs as [charsBackStart] says, before this is asked.
   ##
   ## ``(?~)`` is the absent function with an empty pattern.  It consumes
   ## nothing, yet does not count as fixed-length (see ``nkAbsent`` in
@@ -2780,6 +2785,65 @@ proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
 proc altWindow(ctx: MatchContext, node: Node, i: int, alt: Node): bool {.inline.} =
   ## As [bodyWindow] for one alternative; each answers on its own.
   ctx.altBounds(node, i, alt).fixedLen < 0
+
+proc charsBackStart(ctx: MatchContext, targetEnd, chars: int): int {.noinline.} =
+  ## Where a look-behind body or branch that ``tuneLookBehinds`` marked
+  ## (``lookUnclipped``, ``LookAlt.unclipped``) starts: ``chars`` characters
+  ## before ``targetEnd``, or -1 when fewer lie before it.  It runs from
+  ## there once, with no window, as Oniguruma runs a body of a fixed length
+  ## in characters: it steps back that far (``STEP_BACK_START``) and matches
+  ## against the subject.
+  ##
+  ## Each step is ``onigenc_step_back``'s, back over continuation bytes to
+  ## the nearest byte that is not one ([leftAdjustCharHead]), not
+  ## [prevCharStart], which also asks that the character found end where the
+  ## step began.  On malformed bytes the two land apart: two characters back
+  ## from the end of ``"\xC3\xE1\xBE"`` is 0 for Oniguruma and 1 for
+  ## [prevCharStart], so only the first holds ``(..)(?<=\1)`` there.
+  ##
+  ## [lengthBounds] counts bytes, where a backreference or a call has no
+  ## fixed width, so the scan would run a body holding one from every start
+  ## under a window.  The window shows: a backreference reads past where it
+  ## ends ([foldedBackrefEnd]), and either may match empty, as
+  ## ``()(?<=\g<1>\b)a`` does on ``"a"``, where a window at 0 holds no word
+  ## boundary.  So do the starts, once the window is gone: from one nearer
+  ## than the body's length, a call runs on to the position and into the
+  ## same look-behind again, without end, as ``(k(?<=\wbb|\g<1>\b[ak]))``
+  ## does on ``"kk"``.  In any other body fixed in characters and not in
+  ## bytes, the scan and the step back answer the same on well-formed text.
+  ##
+  ## Out of line: only a marked piece comes here, and the four look-behind
+  ## paths that ask need not carry the loop.
+  result = targetEnd
+  for _ in 0 ..< chars:
+    if result == 0:
+      return -1
+    result = leftAdjustCharHead(ctx.subject, result - 1)
+
+proc bodyChars(ctx: MatchContext, node: Node): int {.inline.} =
+  ## ``lookChars`` when the body is marked to run from [charsBackStart], else
+  ## -1.  The mark is measured under the flags ``lookBounds`` records, so it
+  ## counts only under those, as the bounds do.
+  if node.lookUnclipped and ctx.boundsUsable(node):
+    int(node.lookChars)
+  else:
+    -1
+
+proc altChars(ctx: MatchContext, node: Node, i: int): int {.inline.} =
+  ## As [bodyChars] for alternative ``i``.
+  if ctx.boundsUsable(node) and i < node.lookAlts.len and node.lookAlts[i].unclipped:
+    int(node.lookAlts[i].chars)
+  else:
+    -1
+
+proc fixedStart(ctx: MatchContext, targetEnd, fixedLen, chars: int): int {.inline.} =
+  ## The one start of a look-behind body or branch of a fixed length:
+  ## ``fixedLen`` bytes back, or failing that ``chars`` characters back
+  ## ([charsBackStart]).  It runs from there with no window.
+  if fixedLen >= 0:
+    targetEnd - fixedLen
+  else:
+    ctx.charsBackStart(targetEnd, chars)
 
 proc lookbehindBodyEndsAt(
     ctx: MatchContext, body: Node, startPos, targetEnd: int, window: bool
@@ -2898,20 +2962,28 @@ proc leafScanHolds(
 
 proc lookbehindVarHolds(ctx: MatchContext, node: Node, bodyLen: LenBounds): bool =
   ## Whether variable-length positive lookbehind matches ending at ``ctx.pos``.
-  ## Scans shortest-first, commits to first match, takes no continuation.
+  ## Scans shortest-first, commits to first match, takes no continuation.  A
+  ## body fixed in characters has the one start [charsBackStart] gives.
   let targetEnd = ctx.pos
   let body {.cursor.} = node.lookBody
-  let window = ctx.bodyWindow(node)
+  let chars = ctx.bodyChars(node)
+  var window = ctx.bodyWindow(node)
   let mbl = bodyLen.maxLen
-  let minPos =
+  var minPos =
     if mbl >= 0:
       max(0, targetEnd - mbl)
     else:
       0
-  if isLeafBody(body):
+  var startTry = targetEnd
+  if chars >= 0:
+    startTry = ctx.charsBackStart(targetEnd, chars)
+    if startTry < 0:
+      return false
+    minPos = startTry
+    window = false
+  elif isLeafBody(body):
     return leafScanHolds(ctx, body, targetEnd, minPos, window)
   let pure = node.lookBodyPure
-  var startTry = targetEnd
   while startTry >= minPos:
     if pure:
       # A pure body keeps nothing, so a match needs no rollback entry either.
@@ -2942,13 +3014,19 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
     for i, alt in body.alternatives.view:
       let altLen = ctx.altBounds(node, i, alt)
       let altFbl = altLen.fixedLen
-      let window = ctx.altWindow(node, i, alt)
-      if altFbl >= 0:
+      let chars = ctx.altChars(node, i)
+      if altFbl >= 0 or chars >= 0:
         if lookbehindBodyMatches(
-          ctx, alt, targetEnd - altFbl, targetEnd, window, node.lookBodyPure
+          ctx,
+          alt,
+          ctx.fixedStart(targetEnd, altFbl, chars),
+          targetEnd,
+          false,
+          node.lookBodyPure,
         ):
           return false
       else:
+        let window = ctx.altWindow(node, i, alt)
         let altMbl = altLen.maxLen
         let altMinPos =
           if altMbl >= 0:
@@ -2970,14 +3048,15 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
           startTry = prevCharStart(ctx.subject.oa, startTry)
     return true
   let bodyLen = ctx.bodyBounds(node)
-  if bodyLen.fixedLen >= 0:
-    # Fixed length: one starting position, so one attempt decides it.
+  let chars = ctx.bodyChars(node)
+  if bodyLen.fixedLen >= 0 or chars >= 0:
+    # One starting position ([fixedStart]), so one attempt decides it.
     return not lookbehindBodyMatches(
       ctx,
       body,
-      targetEnd - bodyLen.fixedLen,
+      ctx.fixedStart(targetEnd, bodyLen.fixedLen, chars),
       targetEnd,
-      ctx.bodyWindow(node),
+      false,
       node.lookBodyPure,
     )
   # Variable-length (non-alternation): scan from right to left
@@ -3020,17 +3099,19 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): bool =
     let alt {.cursor.} = alts.alternatives[k]
     let altLen = ctx.altBounds(node, k, alt)
     let altFbl = altLen.fixedLen
-    # A fixed-length branch has one start; any other is scanned from the
-    # shortest start back.
+    let chars = ctx.altChars(node, k)
+    # A branch of a fixed length has one start ([fixedStart]); any other is
+    # scanned from the shortest start back.
+    let one = altFbl >= 0 or chars >= 0
     let altMinPos =
-      if altFbl >= 0:
-        targetEnd - altFbl
+      if one:
+        ctx.fixedStart(targetEnd, altFbl, chars)
       elif altLen.maxLen >= 0:
         max(0, targetEnd - altLen.maxLen)
       else:
         0
-    let window = ctx.altWindow(node, k, alt)
-    if altFbl < 0 and isLeafBody(alt):
+    let window = not one and ctx.altWindow(node, k, alt)
+    if not one and isLeafBody(alt):
       if leafScanHolds(ctx, alt, targetEnd, altMinPos, window):
         ctx.choices[top].lbaNext = int32(k + 1)
         return true
@@ -3038,7 +3119,7 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): bool =
       continue
     # A leaf branch is pure whatever its siblings write.
     let pure = node.lookBodyPure or isLeafBody(alt)
-    var startTry = if altFbl >= 0: altMinPos else: targetEnd
+    var startTry = if one: altMinPos else: targetEnd
     while startTry >= max(altMinPos, 0):
       if pure:
         # Nothing written for the entry snapshot to undo.

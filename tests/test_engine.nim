@@ -2779,6 +2779,31 @@ suite "Lookbehind edge cases":
     let m3 = search("zzxy", re("(?<!ab|cd)xy"))
     check m3.found
 
+  test "a look-behind that may take more than 65,535 characters is rejected":
+    # Oniguruma's ``LOOK_BEHIND_MAX_CHAR_LEN``, held to the reduced body
+    # before it is dropped or divided, positive or negative: ``a{0,65536}b``
+    # reduces to ``b``, and ``(?:a{65536})?`` would drop.  A body that
+    # divides is held to it again piece by piece, ``xy*|a{65536}`` passing as
+    # a whole; one that drops, or whose later branch varies, never divides.
+    for pattern in [
+      "(?<=a{65536})", "(?<!a{65536})", "(?<=a{65536,})", "(?<=(?:aa){32768})",
+      "(?<=(?:a{65536})?)", "(?<=b|a{65536})", "(?<!b|a{65536})", "(?<=\\R{40000})",
+      "(a)(?<=\\1{65536})", "(a)(?<=b|\\1{65536})", "(a)(?<!b|\\1{65536})",
+      "(?<=xy*|a{65536})", "(?<!xy*|a{65536})", "(?<=a{65536}y*|b)",
+      "(?<=(?:xy*|a{65536})|b)", "(?<!(?:xy*|a{65536}))", "(a)(?<=\\1y*|a{65536})",
+      "(a)(?<!\\1y*|a{65536})",
+    ]:
+      check compileError(pattern) == "invalid pattern in look-behind"
+    for pattern in [
+      "(?<=a{65535})", "(?<=a{65535,})", "(?<=a{1,65536})", "(?<=a{0,65536}b)",
+      "(a)(?<!\\1{65535}|b)", "(?<=xy*|a{65535})", "(?<=xy*||a{65536})",
+      "(?<!xy*||a{65536})", "(?<=xy*|(?:a{65536}|b))",
+    ]:
+      check compileError(pattern) == ""
+    # The longest the matcher steps back over, on a marked body.
+    let subject = "a".repeat(65536)
+    check search(subject, re("(a)(?<=\\1{65535})")).matchSpan == 65534 .. 65535
+
 suite "a look-behind alternation retries only where Oniguruma divides it":
   # A look-behind commits to its first match, as any assertion does, except
   # where Oniguruma divides one whose body is an alternation into one
@@ -4206,36 +4231,170 @@ suite "captureSpan bounds checking":
     check m.captureSpan(-1).a < 0
     check m.captureSpan(-1).b < 0
 
-suite "Backreference multi-char case fold":
-  test "captured ß matches subject ss via forward fold":
-    let m = search("ßss", re("(?i)(ß)\\1"))
-    check m.found
-    check m.matchSpan == 0 .. 4
+suite "Backreference case fold":
+  # Oniguruma 6.9.10's ``string_cmp_ic``: each character of the group and the
+  # one at the same place in the subject fold to the same string, inside a
+  # window of the group's byte length.
+  test "a character folds against one character, not two":
+    check not search("ßss", re("(?i)(ß)\\1")).found
+    check not search("ssß", re("(?i)(ss)\\1")).found
+    check not search("ﬀff", re("(?i)(ﬀ)\\1")).found
+    check search("ßß", re("(?i)(ß)\\1")).matchSpan == 0 .. 4
+    check not search("ßab", re("(?i)(ß)\\1")).found
 
-  test "captured ss matches subject ß via reverse fold":
-    let m = search("ssß", re("(?i)(ss)\\1"))
-    check m.found
-    check m.matchSpan == 0 .. 4
+  test "the subject holds as many bytes as the group":
+    # ẞ is three bytes and ß two: ``ẞß`` leaves two after the group, and the
+    # ``x`` makes it three.
+    check not search("ẞß", re("(?i)(ẞ)\\1")).found
+    let m = search("ẞßx", re("(?i)(ẞ)\\1"))
+    check m.matchSpan == 0 .. 5
+    check m.captureSpan(1) == 0 .. 3
+    check not search("ſs", re("(?i)(ſ)\\1")).found
+    check search("ſsx", re("(?i)(ſ)\\1")).matchSpan == 0 .. 3
 
-  test "captured ß matches subject ß (simple)":
-    let m = search("ßß", re("(?i)(ß)\\1"))
-    check m.found
-    check m.matchSpan == 0 .. 4
+  test "the window ends inside a character":
+    # One byte of ſ is left in the window, and ``\xC5`` alone is Å.
+    check not search("sſ", re("(?i)(s)\\1")).found
+    check not search("k\u212A", re("(?i)(k)\\1")).found
+    check search("\u212Akab", re("(?i)(\u212A)\\1")).matchSpan == 0 .. 4
+    # The window holds ſ and the ``\xC3`` of the ã after it, which as Ã
+    # folds to ã, so the match takes all of that ã; é does not fold to ã.
+    check search("sãſã", re("(?i)(sã)\\1")).matchSpan == 0 .. 7
+    check not search("séſé", re("(?i)(sé)\\1")).found
 
-  test "mismatched capture and subject fails":
-    let m = search("ßab", re("(?i)(ß)\\1"))
-    check not m.found
-
-  test "ascii-only flag disables multi-char fold in backref":
-    # (?iI): ignore-case combined with ASCII-only fold. ß ↔ ss
-    # must not fold because ß is outside ASCII.
-    let m = search("ßss", re("(?iI)(ß)\\1"))
-    check not m.found
+  test "ascii-only folds no non-ASCII character":
+    check not search("ßss", re("(?iI)(ß)\\1")).found
+    check not search("\u212Akab", re("(?iI)(\u212A)\\1")).found
+    check search("kK", re("(?iI)(k)\\1")).matchSpan == 0 .. 2
 
   test "ASCII backref still works under ignore-case":
     let m = search("abcABC", re("(?i)(abc)\\1"))
     check m.found
     check m.matchSpan == 0 .. 6
+
+  test "a name read twice compares each group the same way":
+    check not search("ßss", re("(?i)(?<n>ß)(?<n>x)?\\k<n>")).found
+    check search("ſss", re("(?i)(?<n>ſ)(?<n>s)\\k<n>")).matchSpan == 0 .. 4
+    # The unset ``x`` group falls back to the ſ one, whose window runs past
+    # the ``s`` it takes.
+    let m = search("ſsx", re("(?i)(?<n>ſ)(?<n>x)?\\k<n>"))
+    check m.matchSpan == 0 .. 3
+    check m.captureSpan(2).a < 0
+
+  test "a look-behind of a fixed number of characters leaves the window whole":
+    # Oniguruma runs these bodies against the subject, so the window of ſ
+    # holds the ``x`` past the look-behind.
+    check search("ſsx", re("(?i)(ſ)s(?<=\\1)x")).matchSpan == 0 .. 4
+    check search("ſsx", re("(?i)(ſ)s(?<=\\1|abc)x")).matchSpan == 0 .. 4
+    check search("ſsx", re("(?i)(?<n>ſ)s(?<=\\k<n>)x")).matchSpan == 0 .. 4
+    check not search("ſsx", re("(?i)(ſ)s(?<!\\1)x")).found
+    check not search("ſsx", re("(?i)(ſ)s(?<!\\1|abc)x")).found
+    check search("ſsx", re("(?i)(ſ)s(?<=[sé](?<=\\1))x")).matchSpan == 0 .. 4
+    # An empty group: ``\b`` at 0 reads the subject, not an empty window.
+    check search("a", re("()(?<=\\1\\b)a")).matchSpan == 0 .. 1
+    check search("a", re("()(?<=\\g<1>\\b)a")).matchSpan == 0 .. 1
+    check not search("a", re("()(?<!\\g<1>\\b)a")).found
+    # Each branch of a divided body decides on its own, past the sixteenth
+    # too, and so does each of a first branch that divides again.
+    check search("ſsx", re("(?i)(ſ)s(?<=ab|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|\\1)x")).matchSpan ==
+      0 .. 4
+    check not search("ſsx", re("(?i)(ſ)s(?<!ab|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|\\1)x")).found
+    check not search("ſsx", re("(?i)(ſ)s(?<!(?:\\1|bb)|c)x")).found
+    check not search("ſsx", re("(?i)(ſ)s(?<!(?:a*\\1|b)|cc)x")).found
+    check not search("ſsx", re("(?i)(ſ)s(?<!(?:(?:\\1|bb)|c)|dd)x")).found
+    check search("ſkskxx", re("(?i)(ſk)sk(?<=\\1)xx")).matchSpan == 0 .. 7
+    # A call runs its group, and a reference in it reads the subject so too.
+    check search("ſysx", re("(?i)(ſ)(?:(\\1)|y)s(?<=\\g<2>)x")).matchSpan == 0 .. 5
+    check not search("ſysx", re("(?i)(ſ)(?:(\\1)|y)s(?<!\\g<2>)x")).found
+    check search("ſysx", re("(?i)(?<n>ſ)(?:(?<m>\\k<n>)|y)s(?<=\\g<m>)x")).matchSpan ==
+      0 .. 5
+
+  test "such a body runs once, from as many characters back":
+    check search("aa", re("(a)(?<=\\1\\1)")).matchSpan == 1 .. 2
+    check not search("a", re("(a)(?<=\\1\\1)")).found
+    check search("a", re("(a)(?<!\\1\\1)")).matchSpan == 0 .. 1
+    # From any start nearer, the call would run on to the position and into
+    # the same look-behind again.
+    check not search("kk", re("(k(?<=\\wbb|\\g<1>\\b[ak]))")).found
+    check search("xyzkk", re("(k(?<!\\wbb|\\g<1>\\b[ak]))")).matchSpan == 3 .. 4
+    # Each step goes back over continuation bytes to the nearest byte that is
+    # not one, as Oniguruma's does, however malformed: two back from the end
+    # of ``"\xC3\xE1\xBE"`` is 0, where ``(..)`` took ``\xC3\xE1`` and
+    # ``\xBE``, and a run of continuation bytes is one step.
+    check search("\xC3\xE1\xBE", re("(..)(?<=\\1)")).matchSpan == 0 .. 3
+    check not search("\xC3\xE1\xBE", re("(..)(?<!\\1)")).found
+    check search("\xC3\xE1\xBEx", re("(..)(?<!\\1)")).matchSpan == 2 .. 4
+    check not search("\x80\x80\x80", re("(..)(?<=\\1)")).found
+    check search("\x80\x80\x80", re("(..)(?<!\\1)")).matchSpan == 0 .. 2
+    check not search("Kk", re("(?i)(k(?<=\\wß{2}|\\g<1>\\b[ſk]))")).found
+    # Two characters back, the ẞ cannot take ``ss``.
+    check search("éſSss", re("(?i)(s)ss(?<!ẞ\\1)")).matchSpan == 2 .. 6
+    check not search("éſSss", re("(?i)(s)ss(?<=ẞ\\1)")).found
+    # Oniguruma keeps no ``X{1}``, so the repeat around one takes ``\1``
+    # itself, and the reduction pins that to one character.
+    check search("ſsx", re("(?i)(ſ)s(?<=\\1{1,1}+)x")).matchSpan == 0 .. 4
+    check search("ſsx", re("(?i)(ſ)s(?<=(?:\\1){1}+)x")).matchSpan == 0 .. 4
+    check search("ſsx", re("(?i)(ſ)s(?<=(?:\\1{1})+)x")).matchSpan == 0 .. 4
+    check not search("ſsx", re("(?i)(ſ)s(?<!\\1{1,1}+)x")).found
+    check search("ſsSSſssKſ", re("(?i)(s)s(?<=\\1{1}+{1})")).matchSpan == 0 .. 3
+    # And a body of one alternation repeated once divides as the alternation.
+    check search("kk", re("(?<=(?:(k)|kk|(k)){1})\\2")).matchSpan == 1 .. 2
+    check not search("kk", re("(?<=(?:(k)|kk|(k)){1}?)\\2")).found
+    # Under ``(?y{g})`` a ``.`` takes a cluster, which no count of characters
+    # measures, so a body reaching one keeps its window and answers as the
+    # same body without the reference does.
+    check search("aé", re("(?y{g})(a).(?<=\\1.)")).matchSpan == 0 .. 4
+    check search("aé", re("(?y{g})(a).(?<=a.)")).matchSpan == 0 .. 4
+    check search("aéx", re("(?y{g})(.)(?<=\\1)x")).matchSpan == 1 .. 5
+
+  test "a (?i) class holding a fold of several characters varies in length":
+    # Oniguruma's parser makes ``[ß]`` the class or ``ss``, inside a
+    # look-behind too, where the literal ``ß`` stays one character.
+    check not search("ſßsx", re("(?i)(ſ)ßs(?<=[ß]\\1)x")).found
+    check search("ſßsx", re("(?i)(ſ)ßs(?<![ß]\\1)x")).matchSpan == 0 .. 6
+    check search("ſßsx", re("(?i)(ſ)ßs(?<=ß\\1)x")).matchSpan == 0 .. 6
+    check not search("ſẞsx", re("(?i)(ſ)ẞs(?<=[ẞ]\\1)x")).found
+    check search("ſẞsx", re("(?i)(ſ)ẞs(?<![ẞ]\\1)x")).matchSpan == 0 .. 7
+    check search("ßſẞss\r\nẞx", re("(?i)(\\b)(?<!\\g<1>|ſ[sß]\\w)")).matchSpan ==
+      0 .. 0
+    # A branch after the first that varies keeps the body whole, so the
+    # first branch to match is not retried.
+    check not search("kk", re("(?i)(?<=(k)|[sß]k|(k))\\2")).found
+    check not search("kk", re("(?i)(?<=(k)|[ﬃ]k|(k))\\2")).found
+    check search("kk", re("(?i)(?<=(k)|ßk|(k))\\2")).matchSpan == 1 .. 2
+    check search("kk", re("(?i)(?<=(k)|[^ß]k|(k))\\2")).matchSpan == 1 .. 2
+    check search("kk", re("(?iI)(?<=(k)|[sß]k|(k))\\2")).matchSpan == 1 .. 2
+
+  test "a group with a fold of several characters varies in length":
+    # Oniguruma unravels ``(?i)(ẞ)`` into ``(ẞ|ss)``, and so on, before it
+    # measures the look-behind: its body varies, and runs clipped.
+    check not search("ẞßx", re("(?i)(ẞ)ß(?<=\\1)x")).found
+    check not search("ẞßx", re("(?i)(ẞ)ß(?<=ab|\\1)x")).found
+    check not search("ſſssxx", re("(?i)(ſſ)ss(?<=\\1)xx")).found
+    check not search("ſtstxx", re("(?i)(ſt)st(?<=\\1)xx")).found
+    check not search("ẞßx", re("(?i)([ẞ])ß(?<=\\1)x")).found
+    check search("ſsséſK", re("(?i)(ẞ)ſ(?<!\\1)")).matchSpan == 0 .. 4
+    # A call runs the group as unravelled, and varies with it.
+    check not search("ſssx", re("(?i)(?:(ß)|(ſ))ss(?<=\\g<1>\\2)x")).found
+    check not search("ſsssx", re("(?i)(?:(ß)|(ſ))sss(?<=\\g<1>\\2)x")).found
+    # Under ``(?I)`` nothing folds to several.
+    check search("ẞẞx", re("(?iI)(ẞ)ẞ(?<=\\1)x")).matchSpan == 0 .. 7
+
+  test "a look-behind of varying length clips the window":
+    check not search("ſsx", re("(?i)(ſ)s(?<=\\1x?)x")).found
+    check search("ſsx", re("(?i)(ſ)s(?<!\\1x?)x")).matchSpan == 0 .. 4
+    check not search("ſsx", re("(?i)(ſ|ab)s(?<=\\1)x")).found
+    check not search("ſsx", re("(?i)(ſ)s(?<=[sé]x?(?<=\\1))x")).found
+    # Not divided, as a branch after the first varies: one window for both.
+    check not search("ſsx", re("(?i)(ſ)s(?<=\\1|ab+)x")).found
+    check search("ſsx", re("(?i)(ſ)s(?<!\\1|ab+)x")).matchSpan == 0 .. 4
+    check search("ſsx", re("(?i)(ſ)s(?<!cc|(?:\\1|bb))x")).matchSpan == 0 .. 4
+
+  test "a reference with a level reads its window to the end of the subject":
+    let m = search("ſsx", re("(?i)(?<n>ſ)(?~|x)\\k<n+0>"))
+    check m.matchSpan == 0 .. 3
+    check search("ẞßx", re("(?i)(?<n>ẞ)(?~|x)\\k<n+0>")).matchSpan == 0 .. 5
+    check search("ſsx", re("(?i)(?<n>ſ)s(?<=\\k<n+0>x?)x")).matchSpan == 0 .. 4
 
 suite "replace invalid reference":
   test "numeric reference out of range raises":

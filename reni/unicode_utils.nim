@@ -1681,6 +1681,101 @@ proc caseInsensitiveMatch*(r, target: Rune, flags: RegexFlags): bool =
     return r == target
   simpleFold(r) == simpleFold(target)
 
+const FullFoldExpansions = block:
+  ## The distinct full case folds of [AllMultiCharFoldSources], each several
+  ## characters.
+  var folds: seq[seq[int32]]
+  for (first, last) in AllMultiCharFoldSources:
+    for cp in first .. last:
+      var fold: seq[int32]
+      for r in caseFold(Rune(cp)):
+        fold.add int32(r)
+      if fold notin folds:
+        folds.add fold
+  folds
+
+proc foldsUnevenly*(runes: openArray[Rune]): bool =
+  ## Whether a ``(?i)`` string holds a character, or a run of them, that
+  ## folds with something of another number of characters: a character with
+  ## a full fold of several ([AllMultiCharFoldSources]), or a run whose
+  ## characters fold to such a fold one by one.  Oniguruma's
+  ## ``unravel_case_fold_string`` makes each a choice of branches of those
+  ## lengths -- ``ß`` one of ``ß`` and ``ss``, ``ſt`` one of ``ſt``, ``ﬅ``
+  ## and ``ﬆ`` -- outside a look-behind.
+  for i, r in runes:
+    if inRangeTable(int32(r), AllMultiCharFoldSources):
+      return true
+    for fold in FullFoldExpansions:
+      if i + fold.len <= runes.len:
+        var j = 0
+        while j < fold.len and int32(simpleFold(runes[i + j])) == fold[j]:
+          inc j
+        if j == fold.len:
+          return true
+  false
+
+const MaxFoldBytes = 12
+  ## Room for the longest [caseFoldBytesAt] output: a fold to several
+  ## characters is three in the BMP at most, nine bytes, and every other
+  ## output is one character.
+
+type FoldBytes* = array[MaxFoldBytes, char]
+
+proc caseFoldBytesAt*(
+    s: openArray[char], p: var int, e: int, asciiOnly: bool, fold: var FoldBytes
+): int =
+  ## Oniguruma's ``mbc_case_fold`` for UTF-8, which a ``(?i)`` backreference
+  ## compares through: fold the character at ``p`` into ``fold``, move ``p``
+  ## past it, and return the fold's length in bytes.  ``e`` is where the
+  ## character has to end, ``p < e``; ``asciiOnly`` is ``(?I)``.
+  ##
+  ## - An ASCII byte folds to its lower case.
+  ## - Any other character is decoded from the bytes before ``e`` only, as
+  ##   ``mbc_to_code`` reads a sequence cut short: ``\xC3`` alone is U+00C3.
+  ##   ``p`` still moves by the length its lead byte declares, past ``e``
+  ##   for a cut one.
+  ## - That code point folds to its full case fold (CaseFolding.txt C and F)
+  ##   when it has one.  Under ``asciiOnly`` only an ASCII code point folds,
+  ##   which an overlong one is (``\xC1\x93`` is ``S``), and only to ASCII.
+  ## - Any other folds to the character's own bytes, all of them, the cut
+  ##   ones past ``e`` too.  -1 when they run past the end of ``s``, where
+  ##   Oniguruma reads beyond the subject.
+  when not defined(release):
+    assert p < e
+  let start = p
+  let b = s[p].uint8
+  if b < 0x80:
+    fold[0] = char(asciiFoldByte(b))
+    inc p
+    return 1
+  let n = encLen(b)
+  let k = min(n, e - p)
+  var code = int32(b)
+  if k > 1:
+    code = int32(b and (0x7F'u8 shr k))
+    for i in 1 ..< k:
+      code = (code shl 6) or int32(s[p + i].uint8 and 0x3F'u8)
+  p += n
+  if (not asciiOnly or code < 0x80) and code <= MaxCodePoint:
+    var runes: array[3, Rune]
+    var count = 0
+    for r in caseFold(Rune(code)):
+      runes[count] = r
+      inc count
+    if count > 1 or
+        (runes[0] != Rune(code) and (not asciiOnly or int32(runes[0]) < 0x80)):
+      result = 0
+      var buf: array[4, char]
+      for r in runes.toOpenArray(0, count - 1):
+        let len = utf8Encode(int32(r), buf)
+        copyMem(addr fold[result], addr buf[0], len)
+        result += len
+      return
+  if start + n > s.len:
+    return -1
+  copyMem(addr fold[0], unsafeAddr s[start], n)
+  n
+
 proc matchCcAtom*(r: Rune, atom: CcAtom, flags: RegexFlags): bool =
   case atom.kind
   of ccLiteral:

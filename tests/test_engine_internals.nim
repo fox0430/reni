@@ -124,6 +124,12 @@ suite "malformed UTF-8 above U+10FFFF":
     check not search("\xF4\xBF\xBF\xBF", re("\\w")).found
     check not search("\xF4\xBF\xBF\xBF", re("\\p{L}")).found
 
+  test "a case-insensitive backreference compares one as its bytes":
+    # Spans read off Oniguruma 6.9.10.
+    let twice = "\xF4\x90\x80\x80\xF4\x90\x80\x80"
+    check search(twice, re("(?i)(.)\\1")).matchSpan == 0 .. 8
+    check not search("\xF4\x90\x80\x80\xF4\x90\x80\x81", re("(?i)(.)\\1")).found
+
   test "word segmentation does not abort on one":
     # ``wordBreakProp`` is the lookup ``(?y{w})`` reaches, and an unguarded
     # one aborts with an uncatchable AssertionDefect rather than failing to
@@ -224,6 +230,74 @@ suite "the \\Z jump never skips a start position":
     check search("क्षि", re("(?y{w}).\\Z")).matchSpan == 0 .. 12
     # Outside those modes a dot is one character wide again.
     check re(".\\Z").semiEndDMax == 4
+
+suite "caseFoldBytesAt folds as Oniguruma's mbc_case_fold does":
+  # Rows read off libonig 6.9.10's ``ONIGENC_MBC_CASE_FOLD`` for UTF-8: the
+  # bytes, where the character has to end, (?I), then how far it moved and
+  # what it folded to.  "past the end" is reni's: libonig reads on there.
+  proc fold(s: string, e: int, asciiOnly = false): (int, string) =
+    var p = 0
+    var buf: FoldBytes
+    let n = caseFoldBytesAt(s, p, e, asciiOnly, buf)
+    var folded = "past the end"
+    if n >= 0:
+      folded = newString(n)
+      for i in 0 ..< n:
+        folded[i] = buf[i]
+    (p, folded)
+
+  test "a whole character folds to its full case fold":
+    check fold("ſ", 2) == (2, "s")
+    check fold("\u212A", 3) == (3, "k")
+    check fold("ß", 2) == (2, "ss")
+    check fold("ẞ", 3) == (3, "ss")
+    check fold("\u00B5", 2) == (2, "\u03BC")
+    check fold("é", 2) == (2, "é")
+
+  test "a cut one is read from the bytes before the end, and moved past whole":
+    check fold("ſ", 1) == (2, "å")
+    check fold("ã", 1) == (2, "ã")
+    check fold("\xC3", 1) == (2, "ã")
+    check fold("\xE2", 1) == (3, "past the end")
+    check fold("\u212A", 1) == (3, "\u212A")
+    check fold("ẞ", 2) == (3, "ẞ")
+
+  test "a byte that leads nothing reads as its own code point":
+    check fold("\xB5", 1) == (1, "\u03BC")
+    check fold("\xDF", 1) == (2, "ss")
+
+  test "an overlong ASCII letter folds from upper case only":
+    check fold("\xC1\x93", 2) == (2, "s")
+    check fold("\xC1\xB3", 2) == (2, "\xC1\xB3")
+
+  test "under (?I) only an ASCII code point folds":
+    check fold("\xC1\x93", 2, asciiOnly = true) == (2, "s")
+    check fold("Ó", 2, asciiOnly = true) == (2, "Ó")
+    check fold("\u212A", 3, asciiOnly = true) == (3, "\u212A")
+
+suite "foldsUnevenly finds what Oniguruma unravels into branches":
+  proc uneven(s: string): bool =
+    foldsUnevenly(s.toRunes)
+
+  test "a character with a fold of several":
+    check uneven("ß")
+    check uneven("aẞ")
+    check uneven("ﬃ")
+    check uneven("ᾀ")
+
+  test "a run that folds to such a fold":
+    check uneven("ss")
+    check uneven("ſS")
+    check uneven("xst")
+    check uneven("ffi")
+    check uneven("ἀι")
+
+  test "characters that fold one for one":
+    check not uneven("s")
+    check not uneven("ſ")
+    check not uneven("sk")
+    check not uneven("\u212Ak")
+    check not uneven("")
 
 suite "case folding widens what a pattern character can consume":
   # Under ``(?i)`` a character matches a fold equivalent with a wider encoding

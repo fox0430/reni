@@ -4,7 +4,10 @@
 ## pinned to their lower bound ([reduceBody]), then the positive look-behind
 ## dropped, divided into one look-behind per branch (``lookDivided``, which
 ## the matcher retries), or kept whole, on the lengths of that reduced body
-## ([tuneLookBehind]).
+## ([tuneLookBehind]).  A negative one is divided only where a window could
+## tell ([tuneNegLookBehind]).  Either is rejected where that body may take
+## more characters than Oniguruma steps back over, or where a piece it
+## divides into may ([checkLength], [checkLengths]).
 ##
 ## The decisions read a model of Oniguruma's tree -- lengths in characters,
 ## ``min_is_sure``, the possessive rewrite and the case-fold unravelling that
@@ -13,7 +16,7 @@
 
 import std/unicode
 
-import types, unicode_utils, stackguard
+import types, unicode_utils, stackguard, leafgate
 
 proc isSimpleRepeatBody(node: Node): bool {.inline.} =
   ## Repeat bodies the look-behind reduction handles: strings, char types,
@@ -67,6 +70,20 @@ type
       ## [repeatBodySpan].  Empty unless [initGroupSpans] was given the
       ## numbering.
     stackBase: int ## Where measuring began, for [charSpan]'s stack check.
+    unravel: bool
+      ## Whether a backreference or a call reads its group as unravelled
+      ## ([refSpan]); set by [tuneLookBehinds] only, whose ``flags`` are
+      ## ``rootFlags``.
+    rootFlags: RegexFlags
+    groupFlags: seq[RegexFlags]
+    groupBehind: seq[bool]
+      ## By group: the flags in force at it, which its body is measured
+      ## under, and whether it sits in a look-behind.  Collected with the
+      ## bodies.
+    uneven: seq[int8] ## By group: whether it [unravels], 1 or 0, -1 until asked.
+    clusterModes: bool
+      ## Whether the pattern sets ``(?y{g})`` or ``(?y{w})`` anywhere, for
+      ## [takesClusters].  Collected with the bodies.
 
 const CharSpanCap = 1 shl 30
   ## Where a count saturates, as Oniguruma's ``distance_add`` and
@@ -146,12 +163,15 @@ proc ensureGroups(g: var GroupSpans) =
   if g.ready:
     return
   g.ready = true
-  var flags: seq[RegexFlags]
-  collectGroupBodies(g.root, g.bodies, flags)
+  collectGroupBodies(g.root, g.bodies, g.groupFlags, g.rootFlags)
   g.spans = newSeq[CharSpan](g.bodies.len)
   g.measured = newSeq[bool](g.bodies.len)
   g.visiting = newSeq[bool](g.bodies.len)
   g.referenced = newSeq[bool](g.bodies.len)
+  g.groupBehind = newSeq[bool](g.bodies.len)
+  g.uneven = newSeq[int8](g.bodies.len)
+  for u in g.uneven.mitems:
+    u = -1
   proc mark(g: var GroupSpans, idx: int) =
     if idx >= 0 and idx < g.referenced.len:
       g.referenced[idx] = true
@@ -160,10 +180,20 @@ proc ensureGroups(g: var GroupSpans) =
     for idx in g.names.namedGroupsRead(name, scope):
       mark(g, idx)
 
-  proc walk(g: var GroupSpans, node: Node) =
+  proc walk(g: var GroupSpans, node: Node, behind: bool) =
     if node == nil:
       return
+    var inner = behind
     case node.kind
+    of nkCapture:
+      g.groupBehind[node.captureIndex] = behind
+    of nkNamedCapture:
+      g.groupBehind[node.namedCaptureIndex] = behind
+    of nkLookaround:
+      inner = behind or node.lookKind in {lkBehind, lkNegBehind}
+    of nkFlagGroup:
+      if node.graphemeMode in {gmGrapheme, gmWord}:
+        g.clusterModes = true
     of nkBackreference:
       mark(g, node.backrefIndex - 1)
     of nkNamedBackref:
@@ -184,11 +214,11 @@ proc ensureGroups(g: var GroupSpans) =
     else:
       discard
     for child in node.childNodes:
-      walk(g, child)
+      walk(g, child, inner)
 
-  walk(g, g.root)
+  walk(g, g.root, false)
 
-proc charSpan(node: Node, g: var GroupSpans): CharSpan
+proc charSpan(node: Node, g: var GroupSpans, flags: RegexFlags): CharSpan
 
 proc groupSpan(g: var GroupSpans, idx: int): CharSpan =
   ## The span of group ``idx`` (0-based), unbounded when the group is unknown
@@ -203,7 +233,7 @@ proc groupSpan(g: var GroupSpans, idx: int): CharSpan =
   if not g.measured[idx]:
     g.visiting[idx] = true
     inc g.open
-    var s = charSpan(g.bodies[idx], g)
+    var s = charSpan(g.bodies[idx], g, g.groupFlags[idx])
     dec g.open
     g.visiting[idx] = false
     s.sure = false
@@ -211,14 +241,64 @@ proc groupSpan(g: var GroupSpans, idx: int): CharSpan =
     g.measured[idx] = true
   g.spans[idx]
 
+proc unravels(node: Node, flags: RegexFlags, behind: bool): bool =
+  ## Whether Oniguruma's case-fold unravelling turns something in ``node``
+  ## into branches of different lengths: a ``(?i)`` string outside a
+  ## look-behind that [foldsUnevenly].  One inside is unravelled one
+  ## character for one (``unravel_cf_look_behind_add``), and a class its
+  ## parser makes branches of [charSpan] measures already.  A look-around
+  ## takes no characters, and a reference or a call is measured on its own.
+  if node == nil:
+    return false
+  case node.kind
+  of nkLiteral:
+    not behind and multiCharFoldsApply(flags) and foldsUnevenly([node.rune])
+  of nkEscapedLiteral:
+    not behind and multiCharFoldsApply(flags) and foldsUnevenly([node.escapedRune])
+  of nkString:
+    not behind and multiCharFoldsApply(flags) and foldsUnevenly(node.runes)
+  of nkFlagGroup:
+    unravels(node.flagBody, flags + node.flagsOn - node.flagsOff, behind)
+  of nkConcat:
+    var current = flags
+    for child in node.children.view:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        current = current + child.flagsOn - child.flagsOff
+      elif unravels(child, current, behind):
+        return true
+    false
+  of nkLookaround, nkBackreference, nkNamedBackref, nkSubexpCall:
+    false
+  else:
+    for child in node.childNodes:
+      if unravels(child, flags, behind):
+        return true
+    false
+
+proc refSpan(g: var GroupSpans, idx: int): CharSpan =
+  ## [groupSpan] as a backreference or a call reads group ``idx``: unbounded
+  ## as well when the group [unravels], as Oniguruma measures it once its own
+  ## tuning has made ``(?i)(ß)`` into ``(ß|ss)``.  Its text can then hold
+  ## another number of characters than the group's pattern does, and a call
+  ## runs the unravelled body: ``node_char_len1`` measures the group's node
+  ## for either.
+  result = groupSpan(g, idx)
+  if not g.unravel or not result.fixed or idx < 0 or idx >= g.bodies.len:
+    return
+  if g.uneven[idx] < 0:
+    g.uneven[idx] =
+      if unravels(g.bodies[idx], g.groupFlags[idx], g.groupBehind[idx]): 1 else: 0
+  if g.uneven[idx] == 1:
+    result.hi = -1
+
 proc namedGroupSpan(g: var GroupSpans, name: string, scope: int32): CharSpan =
   ## Any of the groups called ``name`` that a reference in ``scope`` reads
-  ## ([namedGroupsRead]), as a backreference to a name that several groups
-  ## share reads any one of them.
+  ## ([namedGroupsRead]), each as [refSpan] measures it, as a backreference
+  ## to a name that several groups share reads any one of them.
   ensureGroups(g)
   var first = true
   for idx in g.names.namedGroupsRead(name, scope):
-    let s = groupSpan(g, idx)
+    let s = refSpan(g, idx)
     result =
       if first:
         s
@@ -228,25 +308,31 @@ proc namedGroupSpan(g: var GroupSpans, name: string, scope: int32): CharSpan =
   if first:
     result = CharSpan(lo: 0, hi: -1)
 
-proc repeatBodySpan(q: Node, g: var GroupSpans): CharSpan =
+proc repeatBodySpan(q: Node, g: var GroupSpans, flags: RegexFlags): CharSpan =
   ## [charSpan] of repeat ``q``'s body, kept by [NodeId] when
   ## [initGroupSpans] was given the numbering.  A repeat inside another is
   ## then measured once, not again for every repeat around it.  Nothing is
   ## kept or read while a group is being measured: a reference back into
   ## that group reads as unbounded there (see [groupSpan]), and the same
-  ## body measured from outside it reads it in full.
+  ## body measured from outside it reads it in full.  What is kept was
+  ## measured under the ``flags`` of the first ask -- ``(?:(?i:[sß]*))*``
+  ## keeps the inner repeat as measured under ``(?i)`` -- and only
+  ## [repeatBodyMayBeEmpty] keeps any, which reads ``lo`` alone.
   let id = q.id.int
   let keep = g.open == 0 and id > 0 and id < g.bodyKnown.len
   if keep and g.bodyKnown[id]:
     return g.bodySpans[id]
-  result = charSpan(q.quantBody, g)
+  result = charSpan(q.quantBody, g, flags)
   if keep:
     g.bodySpans[id] = result
     g.bodyKnown[id] = true
 
-proc charSpan(node: Node, g: var GroupSpans): CharSpan =
-  ## Oniguruma's ``node_char_len1`` over this tree.  ``\R`` and ``\X`` are
-  ## subexpressions there, of one to two characters and of one or more.
+proc charSpan(node: Node, g: var GroupSpans, flags: RegexFlags): CharSpan =
+  ## Oniguruma's ``node_char_len1`` over this tree, which sits where
+  ## ``flags`` are in force.  ``\R`` and ``\X`` are subexpressions there, of
+  ## one to two characters and of one or more, and so is a ``(?i)`` class
+  ## holding a character with a fold of several ([classHoldsFoldSource]):
+  ## its parser makes ``[sß]`` the class or ``ss``, wherever it stands.
   ## Where the two trees part ways, the answer leans to ``sure == false``,
   ## which keeps a look-behind rather than dropping it.
   if node == nil:
@@ -256,8 +342,17 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
   if nearStackEnd(g.stackBase):
     raise newException(RegexLimitError, "compile stack budget exceeded")
   case node.kind
-  of nkLiteral, nkEscapedLiteral, nkCharClass:
+  of nkLiteral, nkEscapedLiteral:
     spanOf(1)
+  of nkCharClass:
+    if classHoldsFoldSource(node, flags):
+      # ``hi`` is read only to ask whether a span is fixed and whether it
+      # passes [LookBehindMaxChars], so the longest fold goes unmeasured, as
+      # in [refSpan], and ``(?i)(?<=[ß]{40000})`` passes the cap there,
+      # where Oniguruma measures 80,000.
+      CharSpan(lo: 1, hi: -1, sure: true)
+    else:
+      spanOf(1)
   of nkString:
     spanOf(node.runes.len)
   of nkCharType:
@@ -270,13 +365,18 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
       spanOf(1)
   of nkConcat:
     var s = spanOf(0)
+    var current = flags
     for child in node.children.view:
-      s = s + charSpan(child, g)
+      # A bare flag group sets the flags for the rest, as in [unravels].
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        current = current + child.flagsOn - child.flagsOff
+      else:
+        s = s + charSpan(child, g, current)
     s
   of nkAlternation:
     var s = spanOf(0)
     for i, alt in node.alternatives.view:
-      let a = charSpan(alt, g)
+      let a = charSpan(alt, g, flags)
       s =
         if i == 0:
           a
@@ -288,17 +388,17 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
     if lo == 0 and hi == 0:
       spanOf(0)
     else:
-      repeatBodySpan(node, g).repeated(lo, hi)
+      repeatBodySpan(node, g, flags).repeated(lo, hi)
   of nkCapture:
     groupSpan(g, node.captureIndex)
   of nkNamedCapture:
     groupSpan(g, node.namedCaptureIndex)
   of nkGroup:
-    charSpan(node.groupBody, g)
+    charSpan(node.groupBody, g, flags)
   of nkFlagGroup:
-    charSpan(node.flagBody, g)
+    charSpan(node.flagBody, g, flags + node.flagsOn - node.flagsOff)
   of nkAtomicGroup:
-    charSpan(node.atomicBody, g)
+    charSpan(node.atomicBody, g, flags)
   of nkAnchor:
     # ``\K`` is no anchor there but a marker, which consumes nothing surely.
     spanOf(0, sure = node.anchor == akKeep)
@@ -310,7 +410,7 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
     if node.backrefLevel != 0:
       CharSpan(lo: 0, hi: -1)
     else:
-      groupSpan(g, node.backrefIndex - 1)
+      refSpan(g, node.backrefIndex - 1)
   of nkNamedBackref:
     if node.namedBackrefLevel != 0:
       CharSpan(lo: 0, hi: -1)
@@ -318,7 +418,7 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
       namedGroupSpan(g, node.backrefName, node.backrefScope)
   of nkSubexpCall:
     if node.callIndex > 0:
-      groupSpan(g, node.callIndex - 1)
+      refSpan(g, node.callIndex - 1)
     elif node.callName.len > 0:
       namedGroupSpan(g, node.callName, EveryNamedGroup)
     else:
@@ -326,7 +426,7 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
   of nkConditional:
     let test =
       if node.condKind == ckRegexCond:
-        charSpan(node.condBody, g)
+        charSpan(node.condBody, g, flags)
       else:
         spanOf(0, sure = false)
     let bare =
@@ -339,7 +439,7 @@ proc charSpan(node: Node, g: var GroupSpans): CharSpan =
       test
     else:
       # The test runs before the yes branch only, as in ``BAG_IF_ELSE``.
-      either(test + charSpan(node.condYes, g), charSpan(node.condNo, g))
+      either(test + charSpan(node.condYes, g, flags), charSpan(node.condNo, g, flags))
   of nkAbsent:
     case node.absentKind
     of abClear, abRange:
@@ -371,7 +471,10 @@ proc repeatBodyMayBeEmpty*(q: Node, g: var GroupSpans): bool =
   ## than 0, empty here wherever it stands.  An iteration through the first,
   ## or through a plain reference into its own open group
   ## (``Regex.opensUnset``), always fails, so no empty check reads those.
-  repeatBodySpan(q, g).lo == 0
+  ##
+  ## Measured under no flags: they decide whether a class is fixed
+  ## ([charSpan]), never ``lo``.
+  repeatBodySpan(q, g, {}).lo == 0
 
 const AsciiWordBytes =
   {'0'.uint8 .. '9'.uint8, 'A'.uint8 .. 'Z'.uint8, '_'.uint8, 'a'.uint8 .. 'z'.uint8}
@@ -753,6 +856,21 @@ proc surelyEmpty(s: CharSpan, used: bool): bool {.inline.} =
   ## matched through it.
   s.lo == 0 and s.sure and not used
 
+const LookBehindMaxChars = 65_535
+  ## Oniguruma's ``LOOK_BEHIND_MAX_CHAR_LEN``, the most characters a
+  ## look-behind body may take, so that ``onigenc_step_back`` cannot
+  ## overflow.
+
+proc checkLength(s: CharSpan) =
+  ## Reject a look-behind whose reduced body measures ``s`` where that may
+  ## run past [LookBehindMaxChars], as ``tune_look_behind`` does before it
+  ## drops or divides one: ``(?<=a{65536})``, ``(?<=(?:a{65536})?)``, which
+  ## would drop, and ``(?<=b|a{65536})``, which would divide.  Positive or
+  ## negative alike.  A body that divides has each piece checked as well
+  ## ([checkLengths]).
+  if s.lo > LookBehindMaxChars or s.hi > LookBehindMaxChars:
+    raise newException(RegexError, "invalid pattern in look-behind")
+
 type Branches = object
   ## The branches of a reduced look-behind body that is an alternation, as
   ## ``tune_look_behind`` reads them: each one's [charSpan], and whether it
@@ -760,22 +878,25 @@ type Branches = object
   spans: seq[CharSpan]
   used: seq[bool]
 
-proc measure(alt: Node, g: var GroupSpans): Branches =
+proc measure(alt: Node, g: var GroupSpans, flags: RegexFlags): Branches =
   ## [Branches] of the alternation ``alt``, its branches reduced already.
   for branch in alt.alternatives.view:
-    result.spans.add charSpan(branch, g)
+    result.spans.add charSpan(branch, g, flags)
     result.used.add usesCaptures(branch, g)
 
-proc dropped(b: Branches): bool =
-  ## [surelyEmpty] over the alternation as a whole.
-  var whole = spanOf(0, sure = false)
+proc whole(b: Branches): CharSpan =
+  ## The [charSpan] of the alternation as a whole.
+  result = spanOf(0, sure = false)
   for i, s in b.spans:
-    whole =
+    result =
       if i == 0:
         s
       else:
-        either(whole, s)
-  surelyEmpty(whole, true in b.used)
+        either(result, s)
+
+proc dropped(b: Branches): bool =
+  ## [surelyEmpty] over the alternation as a whole.
+  surelyEmpty(b.whole, true in b.used)
 
 proc divides(b: Branches): bool =
   ## Whether Oniguruma divides a look-behind whose body is this alternation
@@ -792,6 +913,26 @@ proc divides(b: Branches): bool =
       return false
     all = either(all, b.spans[i])
   not all.fixed
+
+proc checkLengths(alt: Node, b: Branches, g: var GroupSpans, flags: RegexFlags) =
+  ## [checkLength] over the look-behind body ``alt``, an alternation measured
+  ## ``b``, and over each look-behind ``tune_look_behind`` divides it into,
+  ## as it tunes each again.  ``(?<=xy*|a{65536})`` passes as a whole, its
+  ## first branch unbounded, and then fails as ``(?<=a{65536})``.  Only an
+  ## unbounded whole can hide a piece that long, and a body that drops is
+  ## never divided: ``(?<=xy*||a{65536})`` compiles.  A branch that is an
+  ## alternation is reduced, measured and divided again, as [addDivided]
+  ## does.
+  checkLength(b.whole)
+  if b.whole.hi >= 0 or dropped(b) or not divides(b):
+    return
+  for k, branch in alt.alternatives.view:
+    let inner = peelBareGroups(branch)
+    if inner != nil and inner.kind == nkAlternation:
+      reduceBody(inner, flags, fastPath = false)
+      checkLengths(inner, measure(inner, g, flags), g, flags)
+    else:
+      checkLength(b.spans[k])
 
 proc addDivided(
     flat: var seq[Node],
@@ -812,7 +953,7 @@ proc addDivided(
     # Its own branches were never reduced, so ``span`` is not what Oniguruma
     # measures it by now.
     reduceBody(inner, flags, fastPath = false)
-    let b = measure(inner, g)
+    let b = measure(inner, g, flags)
     if dropped(b):
       flat.add Node(kind: nkConcat, children: @[])
     elif divides(b):
@@ -825,11 +966,129 @@ proc addDivided(
   else:
     flat.add branch
 
-proc tuneLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags) =
+proc divide(alt: Node, b: Branches, g: var GroupSpans, flags: RegexFlags) =
+  ## Divide the look-behind body ``alt``, an alternation whose [Branches] are
+  ## ``b`` ([divides]): each branch is replaced by what it ends as
+  ## ([addDivided]).
+  var flat: seq[Node]
+  for k, branch in alt.alternatives.view:
+    addDivided(flat, branch, b.spans[k], b.used[k], g, flags)
+  alt.alternatives = flat
+
+proc readsGroup(node: Node): bool =
+  ## Whether a backreference or a call sits anywhere in ``node``: what
+  ## [lengthBounds] gives no fixed width in bytes where Oniguruma's length in
+  ## characters may be fixed, and what then shows the window apart (see
+  ## ``charsBackStart`` in ``engine``).
+  if node == nil:
+    return false
+  if node.kind in {nkBackreference, nkNamedBackref, nkSubexpCall}:
+    return true
+  for child in node.childNodes:
+    if readsGroup(child):
+      return true
+  false
+
+proc dotsIn(node: Node, g: var GroupSpans, seen: var seq[bool]): bool =
+  ## [takesClusters]' walk, with ``seen`` holding a slot per group and a last
+  ## one for the whole pattern.
+  if node == nil:
+    return false
+  case node.kind
+  of nkCharType:
+    return node.charType == ctDot
+  of nkLookaround:
+    return false
+  of nkBackreference, nkNamedBackref, nkSubexpCall:
+    var targets: seq[int]
+    case node.kind
+    of nkBackreference:
+      targets.add node.backrefIndex - 1
+    of nkNamedBackref:
+      for idx in g.names.namedGroupsRead(node.backrefName, node.backrefScope):
+        targets.add idx
+    else:
+      if node.callIndex > 0:
+        targets.add node.callIndex - 1
+      elif node.callName.len > 0:
+        for idx in g.names.namedGroupsRead(node.callName, EveryNamedGroup):
+          targets.add idx
+      else:
+        targets.add g.bodies.len # ``\g<0>``
+    for idx in targets:
+      if idx < 0 or idx > g.bodies.len or seen[idx]:
+        continue
+      seen[idx] = true
+      let body =
+        if idx == g.bodies.len:
+          g.root
+        else:
+          g.bodies[idx]
+      if dotsIn(body, g, seen):
+        return true
+    return false
+  else:
+    discard
+  for child in node.childNodes:
+    if dotsIn(child, g, seen):
+      return true
+  false
+
+proc takesClusters(piece: Node, g: var GroupSpans): bool =
+  ## Whether a ``.`` may take a whole grapheme cluster where ``piece``
+  ## counts it as one character: [charSpan] counts as Oniguruma does, and
+  ## under ``(?y{g})`` and ``(?y{w})`` the matcher's ``.`` is a cluster
+  ## (``charTypeAdvance`` in ``engine``).  It may be in ``piece``, or in a
+  ## group whose text a reference reads or a call runs, under whatever mode
+  ## the group ran in.  So in a pattern that sets either mode anywhere, any
+  ## ``.`` reached counts, and such a piece keeps its window.  A look-around
+  ## takes nothing.
+  if not g.clusterModes:
+    return false
+  var seen = newSeq[bool](g.bodies.len + 1)
+  dotsIn(piece, g, seen)
+
+proc stepsBack(piece: Node, span: CharSpan, g: var GroupSpans): int =
+  ## [fixedChars] of a ``piece`` that reads a group, measured ``span``:
+  ## ``span.lo``, or -1 where that varies, or where a ``.`` may take a
+  ## cluster ([takesClusters]) and step over more characters than counted.
+  if span.fixed and not takesClusters(piece, g): span.lo else: -1
+
+proc fixedChars(piece: Node, g: var GroupSpans, flags: RegexFlags): int =
+  ## The length in characters of the look-behind ``piece``, which Oniguruma
+  ## steps back over and runs with no window where the matcher would scan it
+  ## under one (``charsBackStart`` in ``engine``), or -1.  Only a piece that
+  ## reads a group ([readsGroup]) and whose length in characters is fixed
+  ## has one, and only where the matcher steps over as many ([stepsBack]).
+  if not readsGroup(piece):
+    return -1
+  stepsBack(piece, charSpan(piece, g, flags), g)
+
+proc markBranch(node: Node, k, count, chars: int) =
+  ## Record in ``lookAlts`` that the matcher runs branch ``k`` of the
+  ## ``count`` in the body of look-behind ``node`` from ``chars`` characters
+  ## back, with no window.  Nothing to record when ``chars`` is -1.
+  if chars < 0:
+    return
+  if node.lookAlts.len == 0:
+    node.lookAlts.setLen(count)
+  node.lookAlts[k].unclipped = true
+  node.lookAlts[k].chars = int32(chars)
+
+proc markBody(node: Node, chars: int) =
+  ## As [markBranch] for the whole body, in ``lookUnclipped`` and
+  ## ``lookChars``, which holds any length [checkLength] lets through.
+  if chars >= 0:
+    node.lookUnclipped = true
+    node.lookChars = uint16(chars)
+
+proc tuneLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags, reads: bool) =
   ## Give the positive look-behind ``node`` the shape ``tune_look_behind``
-  ## leaves it in: its body reduced ([reduceBody]), then dropped
-  ## ([surelyEmpty]), divided ([divides], recorded as ``lookDivided``), or
-  ## kept whole.
+  ## leaves it in: its body reduced ([reduceBody]) and its length checked
+  ## ([checkLength], [checkLengths]), then dropped ([surelyEmpty]), divided
+  ## ([divides], recorded as ``lookDivided``), or kept whole.  With ``reads``
+  ## (the pattern may read a group), each piece of it is measured for
+  ## [fixedChars] before the fast path pins it further.
   ##
   ## Then the fast path: a repeat that ``tune_next`` made possessive is pinned
   ## too, where Oniguruma keeps it.  That changes no answer: what follows such
@@ -841,24 +1100,68 @@ proc tuneLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags) =
   ensureGroups(g)
   reduceBody(node.lookBody, flags, fastPath = false)
   let peeled = peelBareGroups(node.lookBody)
+  var span: CharSpan
   if peeled != nil and peeled.kind == nkAlternation:
-    let b = measure(peeled, g)
+    let b = measure(peeled, g, flags)
+    checkLengths(peeled, b, g, flags)
     if dropped(b):
       node[] = Node(kind: nkConcat, children: @[])[]
       return
     if divides(b):
-      var flat: seq[Node]
-      for k, alt in peeled.alternatives.view:
-        addDivided(flat, alt, b.spans[k], b.used[k], g, flags)
-      peeled.alternatives = flat
+      divide(peeled, b, g, flags)
       node.lookDivided = true
-      for alt in peeled.alternatives.view:
+      for k, alt in peeled.alternatives.view:
+        if reads:
+          markBranch(node, k, peeled.alternatives.len, fixedChars(alt, g, flags))
         reduceBody(alt, flags, fastPath = true)
       return
-  elif surelyEmpty(charSpan(node.lookBody, g), usesCaptures(node.lookBody, g)):
-    node[] = Node(kind: nkConcat, children: @[])[]
-    return
+    span = b.whole
+  else:
+    span = charSpan(node.lookBody, g, flags)
+    checkLength(span)
+    if surelyEmpty(span, usesCaptures(node.lookBody, g)):
+      node[] = Node(kind: nkConcat, children: @[])[]
+      return
+  if reads and readsGroup(node.lookBody):
+    markBody(node, stepsBack(node.lookBody, span, g))
   reduceBody(node.lookBody, flags, fastPath = true)
+
+proc tuneNegLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags, reads: bool) =
+  ## Check the length of the negative look-behind ``node`` ([checkLength],
+  ## [checkLengths] over the pieces Oniguruma would divide it into), its body
+  ## reduced short of the fast path.  With ``reads``, a body that reads a
+  ## group then has the pieces Oniguruma runs from a fixed number of
+  ## characters back marked ([fixedChars]), divided as it divides them and
+  ## flattened as a positive one is ([addDivided]), since the matcher runs
+  ## each branch on its own: a first branch that divides again,
+  ## ``(?<!(?:\1|bb)|c)``, gives a piece per branch, each fixed or not on its
+  ## own.  An undivided body gives every branch the length of the whole.  A
+  ## body that reads no group shows no window apart, and is left undivided,
+  ## its pieces only checked.
+  reduceBody(node.lookBody, flags, fastPath = false)
+  let marks = reads and readsGroup(node.lookBody)
+  if marks:
+    ensureGroups(g)
+  let peeled = peelBareGroups(node.lookBody)
+  if marks and peeled != nil and peeled.kind == nkAlternation:
+    let b = measure(peeled, g, flags)
+    checkLengths(peeled, b, g, flags)
+    if divides(b):
+      divide(peeled, b, g, flags)
+      for k, alt in peeled.alternatives.view:
+        markBranch(node, k, peeled.alternatives.len, fixedChars(alt, g, flags))
+    elif b.whole.fixed:
+      for k, alt in peeled.alternatives.view:
+        if readsGroup(alt):
+          markBranch(node, k, peeled.alternatives.len, stepsBack(alt, b.whole, g))
+  else:
+    let span = charSpan(node.lookBody, g, flags)
+    checkLength(span)
+    if marks:
+      markBody(node, stepsBack(node.lookBody, span, g))
+    elif span.hi < 0 and peeled != nil and peeled.kind == nkAlternation:
+      # Oniguruma divides it even so, and checks each piece.
+      checkLengths(peeled, measure(peeled, g, flags), g, flags)
 
 proc reduceNegLookBehind(body: Node, flags: RegexFlags) =
   ## The reduction over a negative look-behind's body, fast path included.
@@ -874,37 +1177,44 @@ proc reduceNegLookBehind(body: Node, flags: RegexFlags) =
       if inner != nil and inner.kind == nkAlternation:
         reduceNegLookBehind(inner, flags)
 
-proc tuneLookBehindsIn(node: Node, g: var GroupSpans, flags: RegexFlags) =
-  ## [tuneLookBehind] or [reduceNegLookBehind] over every look-behind under
-  ## ``node``, innermost first: ``tune_look_behind`` tunes a body before it
-  ## measures it, so a look-behind inside is dropped by then, and
-  ## ``(?<=(b)|(?<=a*))`` is dropped whole.  ``flags`` are those in force
-  ## where ``node`` sits, threaded as [annotateLookaroundBounds] threads
-  ## them: they decide what Oniguruma's possessive rewrite compares and how
-  ## it unravels a string.
+proc tuneLookBehindsIn(node: Node, g: var GroupSpans, flags: RegexFlags, reads: bool) =
+  ## [tuneLookBehind], or [tuneNegLookBehind] and [reduceNegLookBehind], over
+  ## every look-behind under ``node``, innermost first: ``tune_look_behind``
+  ## tunes a body before it measures it, so a look-behind inside is dropped
+  ## by then, and ``(?<=(b)|(?<=a*))`` is dropped whole.  ``flags`` are those
+  ## in force where ``node`` sits, threaded as [annotateLookaroundBounds]
+  ## threads them: they decide what Oniguruma's possessive rewrite compares
+  ## and how it unravels a string.  ``reads`` as for [tuneLookBehinds].
   if node == nil:
     return
   case node.kind
   of nkLookaround:
-    tuneLookBehindsIn(node.lookBody, g, flags)
+    tuneLookBehindsIn(node.lookBody, g, flags, reads)
     case node.lookKind
     of lkBehind:
-      tuneLookBehind(node, g, flags)
+      tuneLookBehind(node, g, flags, reads)
     of lkNegBehind:
+      tuneNegLookBehind(node, g, flags, reads)
       reduceNegLookBehind(node.lookBody, flags)
     else:
       discard
   of nkFlagGroup:
-    tuneLookBehindsIn(node.flagBody, g, flags + node.flagsOn - node.flagsOff)
+    tuneLookBehindsIn(node.flagBody, g, flags + node.flagsOn - node.flagsOff, reads)
   else:
     for child in node.childNodes:
-      tuneLookBehindsIn(child, g, flags)
+      tuneLookBehindsIn(child, g, flags, reads)
 
-proc tuneLookBehinds*(ast: Node, names: seq[(string, int)], flags: RegexFlags) =
+proc tuneLookBehinds*(
+    ast: Node, names: seq[(string, int)], flags: RegexFlags, reads: bool
+) =
   ## Give every look-behind in ``ast`` the shape Oniguruma leaves it in (see
   ## the module documentation).  ``names`` maps each capture name to its
-  ## group, for the references and calls a body is measured through.  Must
-  ## run where [reduceBody] says: before every pass that reads a look-behind's
-  ## bounds, since a reduced body may become fixed-length.
+  ## group, for the references and calls a body is measured through.
+  ## ``reads`` says the pattern may hold a backreference or a call, without
+  ## which no look-behind is measured for [fixedChars].  Must run where
+  ## [reduceBody] says: before every pass that reads a look-behind's bounds,
+  ## since a reduced body may become fixed-length.
   var g = initGroupSpans(ast, names)
-  tuneLookBehindsIn(ast, g, flags)
+  g.unravel = true
+  g.rootFlags = flags
+  tuneLookBehindsIn(ast, g, flags, reads)
