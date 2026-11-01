@@ -306,6 +306,10 @@ type
       captureBodyKeepsFlags*: bool
         ## ``groupBodyKeepsFlags`` for a capturing group: the matcher skips
         ## only the ``chUndoFlags`` push, since the frame carries the span.
+      captureCalled*: bool
+        ## A call can run this group (Oniguruma's ``ND_ST_CALLED``), so where
+        ## it is written it runs as a call too: one more nest level open while
+        ## its body runs.  Set by ``markCalledGroups``.
       capturePos*: int32 ## See ``lookPos``.
     of nkNamedCapture:
       captureName*: string
@@ -313,6 +317,7 @@ type
       namedCaptureBody*: Node
       namedCaptureBodyKeepsFlags*: bool
         ## ``captureBodyKeepsFlags`` for the named spelling.
+      namedCaptureCalled*: bool ## ``captureCalled`` for the named spelling.
       namedCapturePos*: int32 ## See ``lookPos``.
     of nkGroup:
       groupBody*: Node
@@ -1100,6 +1105,10 @@ type
     levelBackrefs: bool
       ## The pattern uses a recursion-level backreference, so the matcher has
       ## to maintain the per-group capture history.
+    wholeCalled: bool
+      ## A ``\g<0>`` can run, so the whole pattern runs as a call: a match
+      ## starts one nest level deep, as Oniguruma's ``make_call_zero_body``
+      ## wraps it in a called group.
     leadRun: Node
       ## Leading greedy unbounded repeat over a one-way leaf, or nil. A failed
       ## run rules out starts inside it, so the scan jumps to its end.
@@ -1165,7 +1174,14 @@ const SearchStepsPerByte* = 100
   ## position moves, which keeps a search's work linear in the subject.  The
   ## densest pattern measured on the benchmark's code corpus,
   ## ``(\w+)\s+\1\b``, takes about 6.4 steps a byte.
-const DefaultMaxRecursionDepth* = 50
+const DefaultMaxRecursionDepth* = 20
+  ## Subroutine calls (``\g<name>``, ``(?1)``) that may be open at once.  A
+  ## call that would open one more fails, as Oniguruma's
+  ## ``DEFAULT_SUBEXP_CALL_MAX_NEST_LEVEL`` makes it; a call that returned
+  ## counts no more, so ``\g<n>*`` repeats any number of times.  Below one,
+  ## every call fails, and so does what opens one: a group a call can run,
+  ## where it is written, and every match under ``\g<0>``, which makes the
+  ## match a call.  Oniguruma reads a negative level as no limit.
 
 const UnsetSpan* = Span(a: -1, b: -1)
   ## Sentinel span returned by API accessors when a span is unset or out of
@@ -1329,6 +1345,10 @@ proc levelBackrefs*(r: Regex): bool {.inline.} =
   ## (``\k<name+1>``).  Only then does the matcher maintain the per-group
   ## capture history, which costs a write on every capture.
   r.levelBackrefs
+
+proc wholeCalled*(r: Regex): bool {.inline.} =
+  ## Whether a ``\g<0>`` can run, so that a match starts one call deep.
+  r.wholeCalled
 
 proc leadRun*(r: Regex): lent Node {.inline.} =
   ## Leading repeat whose run a failed attempt may skip, or nil.
@@ -1563,6 +1583,7 @@ proc initRegex*(
     semiEndAnchored: bool = false,
     semiEndDMax: int = -1,
     levelBackrefs: bool = true,
+    wholeCalled: bool = false,
     leadRun: Node = nil,
     leadLeaf: Node = nil,
     leadAnchors: set[AnchorKind] = {},
@@ -1594,6 +1615,7 @@ proc initRegex*(
     semiEndAnchored: semiEndAnchored,
     semiEndDMax: semiEndDMax,
     levelBackrefs: levelBackrefs,
+    wholeCalled: wholeCalled,
     leadRun: leadRun,
     leadLeaf: leadLeaf,
     leadAnchors: leadAnchors,
