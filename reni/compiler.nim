@@ -688,7 +688,7 @@ proc checkGroups(c: var RecursionCheck, node: Node) =
 
 proc checkNeverEndingRecursion(
     ast: Node, bodies: seq[Node], namedCaptures: seq[(string, int)], readsGroups: bool
-) =
+): seq[bool] =
   ## Reject a recursion that never ends, as Oniguruma does
   ## (``ONIGERR_NEVER_ENDING_RECURSION``): a group a call can run that calls
   ## itself on every path through it, or before it has consumed anything.
@@ -704,6 +704,9 @@ proc checkNeverEndingRecursion(
   ## where Oniguruma goes down every path too, and one past
   ## ``MaxRecursionCheckSteps``, as 5,000 groups that each call one that calls
   ## them all do.
+  ##
+  ## Returns the groups a call can run, by slot (slot 0 the whole pattern):
+  ## Oniguruma's ``ND_ST_CALLED``, which the matcher needs too.
   var c = RecursionCheck(
     ast: ast,
     bodies: bodies,
@@ -731,6 +734,7 @@ proc checkNeverEndingRecursion(
   # The whole pattern is the outermost group.
   c.checkGroup(0)
   c.checkGroups(ast)
+  move c.called
 
 proc holdsAbsent(
     node: Node,
@@ -1198,6 +1202,22 @@ proc markQuantBodyPure(node: Node): bool =
     node.condBodyPure = not condImpure
   else:
     discard
+
+proc markCalledGroups(node: Node, called: seq[bool]) =
+  ## Mark every capture a call can run, by [checkNeverEndingRecursion]'s
+  ## slots: Oniguruma compiles such a group as a call where it is written
+  ## too (``compile_bag_memory_node``), so it holds a nest level there.
+  if node == nil:
+    return
+  case node.kind
+  of nkCapture:
+    node.captureCalled = called[node.captureIndex + 1]
+  of nkNamedCapture:
+    node.namedCaptureCalled = called[node.namedCaptureIndex + 1]
+  else:
+    discard
+  for child in node.childNodes:
+    markCalledGroups(child, called)
 
 proc markGroupBodyKeepsFlags(node: Node): bool =
   ## Records on every group node -- ``nkGroup`` and both capturing spellings --
@@ -3269,8 +3289,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # Validate that every numeric / named reference points to an existing group.
   validateNumericRefs(ast, captureCount, namedCaptures)
   # After the reference checks, which Oniguruma makes first too.
+  var called: seq[bool]
   if p.sawCall:
-    checkNeverEndingRecursion(ast, bodies, namedCaptures, p.sawGroupRead)
+    called = checkNeverEndingRecursion(ast, bodies, namedCaptures, p.sawGroupRead)
   # What a look-behind body may hold, and absent operators reached through
   # calls.  After the reference checks, as Oniguruma reports those while
   # parsing and this one while tuning: ``(?<!(a))\5`` is a bad reference there.
@@ -3295,6 +3316,10 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   discard markQuantBodyPure(ast)
   # Same rule: a node this pass never reaches keeps the flag save.
   discard markGroupBodyKeepsFlags(ast)
+  # Same rule: a rebuilt capture would drop the mark.  Only a pattern holding
+  # a call has a group a call can run.
+  if called.len > 0:
+    markCalledGroups(ast, called)
   # Same rule, and before ``annotateLookaroundBounds``: ``lengthBounds``
   # reads the flag.  A node this pass never reaches just scans.  Skipped when
   # the pattern has no ``(?~...)`` at all.
@@ -3365,6 +3390,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       else:
         maxByteLen(ast, finalFlags),
     levelBackrefs = levelBackrefs,
+    wholeCalled = called.len > 0 and called[0],
     leadRun =
       if rfFindLongest in finalFlags:
         # findLongest fails every start on purpose, so no skip applies.

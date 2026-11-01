@@ -35,6 +35,7 @@ type
     ckRestoreAbsentEnd ## Absent abExpression: widen ``absentEnd`` back after ``expr``.
     ckEndCheckPos ## Lookbehind: succeed iff ctx.pos == targetPos.
     ckFindLongestRec ## findLongest top level: record longest, return false.
+    ckCallReturn ## After a called body, leave the call: depths, caller's flags.
 
   Frame = object
     ## Continuation frame. Frames live in a flat ``seq`` on ``MatchContext``;
@@ -80,6 +81,8 @@ type
       ecpTargetPos: int
     of ckFindLongestRec:
       flStartPos: int
+    of ckCallReturn:
+      crFlags: RegexFlags ## The caller's flags, put back on the way out.
 
   Subject = object
     ## Non-owning view of the subject string: starting a search must not
@@ -174,7 +177,9 @@ type
       ## which is what refusing the path amounts to here -- and a path that
       ## can reach the same match without one still narrows, since the scan
       ## simply backtracks into it.
-    recursionDepth: int ## for detecting never-ending recursion
+    recursionDepth: int
+      ## Subroutine calls open, held under ``maxRecursionDepth``: Oniguruma's
+      ## ``subexp_call_nest_counter``.
     captureStacks: seq[seq[Span]]
       ## per-group capture history for recursion-level backrefs
     groupRecursionDepth: seq[int] ## per-group recursion depth counter
@@ -189,7 +194,14 @@ type
       ## Where the search started; its step budget grows with every byte an
       ## attempt's start has moved away from here.
     rerunCount: int ## Backs [stepReruns]; nothing resets it.
-    maxRecursionDepth: int ## max subexpression recursion depth
+    maxRecursionDepth: int
+      ## The calls that may be open at once, one fewer than asked when a
+      ## ``\g<0>`` makes the whole pattern a call ([Regex.wholeCalled]), so
+      ## a match starts one deep as in Oniguruma: cheaper than starting
+      ## ``recursionDepth`` at 1 on every attempt.  Such a pattern under a
+      ## limit below one never gets here: the entry points refuse it first
+      ## ([callLimitRefuses]).  A negative limit counts as 0, so the
+      ## subtraction cannot wrap.
     calloutCounters: Table[string, int] ## (*COUNT) / (*MAX) tag counters
     callDepth: int
       ## ``matchNodeRecursive`` nesting depth. Paces the stack sampling and
@@ -376,6 +388,7 @@ type
     chSubexpScope ## leave a subexpression call: depths and flags
     chLookbehindAlt ## divided lookbehind: try the next alternative
     chUndoCallout ## put back the counter a callout incremented
+    chSubexpReturn ## re-enter a call that returned: depths and the body's flags
 
   Choice = object
     ## Backtrack stack entry. Reifies the choice points and undo work the
@@ -497,7 +510,9 @@ type
     of chUndoPos:
       upPos: int ## ``pos`` before a backreference advanced it.
     of chSubexpScope:
-      ssCapIdx: int32 ## Referenced group (0-based), or -1 for ``\g<0>``.
+      ssCapIdx: int32
+        ## Called group (0-based), or -1 for ``\g<0>`` and for a called group
+        ## run where it is written, which leave the group depths alone.
       ssFlags: RegexFlags ## Flags before the called group's flags.
     of chLookbehindAlt:
       lbaNode: NodeId ## Lookaround node under test.
@@ -511,6 +526,8 @@ type
       ucoNode: NodeId ## Callout node whose counter was incremented.
       ucoPrev: int
       ucoExisted: bool
+    of chSubexpReturn:
+      srFlags: RegexFlags ## Flags the called body ended with.
 
   SavedState = object
     ## Rollback snapshot.  ``capOff`` locates the capture vector's slot on
@@ -3591,8 +3608,9 @@ proc runCont(ctx: MatchContext, cont: ContId): bool =
       ctx.flags = modFlags
       ctx.graphemeMode = modGM
     ok
-  of ckQuantGreedyMore, ckQuantLazyMore:
-    # Repetitions belong to the loop; hand the chain back instead of recursing.
+  of ckQuantGreedyMore, ckQuantLazyMore, ckCallReturn:
+    # Repetitions and the way out of a call leave choices behind, which belong
+    # to the loop; hand the chain back instead of recursing.
     runContFromMachine(ctx, cont)
   of ckRestoreAbsentEnd:
     let savedEnd = ctx.frames[cont].reSavedEnd
@@ -3919,12 +3937,15 @@ proc runMachine(
 
   template unwindScopesToBase(): untyped =
     ## Exit subexpression scopes without restoring flags; depths must not leak.
+    ## A call entered and left in this machine has both entries, which cancel.
     for i in choiceBase ..< ctx.choicesLen:
       if ctx.choices[i].kind == chSubexpScope:
         dec ctx.recursionDepth
         let sci = int(ctx.choices[i].ssCapIdx)
         if sci >= 0 and sci < ctx.groupRecursionDepth.len:
           dec ctx.groupRecursionDepth[sci]
+      elif ctx.choices[i].kind == chSubexpReturn:
+        inc ctx.recursionDepth
 
   template succeed(): untyped =
     ## Downstream match succeeded; nothing below can be re-driven.
@@ -4254,31 +4275,46 @@ proc runMachine(
             node.captureBodyKeepsFlags
           else:
             node.namedCaptureBodyKeepsFlags
-        # As ``nkGroup`` above, but the frame carries the span and stays.
-        if not keepsFlags:
-          ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
-        let opened = ctx.clearOnOpen(index + 1)
-        # Capture recursion depth at entry time (before continuations modify it)
-        let myDepth =
-          if index < ctx.groupRecursionDepth.len:
-            ctx.groupRecursionDepth[index]
-          else:
-            -1
-        cont = pushFrame(
-          ctx,
-          Frame(
-            kind: ckCapture,
-            parent: cont,
-            cCapIdx: int32(index + 1),
-            cIndex: int32(index),
-            cMyDepth: int32(myDepth),
-            cOpened: opened,
-            cStartPos: ctx.pos,
-            cSavedFlags: ctx.flags,
-          ),
-        )
-        node = body
-        mode = mMatch
+        let called =
+          if node.kind == nkCapture: node.captureCalled else: node.namedCaptureCalled
+        if called and ctx.recursionDepth + 1 > ctx.maxRecursionDepth:
+          # A group a call can run is a call where it is written too, in
+          # Oniguruma, and fails at the nest limit as any call does.
+          mode = mFail
+        else:
+          # As ``nkGroup`` above, but the frame carries the span and stays.
+          if not keepsFlags:
+            ctx.pushChoice Choice(kind: chUndoFlags, ufFlags: ctx.flags)
+          if called:
+            # One call open while the body runs, left by the frame below the
+            # capture's.  The group's own depth, which levels read, stays.
+            inc ctx.recursionDepth
+            ctx.pushChoice Choice(kind: chSubexpScope, ssCapIdx: -1, ssFlags: ctx.flags)
+            cont = pushFrame(
+              ctx, Frame(kind: ckCallReturn, parent: cont, crFlags: ctx.flags)
+            )
+          let opened = ctx.clearOnOpen(index + 1)
+          # Capture recursion depth at entry time (before continuations modify it)
+          let myDepth =
+            if index < ctx.groupRecursionDepth.len:
+              ctx.groupRecursionDepth[index]
+            else:
+              -1
+          cont = pushFrame(
+            ctx,
+            Frame(
+              kind: ckCapture,
+              parent: cont,
+              cCapIdx: int32(index + 1),
+              cIndex: int32(index),
+              cMyDepth: int32(myDepth),
+              cOpened: opened,
+              cStartPos: ctx.pos,
+              cSavedFlags: ctx.flags,
+            ),
+          )
+          node = body
+          mode = mMatch
       of nkQuantifier:
         # ``normaliseInvertedRanges`` rewrote every inverted ``{n,m}``, so the
         # bounds and the kind are read as written.  The assert is erased under
@@ -4743,8 +4779,10 @@ proc runMachine(
       of nkSubexpCall:
         # Run the referenced body as the loop's next turn under a heap scope:
         # the capture frame is the existing `ckCapture` machinery, and one
-        # `chSubexpScope` entry owns the recursion depths and the flag switch
-        # a native frame used to hold until the whole match resolved.
+        # `chSubexpScope` entry owns the recursion depths and the flag switch.
+        # A `ckCallReturn` frame leaves the call once its body is through, as
+        # Oniguruma's RETURN does, so the depth counts the calls still open,
+        # not every call on the path: `\g<n>*` runs any number of times.
         var body {.cursor.}: Node = nil
         var captureIdx = -1
         if node.callIndex == 0:
@@ -4768,6 +4806,10 @@ proc runMachine(
           let savedFlags = ctx.flags
           if captureIdx >= 0 and captureIdx < ctx.regex[].groupFlags.len:
             ctx.flags = ctx.regex[].groupFlags[captureIdx]
+          elif captureIdx < 0:
+            # ``\g<0>`` runs the whole pattern under the flags a match starts
+            # with, not the caller's: ``x(?i:\g<0>|y)`` takes no ``X``.
+            ctx.flags = ctx.regex[].flags
           inc ctx.recursionDepth
           if captureIdx >= 0:
             if captureIdx >= ctx.groupRecursionDepth.len:
@@ -4777,6 +4819,8 @@ proc runMachine(
           ctx.pushChoice Choice(
             kind: chSubexpScope, ssCapIdx: int32(captureIdx), ssFlags: savedFlags
           )
+          cont =
+            pushFrame(ctx, Frame(kind: ckCallReturn, parent: cont, crFlags: savedFlags))
           if captureIdx >= 0 and captureIdx + 1 < ctx.groupSlots:
             let index = captureIdx
             let opened = ctx.clearOnOpen(index + 1)
@@ -4963,6 +5007,21 @@ proc runMachine(
           if ctx.keepStart != sp:
             ctx.flBestMatch.boundaries[0].a = min(ctx.keepStart, ctx.pos)
         mode = mFail # force backtracking for more alternatives
+      of ckCallReturn:
+        # Walking out of a called body: the call is no longer open, and the
+        # caller's flags come back.  The undo re-enters the call when
+        # backtracking retries inside the body, so it is pushed even with no
+        # choice above ``choiceBase``: the scope entry it pairs with may sit
+        # below it, and its pop would leave the call a second time.
+        # The group's own depth stays until the scope entry goes: it numbers
+        # the ``captureStacks`` slot the call's capture wrote, which leveled
+        # references read, so two calls in a row would share one
+        # (``(?<n>.)\g<n>\g<n>\k<n+2>`` on ``abcc`` matched).
+        ctx.pushChoice Choice(kind: chSubexpReturn, srFlags: ctx.flags)
+        dec ctx.recursionDepth
+        ctx.flags = ctx.frames[cont].crFlags
+        cont = ctx.frames[cont].parent
+        mode = mCont
     of mFail:
       if ctx.choicesLen <= choiceBase:
         releaseToBase()
@@ -5269,6 +5328,11 @@ proc runMachine(
           ctx.calloutCounters.del(tag)
         ctx.choicesLen = top
         mode = mFail
+      of chSubexpReturn:
+        inc ctx.recursionDepth
+        ctx.flags = ctx.choices[top].srFlags
+        ctx.choicesLen = top
+        mode = mFail
 
 proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool =
   ## Match ``node``, then run ``cont``. Leaves answer here so possessive,
@@ -5369,6 +5433,13 @@ proc noteScratchUsage(ctx: MatchContext) =
   ctx.choicesPeak = 0
   ctx.repPeak = 0
 
+proc callLimitRefuses(regex: Regex, maxRecursionDepth: int): bool {.inline.} =
+  ## Whether ``maxRecursionDepth`` leaves nothing to try: under ``\g<0>`` a
+  ## match is itself a call ([Regex.wholeCalled]), which a limit below one
+  ## fails before anything is read, as Oniguruma's level 0 fails its first
+  ## call.
+  regex.wholeCalled and maxRecursionDepth < 1
+
 proc bindLeafGates(ctx: MatchContext, regex: ptr Regex) {.inline.} =
   ## Borrow the pattern's [LeafGate] table for the match about to run.
   ## ``regex`` is a pointer, not a value: ``ctx.gates`` points into the
@@ -5455,7 +5526,7 @@ proc resetForRegex(
   ctx.attemptStepLimit = if stepLimit > 0: stepLimit else: int.high
   # The first attempt's budget: no steps charged and no distance moved.
   ctx.stepLimit = ctx.attemptStepLimit
-  ctx.maxRecursionDepth = maxRecursionDepth
+  ctx.maxRecursionDepth = max(maxRecursionDepth, 0) - ord(regex[].wholeCalled)
   # Reset the per-search counters that used to be zero-initialized by
   # allocating a fresh ``MatchContext``.  ``steps`` is the entry points' to
   # clear, before an early return can leave the last search's count.
@@ -5632,6 +5703,9 @@ proc searchImplInto*(
     ctx.flBestMatch.boundaries.setLen(0)
   writeNotFound(m)
   ctx.steps = 0
+  if callLimitRefuses(regex, maxRecursionDepth):
+    noteScratchUsage(ctx)
+    return
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
@@ -5991,6 +6065,9 @@ proc searchBackwardImplInto*(
     releaseBorrowed(ctx)
   writeNotFound(m)
   ctx.steps = 0
+  if callLimitRefuses(regex, maxRecursionDepth):
+    noteScratchUsage(ctx)
+    return
   # Quick reject: if the pattern requires a specific byte, check its presence.
   # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
   # literal, and such a literal is compared byte for byte, so the byte has to
@@ -6116,6 +6193,9 @@ proc matchAtImplInto*(
     releaseBorrowed(ctx)
   writeNotFound(m)
   ctx.steps = 0
+  if callLimitRefuses(regex, maxRecursionDepth):
+    noteScratchUsage(ctx)
+    return
   ctx.matchOptions = options
   # One attempt, whose budget ``resetForRegex`` sets: nothing to rerun.
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)

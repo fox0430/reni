@@ -1,7 +1,7 @@
 import std/[unittest, strutils]
 
 import ../reni
-import ../reni/[engine, types, parser]
+import ../reni/[types, parser]
 import ../reni/compiler {.all.}
 
 # Subroutine calls, recursion, and the recursions the compiler turns away.
@@ -65,29 +65,90 @@ suite "Subroutine calls and recursion":
     check m.boundaries[0] == 0 .. 2
 
   test "recursion depth limit does not crash":
-    let s = "a".repeat(60)
-    # Each subject character costs about one ``matchNodeRecursive`` level,
-    # and ``maxRecursionDepth`` (default 50) caps the subroutine nesting, so
-    # this stays near ~50 delegation levels: inside the byte budget in both
-    # exception models, and the partial match the depth cap bounds is the
-    # answer. Under a small ``-d:reniMaxStackBytes`` the same shape is what
-    # the budget guard turns into RegexLimitError. A segfault is neither.
-    when compileOption("exceptions", "setjmp") or engine.MaxStackBytes <= 64 * 1024:
-      try:
-        check search(s, re("(a(?1)?)")).found
-      except RegexLimitError:
-        discard
-    else:
-      check search(s, re("(a(?1)?)")).found
+    # A call is a turn of the matcher loop and holds no native frame, so 60
+    # nested calls never reach the stack budget.  ``maxRecursionDepth``
+    # (default 20) fails the 21st, the group's own place counted as a call,
+    # and the 20 characters the open calls took are the match.
+    let m = search("a".repeat(60), re("(a(?1)?)"))
+    check m.matchSpan == Span(a: 0, b: 20)
 
   test "maxRecursionDepth bounds recursion before the call depth guard does":
     # The public maxRecursionDepth is only meaningful if it is reachable: the
     # call depth guard must not fire first and turn a bounded partial match
-    # into an error. Subroutine calls hold no native frame per level, so 40
-    # characters fit every budget on every build and the depth cap answers.
-    let m = search("a".repeat(40), re("(a(?1)?)"), maxRecursionDepth = 50)
+    # into an error. Subroutine calls hold no native frame per level, so 60
+    # characters fit every budget on every build and the depth cap answers
+    # with the 50 the open calls took.
+    let m = search("a".repeat(60), re("(a(?1)?)"), maxRecursionDepth = 50)
     check m.found
-    check m.matchSpan == Span(a: 0, b: 40)
+    check m.matchSpan == Span(a: 0, b: 50)
+
+  test "a call that returned no longer counts toward maxRecursionDepth":
+    # The depth counts the calls still open, as Oniguruma's nest counter does,
+    # so a call repeated in a loop runs any number of times.  A Swift grammar's
+    # operator pattern missed a ``//===`` banner of 80 characters.
+    let m = search("//" & "=".repeat(78), re("(?<oph>[/=])\\g<oph>*$"))
+    check m.found
+    check m.matchSpan == Span(a: 0, b: 80)
+    let r = re("\\A\\g<r>\\g<r>\\g<r>\\z(?<r>ab){0}")
+    check search("ababab", r, maxRecursionDepth = 1).found
+
+  test "the default depth is Oniguruma's nest limit, its own place counted":
+    # Twenty calls may be open, as in Oniguruma, where a group a call can run
+    # is a call where it is written too: 20 parentheses deep is 20 calls, and
+    # at 21 the outermost group fails and the search takes the 20 inside.
+    let r = re("(?<p>\\((?:[^()]|\\g<p>)*\\))")
+    let at20 = search("(".repeat(20) & "x" & ")".repeat(20), r)
+    check at20.matchSpan == Span(a: 0, b: 41)
+    let at21 = search("(".repeat(21) & "x" & ")".repeat(21), r)
+    check at21.matchSpan == Span(a: 1, b: 42)
+    # ``\g<0>`` makes the whole pattern a call, so a match starts one deep.
+    let whole = re("a\\g<0>?b")
+    check search("a".repeat(20) & "b".repeat(20), whole).matchSpan == Span(a: 0, b: 40)
+    check search("a".repeat(21) & "b".repeat(21), whole).matchSpan == Span(a: 1, b: 41)
+
+  test "a limit below one leaves a \\g<0> pattern nothing to match":
+    # ``\g<0>`` makes a match a call, which Oniguruma's level 0 fails before
+    # anything is read; at one, only the call inside fails.
+    let whole = re("a\\g<0>?b")
+    check not search("ab", whole, maxRecursionDepth = 0).found
+    check not searchBackward("ab", whole, maxRecursionDepth = 0).found
+    check not matchAt("ab", whole, maxRecursionDepth = 0).found
+    check search("aabb", whole, maxRecursionDepth = 1).matchSpan == Span(a: 1, b: 3)
+    # A negative limit is read as zero, ``int.low`` included.
+    check not search("ab", whole, maxRecursionDepth = int.low).found
+    check search("x", re("x"), maxRecursionDepth = int.low).found
+
+  test "backtracking into a call that returned opens it again":
+    # The lazy call is skipped, the body returns, and ``\z`` fails; retrying
+    # the call then nests one inside the call open again: two, past a limit
+    # of one.
+    let r = re("\\A\\g<r>\\z(?<r>a\\g<r>??b?){0}")
+    check not search("aabb", r, maxRecursionDepth = 1).found
+    check search("aabb", r, maxRecursionDepth = 2).matchSpan == Span(a: 0, b: 4)
+
+  test "a call that returned keeps its level for a leveled reference":
+    # A call's capture writes the level slot its group depth names, and the
+    # depth stays until backtracking leaves the call.  Lowered when the call
+    # returned, two calls in a row shared one slot.  Both answers are
+    # Oniguruma's.
+    check not search("abcc", re("(?<n>.)\\g<n>\\g<n>\\k<n+2>")).found
+    let m = search("abab", re("(?<n>.(?:\\g<n>|))\\g<n>\\k<n+2>"))
+    check m.matchSpan == Span(a: 0, b: 4)
+
+  test "a call gives the caller its flags back":
+    # The called group runs under the flags where it is written, and what
+    # follows the call under the caller's.
+    let m = search("aaB", re("(?<n>a)(?i:\\g<n>b)"))
+    check m.found
+    check m.matchSpan == Span(a: 0, b: 3)
+    check not search("aAb", re("(?<n>a)(?i:\\g<n>b)")).found
+    # Backtracking into the returned body runs it under its own flags again.
+    let back = search("xYYc", re("\\g<n>c(?<n>(?i)x(?:y|yy)){0}"))
+    check back.found
+    check back.matchSpan == Span(a: 0, b: 4)
+    # ``\g<0>`` is written where the pattern starts, under no ``(?i)``.
+    check not search("xXy", re("x(?i:\\g<0>|y)")).found
+    check search("xxy", re("x(?i:\\g<0>|y)")).matchSpan == Span(a: 0, b: 3)
 
 suite "Mutual recursion detection":
   test "direct self-recursion (?<a>(?&a)) detected":
