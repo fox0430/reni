@@ -1,7 +1,7 @@
-import std/[unittest, strutils, options, unicode]
+import std/[unittest, strutils, options, unicode, importutils]
 
 import ../reni
-import ../reni/engine
+import ../reni/engine {.all.}
 import ../reni/types
 import ../reni/unicode_utils
 
@@ -1351,6 +1351,56 @@ suite "the step budget of a search":
       check m.boundaries[0] == 30 .. 105
       check m.boundaries[1] == 102 .. 103
       check (ctx.stepReruns > reruns) == (limit > 0)
+
+  test "an attempt in the search's first block of bytes runs once":
+    # The attempt at 0 charges a few steps, and the one at 2 gives up.  At
+    # 160,000 a block is 100 bytes, so every attempt of this 43-byte search is
+    # in the first and its budget is the limit: ``stepLimit`` does not lag
+    # and the give-up is not run again.  Earned a byte at a time, as below a
+    # limit of 3,200, the attempt at 2 is owed the steps the one at 0 charged,
+    # and pays the limit a second time to collect them.
+    let subject = "ab" & "a".repeat(40) & "!"
+    let r = re("(?:a|aa)+$")
+    let ctx = newMatchContext()
+    var m: Match
+    let reruns = ctx.stepReruns
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, subject, r, m, stepLimit = 160_000)
+    check ctx.stepsUsed == 160_001
+    check ctx.stepReruns == reruns
+    expect RegexLimitError:
+      discard searchIntoCtx(ctx, subject, r, m, stepLimit = 1_000)
+    check ctx.stepsUsed > 1_001
+    check ctx.stepReruns > reruns
+
+  test "the search earns its bytes in whole blocks":
+    # At 16,000 a block is 10 bytes and earns 1,000 steps; the start has
+    # moved from 40, either way.
+    privateAccess(MatchContext)
+    let ctx = newMatchContext()
+    ctx.attemptStepLimit = 16_000
+    ctx.budgetOrigin = 40
+    check stepBudget(ctx, 0, 40) == 16_000
+    # In the first block the budget is the limit, whatever went before.
+    check stepBudget(ctx, 5, 49) == 16_000
+    check stepBudget(ctx, 5, 31) == 16_000
+    # One block earned: the attempt's own limit is the lesser.
+    check stepBudget(ctx, 5, 50) == 16_005
+    # Two blocks, 25 bytes: the search's is.
+    check stepBudget(ctx, 5_000, 65) == 18_000
+    check stepBudget(ctx, 5_000, 15) == 18_000
+    # Below a limit of 3,200 a block is one byte.
+    ctx.attemptStepLimit = 1_000
+    check stepBudget(ctx, 5, 41) == 1_005
+    check stepBudget(ctx, 500, 43) == 1_300
+    ctx.attemptStepLimit = 3_199
+    check stepBudget(ctx, 500, 43) == 3_499
+    # At 3,200 a block is two bytes: of the 3 moved, 2 count.
+    ctx.attemptStepLimit = 3_200
+    check stepBudget(ctx, 500, 43) == 3_400
+    # Unlimited stays unlimited.
+    ctx.attemptStepLimit = int.high
+    check stepBudget(ctx, 5_000, 65) == int.high
 
   test "a search the required byte refuses charges nothing":
     # The quick reject returns before any attempt; the count of the search
