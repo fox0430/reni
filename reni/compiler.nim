@@ -2297,22 +2297,24 @@ proc requiredByteRegion(
     result.prefix = prefix
 
 proc foldedLeadBytes(cp: int32): set[uint8] =
-  ## The lead byte of every subject character that can stand where the ASCII
-  ## ``cp`` stands under ``(?i)``: its simple-fold variants (``ſ`` for ``s``,
-  ## ``K`` for ``k``), and every character whose multi-character fold holds
-  ## it (``ß`` for ``s``, ``ﬁ`` for ``i``), which [stringAdvance] matches
-  ## against a run of pattern characters at once.  Taken from the tables the
-  ## matcher reads, so it cannot drift from them.
-  var buf: array[4, char]
+  ## The lead bytes of every subject character that can stand where the
+  ## ASCII ``cp`` stands under ``(?i)``: its simple-fold variants (``ſ`` for
+  ## ``s``, ``K`` for ``k``), and every character whose multi-character fold
+  ## holds it (``ß`` for ``s``, ``ﬁ`` for ``i``), which [stringAdvance]
+  ## matches against a run of pattern characters at once.  A non-ASCII one
+  ## counts in its overlong forms too ([readLeadBytes]), which the decode
+  ## reads as it.  Taken from the tables the matcher reads, so it cannot
+  ## drift from them.
   for v in caseFoldVariants(Rune(cp)):
-    discard utf8Encode(int32(v), buf)
-    result.incl uint8(buf[0])
+    if int32(v) < 0x80:
+      result.incl uint8(v)
+    else:
+      result.incl readLeadBytes(int32(v))
   result.incl uint8(cp)
   for f in MultiCharFolds:
     for j in 0 ..< f.len:
       if caseInsensitiveMatch(Rune(f.expansion[j]), Rune(cp), {rfIgnoreCase}):
-        discard utf8Encode(f.source, buf)
-        result.incl uint8(buf[0])
+        result.incl readLeadBytes(f.source)
 
 const FoldedLeadBytes = block:
   ## [foldedLeadBytes] for every ASCII character, worked out once.
@@ -2622,8 +2624,17 @@ proc reqWalk(w: var ReqWalk, node: Node, flags: RegexFlags) =
       var run = w.run
       let runAtStart = w.runAtStart
       let atStart = w.atStart
+      # What it reads at the start stays even where the match consumes the
+      # scan's byte: ``(?=enum\b)\w+`` scans for ``e``, and one ``memmem``
+      # for ``enum`` turns away the lines where every ``e`` would be tried.
+      # A run it goes on from is the match's own (``a(?=bc)``), and stays
+      # with the scan.
+      let skipStart = w.skipStart
+      if w.run.len == 0:
+        w.skipStart = false
       w.reqWalk(node.lookBody, flags)
       w.flushRun()
+      w.skipStart = skipStart
       w.run = run
       w.runAtStart = runAtStart
       w.atStart = atStart
@@ -2661,22 +2672,25 @@ proc requiredLiteral(
     ast: Node,
     flags: RegexFlags,
     fc: FirstCharInfo,
+    fcConsumed: bool,
     rb: RequiredByteInfo,
     leadAnchors: set[AnchorKind],
     semiEnd: bool,
 ): RequiredLiteral =
   ## What every match holds at or after the search start, for the search to
   ## test before it tries a position: the longest byte string, or else the
-  ## byte set least likely to occur.  What opens every match is left out
-  ## while ``fc`` scans for its first byte anyway, and so is the byte ``rb``
-  ## already tests.  Nothing is taken where ``\A``, ``\G`` or ``\Z`` leaves
-  ## one start to try: reading the subject for it would cost more than the
+  ## byte set least likely to occur.  What the match consumes first is left
+  ## out while ``fc`` scans for its first byte anyway (``fcConsumed``: the
+  ## match consumes that byte, not only a look-ahead reads it), and so is the
+  ## byte ``rb`` already tests.  What a look-ahead reads at the start stays
+  ## ([reqWalk]).  Nothing is taken where ``\A``, ``\G`` or ``\Z`` leaves one
+  ## start to try: reading the subject for it would cost more than the
   ## attempt it might save.
   if fc.kind == fcAnchorStart or akSearchBegin in leadAnchors or semiEnd:
     return
   var w = ReqWalk(
     atStart: true,
-    skipStart: fc.kind in {fcByte, fcByteSet},
+    skipStart: fcConsumed,
     skipByte:
       if rb.valid:
         int(rb.byte)
@@ -2695,7 +2709,7 @@ proc requiredLiteral(
   elif w.set.weight >= 0:
     # A set no less likely than the first-byte scan's own only reads the
     # subject a second time.
-    if w.skipStart:
+    if fc.kind in {fcByte, fcByteSet}:
       let scan =
         if fc.kind == fcByte:
           {fc.byte}
@@ -3364,7 +3378,18 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       nil
     else:
       leadFirstLeaf(ast, finalFlags)
-  let firstChar = extractFirstChar(ast, finalFlags)
+  # The hint without the look-aheads first: whether it holds says whether
+  # the byte the scan looks for is one the match consumes
+  # ([requiredLiteral]).
+  let consumedFirst = extractFirstChar(ast, finalFlags)
+  let firstChar =
+    if p.sawAhead:
+      extractSearchFirstChar(ast, finalFlags)
+    else:
+      consumedFirst
+  # The look-aheads only narrow a byte hint ([meetFirstChar]), so the scan's
+  # bytes are then some of these.
+  let firstConsumed = consumedFirst.kind in {fcByte, fcByteSet}
   let requiredByte =
     requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags))
   let leadAnchors = leadAnchorSet(ast, finalFlags)
@@ -3380,8 +3405,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     firstCharInfo = firstChar,
     literalScan = hasLiteralPrefix(ast, finalFlags),
     requiredByte = requiredByte,
-    requiredLit =
-      requiredLiteral(ast, finalFlags, firstChar, requiredByte, leadAnchors, semiEnd),
+    requiredLit = requiredLiteral(
+      ast, finalFlags, firstChar, firstConsumed, requiredByte, leadAnchors, semiEnd
+    ),
     semiEndAnchored = semiEnd,
     # [anchorDMax] parts from [maxByteLen] only over an absent operator.
     semiEndDMax =
