@@ -1646,8 +1646,12 @@ proc asciiFoldBytes(b: uint8): set[uint8] =
     {b}
 
 proc byteSetHint(bs: set[uint8]): FirstCharInfo =
-  ## A multi-byte lead hint.  Every ``fcByteSet`` is built through this, so the
-  ## search reads ``pair`` rather than walking the set per call.
+  ## A multi-byte lead hint, with ``pair`` filled where ``bs`` holds two
+  ## bytes, so the search reads ``pair`` rather than walking the set per call.
+  ## Every ``fcByteSet`` is built through this but in [firstCharFromRune],
+  ## which fills a letter's case pair itself, in the same ascending order,
+  ## and in [extractFirstChar]'s string arm, whose sets hold three bytes or
+  ## more.
   result = FirstCharInfo(kind: fcByteSet, bytes: bs)
   if bs.card == 2:
     var i = 0
@@ -1817,6 +1821,39 @@ proc isMultiCharFoldPairStart*(r1, r2: Rune): bool =
       return true
   false
 
+proc readLeadBytes*(cp: int32): set[uint8] =
+  ## For a non-ASCII ``cp``: every byte that leads a sequence the matcher
+  ## reads as it.  Its own lead byte, and those of its overlong forms, which
+  ## [decodeAt] does not refuse (``\xE0\x85\xBF`` is ``ſ``).  ``leafgate``
+  ## holds it to [decodeAt]'s reading.
+  result.incl utf8LeadByte(cp)
+  if cp < 0x800:
+    result.incl 0xE0'u8
+  if cp < 0x10000:
+    result.incl 0xF0'u8
+
+const
+  LongSLeads = readLeadBytes(0x017F) ## ``ſ``, which folds with ``s``.
+  KelvinSignLeads = readLeadBytes(0x212A) ## ``K``, which folds with ``k``.
+
+proc foldPairSourceLeads*(r1, r2: Rune): set[uint8] =
+  ## For an ASCII ``r1``: the bytes leading the characters whose
+  ## multi-character fold may start with ``r1`` and ``r2`` ([readLeadBytes]:
+  ## 0xEF and 0xF0 for ``fi``, from ``ﬁ``), one of which matches both at
+  ## once.  An ASCII ``r2`` is compared by its case alone.  A non-ASCII
+  ## one may fold with an ASCII second character (``ſ`` with ``s``, as in
+  ## ``sſ`` against ``ß``), so every fold ``r1`` starts counts for it.  Empty
+  ## where none does, and for a non-ASCII ``r1``.  ``leafgate`` holds this to
+  ## every pair spelling the matcher compares equal to an expansion.
+  let c1 = asciiLowerCp(int32(r1))
+  if c1 >= 0x80 or not canStartFoldExpansion(Rune(c1)):
+    return
+  let anySecond = int32(r2) >= 0x80
+  let c2 = asciiLowerCp(int32(r2))
+  for f in MultiCharFolds:
+    if f.expansion[0] == c1 and (anySecond or f.expansion[1] == c2):
+      result.incl readLeadBytes(f.source)
+
 const WidestUsefulHint = 255
   ## Above this many bytes a hint skips too little to pay for its per-position
   ## test. Only the full set is excluded: one load and bit test per byte is
@@ -1840,9 +1877,21 @@ proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
   if cp < 128:
     let b = uint8(cp)
     if rfIgnoreCase in flags:
-      if hasNonAsciiFoldEquiv(cp):
-        return FirstCharInfo(kind: fcNone)
-      byteSetInfo(asciiFoldBytes(b))
+      # Built here rather than through [byteSetInfo]: its ``card`` is a
+      # libgcc call, and a ``(?i)`` keyword list asks it once a branch.
+      let lower = b or 0x20'u8
+      if lower < uint8('a') or lower > uint8('z'):
+        return FirstCharInfo(kind: fcByte, byte: b)
+      let upper = lower - 32
+      if hasNonAsciiFoldEquiv(cp) and rfIgnoreCaseAscii notin flags:
+        # ``ſ`` (U+017F) folds with ``s``, ``K`` (U+212A) with ``k``; the
+        # fold classes ``leafgate`` holds to these two.  ``(?I)`` folds
+        # neither ([caseInsensitiveMatch]).
+        let other = if lower == uint8('s'): LongSLeads else: KelvinSignLeads
+        return FirstCharInfo(kind: fcByteSet, bytes: {upper, lower} + other)
+      FirstCharInfo(
+        kind: fcByteSet, bytes: {upper, lower}, pair: [upper, lower], pairOk: true
+      )
     else:
       # [byteSetInfo] would ask ``card``, a libgcc call without ``-mpopcnt``,
       # what one byte already answers.
@@ -2178,7 +2227,7 @@ const ReduceTable*: array[6, array[6, ReduceAction]] = [
 ]
 
 proc extractFirstCharUncached(
-  node: Node, flags: RegexFlags, cache: FirstCharCache
+  node: Node, flags: RegexFlags, cache: FirstCharCache, ahead: bool
 ): FirstCharInfo
 
 proc extractFirstChar*(
@@ -2190,19 +2239,51 @@ proc extractFirstChar*(
   if node == nil:
     return FirstCharInfo(kind: fcNone)
   if cache.isNil:
-    return extractFirstCharUncached(node, flags, nil)
+    return extractFirstCharUncached(node, flags, nil, false)
   # ``hasKey`` then ``[]`` rather than ``getOrDefault``: the latter compares
   # the hit against the default, and ``FirstCharInfo`` is a case object, for
   # which Nim generates no ``==``.
   let key = (cast[uint](node), flags)
   if cache.hasKey(key):
     return cache[key]
-  result = extractFirstCharUncached(node, flags, cache)
+  result = extractFirstCharUncached(node, flags, cache, false)
   cache[key] = result
 
+proc extractSearchFirstChar*(node: Node, flags: RegexFlags): FirstCharInfo =
+  ## [extractFirstChar], also reading the first byte a positive look-ahead's
+  ## body needs, which is a byte of the position the look-ahead is tried at.
+  ## Only for the search's start positions: a look-ahead reads past a
+  ## look-behind's clip, where ``altFirst`` sees no byte
+  ## ([altBranchPossible]), so a branch hint taken from one would pass over a
+  ## branch that holds.  Hence no cache, whose hints are ``altFirst``'s.
+  if node == nil:
+    return FirstCharInfo(kind: fcNone)
+  extractFirstCharUncached(node, flags, nil, true)
+
+proc meetFirstChar(seen, info: FirstCharInfo): FirstCharInfo =
+  ## ``info`` narrowed by ``seen``, a byte hint a look-ahead states for the
+  ## same position: a start needs a byte both allow.  Bytes none could start
+  ## with (nothing matches) narrow nothing, and keep ``info``.  So a byte
+  ## hint only ever narrows to another byte hint, which ``re`` rests on when
+  ## it reads ``firstConsumed`` off the hint without the look-aheads.
+  if seen.kind notin {fcByte, fcByteSet} or info.kind notin {fcByte, fcByteSet}:
+    return info
+  let all = info.toByteSet
+  let both = seen.toByteSet * all
+  if both == {} or both == all:
+    return info
+  byteSetInfo(both)
+
 proc extractFirstCharUncached(
-    node: Node, flags: RegexFlags, cache: FirstCharCache
+    node: Node, flags: RegexFlags, cache: FirstCharCache, ahead: bool
 ): FirstCharInfo =
+  template sub(n: Node, f: RegexFlags): FirstCharInfo =
+    # The walk that reads look-aheads never reaches the cache.
+    if ahead:
+      extractSearchFirstChar(n, f)
+    else:
+      extractFirstChar(n, f, cache)
+
   case node.kind
   of nkAnchor:
     case node.anchor
@@ -2219,21 +2300,37 @@ proc extractFirstCharUncached(
   of nkString:
     if node.runes.len > 0:
       let info = firstCharFromRune(int32(node.runes[0]), flags)
-      if info.kind != fcNone and rfIgnoreCase in flags and node.runes.len >= 2:
-        if isMultiCharFoldPairStart(node.runes[0], node.runes[1]):
-          return FirstCharInfo(kind: fcNone)
+      # A character can match the first two at once (``ﬁ`` for ``fi``), where
+      # multi-character folds apply: under ``(?i)``, but not ``(?I)``.
+      if rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags and
+          info.kind == fcByteSet and node.runes.len >= 2:
+        let leads = foldPairSourceLeads(node.runes[0], node.runes[1])
+        if leads != {}:
+          # A letter's case pair and a non-ASCII lead at least: three bytes or
+          # more, so no ``pair``, and no [byteSetInfo] (``card``, a libgcc
+          # call, once a branch of a ``(?i)`` keyword list).
+          return FirstCharInfo(kind: fcByteSet, bytes: info.bytes + leads)
       info
     else:
       FirstCharInfo(kind: fcNone)
   of nkConcat:
     var currentFlags = flags
     var lineStart = false
+    # What the look-aheads before the first consuming child ask of the byte
+    # the match starts on (``ahead`` only).  It waits for that child's own
+    # hint to narrow, and answers alone where the child states none.
+    var seen = FirstCharInfo(kind: fcNone)
     for child in node.children.view:
       # Accumulate flags from bare flag groups (e.g., (?i) sets case-insensitive)
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
         continue
-      let info = extractFirstChar(child, currentFlags, cache)
+      let info = sub(child, currentFlags)
+      if child.kind == nkLookaround:
+        # Zero-width; a byte hint at most (the arm below).
+        if info.kind != fcNone:
+          seen = meetFirstChar(seen, info)
+        continue
       if info.kind == fcLineStart:
         # ``^`` is zero-width: remember it, but keep looking for a byte hint,
         # which skips over more of the subject than jumping line to line.
@@ -2246,50 +2343,84 @@ proc extractFirstCharUncached(
           continue
         break
       if info.kind != fcNone:
-        return info
+        return meetFirstChar(seen, info)
       # Zero-width nodes: skip and try the next child
-      if child.kind in
-          {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
+      if child.kind in {nkAnchor, nkCalloutMax, nkCalloutCount, nkCalloutCmp}:
         continue
       break # Non-zero-width node that returned fcNone: give up
+    # ``^`` before a look-ahead's byte: ``^(?= )`` tries a line once, where a
+    # scan for the space would try every space in it.
     if lineStart:
       FirstCharInfo(kind: fcLineStart)
+    elif seen.kind != fcNone:
+      seen
     else:
       FirstCharInfo(kind: fcNone)
   of nkCapture:
-    extractFirstChar(node.captureBody, flags, cache)
+    sub(node.captureBody, flags)
   of nkNamedCapture:
-    extractFirstChar(node.namedCaptureBody, flags, cache)
+    sub(node.namedCaptureBody, flags)
   of nkGroup:
-    extractFirstChar(node.groupBody, flags, cache)
+    sub(node.groupBody, flags)
   of nkFlagGroup:
     if node.flagBody != nil:
-      extractFirstChar(node.flagBody, flags + node.flagsOn - node.flagsOff, cache)
+      sub(node.flagBody, flags + node.flagsOn - node.flagsOff)
     else:
       FirstCharInfo(kind: fcNone)
   of nkQuantifier:
     if node.quantMin >= 1:
-      extractFirstChar(node.quantBody, flags, cache)
+      sub(node.quantBody, flags)
     else:
       FirstCharInfo(kind: fcNone)
   of nkAlternation:
     if node.alternatives.len == 0:
       return FirstCharInfo(kind: fcNone)
-    var merged = extractFirstChar(node.alternatives[0], flags, cache)
-    if merged.kind == fcNone:
+    let first = sub(node.alternatives[0], flags)
+    if first.kind notin {fcByte, fcByteSet}:
+      var merged = first
+      for i in 1 ..< node.alternatives.len:
+        if merged.kind == fcNone:
+          break
+        merged = mergeFirstChar(merged, sub(node.alternatives[i], flags))
       return merged
+    # Bytes from every branch, joined once: [mergeFirstChar] asks ``card``,
+    # a libgcc call, twice a branch, and a keyword list has hundreds.
+    var bytes = first.toByteSet
+    var single = first.kind == fcByte
     for i in 1 ..< node.alternatives.len:
-      merged =
-        mergeFirstChar(merged, extractFirstChar(node.alternatives[i], flags, cache))
-      if merged.kind == fcNone:
-        return merged
-    merged
+      let h = sub(node.alternatives[i], flags)
+      case h.kind
+      of fcByte:
+        single = single and h.byte == first.byte
+        bytes.incl h.byte
+      of fcByteSet:
+        single = false
+        bytes = bytes + h.bytes
+      else:
+        return FirstCharInfo(kind: fcNone)
+    if single:
+      first
+    else:
+      byteSetHint(bytes)
   of nkAtomicGroup:
-    extractFirstChar(node.atomicBody, flags, cache)
+    sub(node.atomicBody, flags)
   of nkCharType:
     byteSetInfo(charTypeBytes(node.charType))
   of nkCharClass:
     classFirstChar(node, flags)
+  of nkLookaround:
+    # A positive look-ahead is tried where it stands, so the first byte its
+    # body needs is the byte there.  A byte hint only: an anchor its body
+    # tests (``(?=^)``) is no anchor of the pattern's own the scan may jump
+    # by.
+    if ahead and node.lookKind == lkAhead:
+      let info = sub(node.lookBody, flags)
+      if info.kind in {fcByte, fcByteSet}:
+        info
+      else:
+        FirstCharInfo(kind: fcNone)
+    else:
+      FirstCharInfo(kind: fcNone)
   else:
     FirstCharInfo(kind: fcNone)
 

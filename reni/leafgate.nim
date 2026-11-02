@@ -175,6 +175,41 @@ proc foldSourceRunesOf(): array[MultiCharFolds.len, FoldSourceRunes] =
 
 const FoldSourceRunesTable = foldSourceRunesOf()
 
+proc decodeLeads(cp: int32): set[uint8] =
+  ## Every byte leading a sequence [decodeAt] reads as the non-ASCII ``cp``:
+  ## it masks the lead's payload bits and checks neither the continuation
+  ## bytes nor overlong forms.
+  for b in 0'i32 .. 255'i32:
+    let n = encLen(uint8(b))
+    if n > 1 and cp shr (6 * (n - 1)) == (b and (0x7F'i32 shr n)):
+      result.incl uint8(b)
+
+static:
+  # [extractFirstChar] lets a ``(?i)`` string start where one subject
+  # character matches its first two at once, at the bytes
+  # [foldPairSourceLeads] names, and its ``s`` / ``k`` hint adds the
+  # [readLeadBytes] of ``ſ`` / ``K`` (the fold classes the check below holds
+  # to those two).  For every spelling of an expansion's first two that the
+  # matcher compares equal to it (a shared simple case fold), every byte that
+  # leads a subject character read as the expansion's source must be named,
+  # or the scan would pass the match over.  A non-ASCII first character takes
+  # no ``(?i)`` hint at all.
+  for cp in [0x017F'i32, 0x212A'i32]:
+    doAssert readLeadBytes(cp) == decodeLeads(cp), "a lenient form is no hint"
+  for i, f in MultiCharFolds:
+    var need: set[uint8]
+    for k in 0 ..< FoldSourceRunesTable[i].len:
+      let leads = decodeLeads(FoldSourceRunesTable[i].runes[k])
+      doAssert readLeadBytes(FoldSourceRunesTable[i].runes[k]) == leads,
+        "a lenient form of a fold source is no hint"
+      need = need + leads
+    for v0 in caseFoldVariants(Rune(f.expansion[0])):
+      if int32(v0) >= 0x80:
+        continue
+      for v1 in caseFoldVariants(Rune(f.expansion[1])):
+        doAssert need <= foldPairSourceLeads(v0, v1),
+          "a fold source's lead byte is no hint"
+
 static:
   # [classFoldOf]'s ASCII half rests on this: the simple fold class of an
   # ASCII byte is its case pair, plus K (U+212A) for k and ſ (U+017F) for s.

@@ -133,6 +133,7 @@ suite "the internals are not part of that API":
   test "the matcher's own analyses and tables are not exported":
     check not declared(lengthBounds)
     check not declared(extractFirstChar)
+    check not declared(extractSearchFirstChar)
     check not declared(AsciiClassTable)
     check not declared(PosixClassName)
 

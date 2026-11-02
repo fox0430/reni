@@ -76,6 +76,146 @@ suite "firstCharInfo optimization":
       check uint8('f') notin r.firstCharInfo.bytes
       check search("fi\xEF\xAC\x81ss7", r).matchSpan == 7 .. 8
 
+suite "a leading positive look-ahead's first byte":
+  # A look-ahead before anything the match consumes is tried where the match
+  # starts, so the search may skip to the bytes its body can begin with, as
+  # Oniguruma's map from a look-ahead body does.
+
+  test "a pattern of look-arounds alone scans for the look-ahead's bytes":
+    let r = re("(?<=\\s)(?=ab|cd)")
+    check r.firstCharInfo.kind == fcByteSet
+    check r.firstCharInfo.bytes == {uint8('a'), uint8('c')}
+    check search("ab xcd cd", r).matchSpan == 7 .. 7
+
+  test "the consumed byte's hint is narrowed to the look-ahead's":
+    let r = re("(?=[a-c])\\w+")
+    check r.firstCharInfo.kind == fcByteSet
+    check r.firstCharInfo.bytes == {uint8('a') .. uint8('c')}
+    check search("9_xb1", r).matchSpan == 3 .. 5
+
+  test "a look-ahead that rules out the consumed byte narrows nothing":
+    let r = re("(?=a)b")
+    check r.firstCharInfo.kind == fcByte
+    check r.firstCharInfo.byte == uint8('b')
+    check not search("abab", r).found
+
+  test "negative look-arounds and look-behinds state nothing":
+    for p in ["(?!a)", "(?<=a)", "(?<!a)", "(?!a)(?<=b)"]:
+      check re(p).firstCharInfo.kind == fcNone
+
+  test "^ keeps the line-start hint":
+    let r = re("^(?= )")
+    check r.firstCharInfo.kind == fcLineStart
+    check search("a b\n c", r).matchSpan == 4 .. 4
+
+  test "every start is still found":
+    var starts: seq[int]
+    for m in findAll("xaya\xC3\xA1a", re("(?=a)")):
+      starts.add m.matchSpan.a
+    check starts == @[1, 3, 6]
+    check searchBackward("abab", re("(?=b)")).matchSpan == 3 .. 3
+    check search("xAb", re("(?i)(?=ab)")).matchSpan == 1 .. 1
+    # ``k`` folds with U+212A KELVIN SIGN, whose lead byte is no ASCII byte.
+    check search("\xE2\x84\xAA", re("(?i)(?=k)")).matchSpan == 0 .. 0
+
+  test "a case-folded letter's hint holds the characters folding with it":
+    # Under ``(?i)`` an ``s`` matches ``ſ`` (U+017F), ``st`` matches ``ﬆ``
+    # (U+FB06) and ``fi`` matches ``ﬁ`` (U+FB01).  The decode reads an
+    # overlong form too, so the hint holds 0xE0 and 0xF0 beside each lead.
+    let s = re("(?i)st")
+    check s.firstCharInfo.kind == fcByteSet
+    check s.firstCharInfo.bytes ==
+      {uint8('s'), uint8('S'), 0xC5'u8, 0xEF'u8, 0xE0'u8, 0xF0'u8}
+    check search("x\xC5\xBFt", s).matchSpan == 1 .. 4
+    check search("x\xEF\xAC\x86", s).matchSpan == 1 .. 4
+    check search("x\xE2\x84\xAAx", re("(?i)k")).matchSpan == 1 .. 4
+    let fi = re("(?i)(?=filter)")
+    check 0xEF'u8 in fi.firstCharInfo.bytes
+    check search("x\xEF\xAC\x81lter", fi).matchSpan == 1 .. 1
+
+  test "(?I) adds the bytes of no fold":
+    # ``(?I)`` folds nothing above U+007F: ``s`` matches neither ``ſ`` nor
+    # ``ß``'s first half, so its hint is the case pair the pair scan reads.
+    for p in ["(?iI)s", "(?iI)st", "(?iI)k", "(?iI)(?=fi)"]:
+      let r = re(p)
+      check r.firstCharInfo.kind == fcByteSet
+      check r.firstCharInfo.bytes.card == 2
+      check r.firstCharInfo.pairOk
+    check not search("x\xC5\xBFt", re("(?iI)st")).found
+    check not search("x\xEF\xAC\x86", re("(?iI)st")).found
+    check search("xSt", re("(?iI)st")).matchSpan == 1 .. 3
+
+  test "a pair spelled with a non-ASCII character still reaches its fold":
+    # ``ſ`` (U+017F) folds with ``s``, so ``(?i)sſ`` matches ``ß`` (U+00DF)
+    # and ``ẞ`` (U+1E9E) as ``(?i)ss`` does, and the hint holds their leads.
+    let r = re("(?i)s\xC5\xBF")
+    check 0xC3'u8 in r.firstCharInfo.bytes
+    check search("x\xC3\x9F", r).matchSpan == 1 .. 3
+    check search("x\xE1\xBA\x9E", re("(?i)S\xC5\xBF")).matchSpan == 1 .. 4
+    check search("x\xC3\x9F", re("(?i)(?=s\\x{17F})")).matchSpan == 1 .. 1
+    check search("x\xC3\x9F", re("(?i)(?:s\xC5\xBF|k)")).matchSpan == 1 .. 3
+    # The branch test reads the same hint.
+    check search("x\xC3\x9F", re("x(?i)(?:a|s\xC5\xBF)")).matchSpan == 0 .. 3
+
+  test "what a folded letter states never turns a match away":
+    # Each search against the first start the matcher takes, trying every
+    # position the scan steps to: over ``(?i)`` and ``(?iI)`` strings with
+    # letters other characters fold with, and subjects holding those
+    # characters, also in
+    # the overlong forms the decode reads as them.  Neither the first-byte
+    # hint nor the required literal may skip one.
+    const strings = [
+      "s", "k", "ss", "st", "fi", "ffi", "s\xC5\xBF", "S\xC5\xBF", "kK", "sK",
+      "i\xCC\x87", "a\xCA\xBE", "xs", "ks",
+    ]
+    const shapes = ["$1", "(?=$1)", "(?:$1|q)", "x?$1", "(?=$1)\\w", "\\b$1"]
+    const chars = [
+      "s", "S", "k", "K", "t", "f", "i", "x", "\xC5\xBF", "\xE0\x85\xBF",
+      "\xF0\x80\x85\xBF", "\xE2\x84\xAA", "\xF0\x82\x84\xAA", "\xC3\x9F",
+      "\xE0\x83\x9F", "\xF0\x80\x83\x9F", "\xE1\xBA\x9E", "\xF0\x81\xBA\x9E",
+      "\xEF\xAC\x81", "\xF0\x8F\xAC\x81", "\xEF\xAC\x86", "\xEF\xAC\x83", "\xC4\xB0",
+      "\xE0\x84\xB0", "\xE1\xBA\x9A", "\xC1\xB3",
+    ]
+
+    proc firstStart(subject: string, r: Regex): string =
+      var p = 0
+      while true:
+        let m = matchAt(subject, r, p)
+        if m.found:
+          return $m.matchSpan
+        if p >= subject.len:
+          return "none"
+        p = nextScanPos(subject, p)
+
+    var wrong: seq[string]
+    for s in strings:
+      for shape in shapes:
+        for flags in ["(?i)", "(?iI)"]:
+          let pattern = flags & shape % s
+          let r = re(pattern)
+          for a in chars:
+            for b in @[""] & @chars:
+              let subject = "1" & a & b
+              let m = search(subject, r)
+              let got =
+                if m.found:
+                  $m.matchSpan
+                else:
+                  "none"
+              let want = firstStart(subject, r)
+              if got != want:
+                wrong.add pattern & " on " & subject.escape & ": " & got & " / " & want
+    check wrong.len == 0
+    for w in wrong[0 ..< min(wrong.len, 5)]:
+      echo w
+
+  test "a branch takes no hint from a look-ahead":
+    # A look-ahead a look-behind calls reads past the clip, where the branch
+    # test sees no byte: a hint would pass over the branch that holds.  (The
+    # reading past the clip is reni's; libonig finds nothing here.)
+    let r = re("(?<=b\\g<1>)a((?=a)|x){0}")
+    check search("ba", r).matchSpan == 1 .. 2
+
 suite "leadRun scan skip":
   # A broken disqualifier silently drops matches, so each is pinned twice:
   # the ``leadRun`` verdict and, where a wrong skip drops a match, the match.
@@ -611,6 +751,18 @@ suite "required literal":
     # A positive look-ahead reads at or after the start.
     check str("\\w+(?=ab)") == "ab"
 
+  test "what a look-ahead reads at the start stays":
+    # The scan's byte comes from the look-ahead alone, or from what the
+    # match consumes: either way one ``memmem`` for ``enum`` turns a line
+    # away, where the scan would try every ``e`` in it.
+    check str("(?=enum\\b)") == "enum"
+    check str("(?=enum\\b)\\w+") == "enum"
+    check str("\\b(?=enum\\b)\\w+") == "enum"
+    check found("\\b(?=enum\\b)\\w+", "an enum") == "enum"
+    check found("(?=enum\\b)\\w+", "enumerate") == "<none>"
+    # A byte no rarer than the scan's own adds nothing to it.
+    check lit("(?=e)\\w+").kind == rlNone
+
   test "an item the scan already looks for is left to it":
     # The first-byte scan lands on ``abc`` anyway; the presence test would
     # read the subject twice.
@@ -632,8 +784,10 @@ suite "required literal":
     let s = lit("\\w+(?i)ss")
     check s.kind == rlSet
     # ``ſ`` (C5), ``ß`` (C3), ``ẞ`` (E1), ``ﬅ``/``ﬆ`` (EF).
-    check s.set == {uint8('s'), uint8('S'), 0xC3'u8, 0xC5'u8, 0xE1'u8, 0xEF'u8}
-    check lit("\\w+(?i)k").set == {uint8('k'), uint8('K'), 0xE2'u8}
+    # The overlong forms the decode reads as these lead with E0 and F0.
+    check s.set ==
+      {uint8('s'), uint8('S'), 0xC3'u8, 0xC5'u8, 0xE1'u8, 0xEF'u8, 0xE0'u8, 0xF0'u8}
+    check lit("\\w+(?i)k").set == {uint8('k'), uint8('K'), 0xE2'u8, 0xF0'u8}
     for (p, subject) in [
       ("(?i)\\d+ss", "12ß"),
       ("(?i)\\d+ss", "12ẞ"),
@@ -642,6 +796,8 @@ suite "required literal":
       ("(?i)\\d+fi", "1ﬁ"),
       ("(?i)\\d+st", "1ﬆ"),
       ("(?i)\\d+ffi", "1ﬃ"),
+      ("(?i)\\d+s", "1\xE0\x85\xBF"),
+      ("(?i)\\d+k", "1\xF0\x82\x84\xAA"),
     ]:
       check found(p, subject) == subject
     # A character no fold reaches stays its own byte, string and all.

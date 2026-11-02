@@ -85,6 +85,11 @@ type Parser* = object
   sawCall*: bool
     ## True once a subexpression call has been parsed, so the compiler can
     ## skip ``checkNeverEndingRecursion`` when nothing calls a group.
+  sawAhead*: bool
+    ## True once a ``(?=...)`` group has been parsed, so the compiler can skip
+    ## the first-byte walk that reads look-aheads when there is none.  A
+    ## condition's ``(?(?=...)...)`` does not set it: that walk gives a
+    ## conditional no hint, so it reads no look-ahead inside one.
   branchlessNames*: seq[(string, int)]
     ## Each bare-name condition with no branch, ``(?(n))``, and where the
     ## ``)`` after it is.  The name has to be a group's, which ``re`` checks
@@ -1894,6 +1899,7 @@ proc parseGroup(p: var Parser, atHead = false): Node =
       p.advance()
       let body = p.parseRegex()
       result = Node(kind: nkLookaround, lookKind: lkAhead, lookBody: body)
+      p.sawAhead = true
     of '!':
       # (?!...) negative lookahead
       p.advance()
