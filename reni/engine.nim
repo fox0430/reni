@@ -191,8 +191,8 @@ type
     attemptStepLimit: int
       ## The caller's step limit for one attempt (``int.high`` = unlimited).
     budgetOrigin: int
-      ## Where the search started; its step budget grows with every byte an
-      ## attempt's start has moved away from here.
+      ## Where the search started; its step budget grows with every block of
+      ## bytes an attempt's start has moved away from here ([stepBudget]).
     rerunCount: int ## Backs [stepReruns]; nothing resets it.
     maxRecursionDepth: int
       ## The calls that may be open at once, one fewer than asked when a
@@ -5546,6 +5546,10 @@ proc resetForRegex(
     # ``setLen`` zero-fills new entries, and ``Span(0, 0)`` is not ``UnsetSpan``.
     ctx.capturesDirty = true
 
+const StepBudgetBlocks = 16
+  ## A search earns ``1 / StepBudgetBlocks`` of its step limit, rounded down
+  ## to whole bytes, for each block of bytes its start moves ([stepBudget]).
+
 proc stepBudget(ctx: MatchContext, attemptSteps, attemptStart: int): int =
   ## The most ``steps`` may reach in the attempt that began at
   ## ``attemptStart`` with ``attemptSteps`` charged: the attempt's own limit,
@@ -5553,12 +5557,25 @@ proc stepBudget(ctx: MatchContext, attemptSteps, attemptStart: int): int =
   ## summed over the start positions raises on a long subject of cheap
   ## attempts; one per attempt alone lets a pattern whose cost is polynomial
   ## in the subject run unchecked.
+  ##
+  ## The search earns its bytes in whole blocks, each worth
+  ## ``1 / StepBudgetBlocks`` of the limit rounded down to whole bytes, and
+  ## at least one byte: 6,250 bytes at ``DefaultStepLimit``, one byte below a
+  ## limit of 3,200.  Within the first block every budget is the limit
+  ## itself, which ``stepLimit`` starts at, so no attempt there runs twice
+  ## ([stepLimitLagged]).  Earned a byte at a time, the attempt after a cheap
+  ## one was owed the few steps the cheap one charged, and a give-up ran its
+  ## whole limit again to pay them.  Searching 383 lines with the 6,030
+  ## patterns of 131 TextMate grammars, every rerun was such a give-up, and
+  ## the reruns took 8% of the time.
   let limit = ctx.attemptStepLimit
   if limit == int.high:
     return int.high
   # Only a search that has charged more than ``limit`` steps asks, so neither
   # sum comes near ``int.high``.
-  let earned = SearchStepsPerByte * abs(attemptStart - ctx.budgetOrigin)
+  let moved = abs(attemptStart - ctx.budgetOrigin)
+  let blockBytes = max(1, limit div (SearchStepsPerByte * StepBudgetBlocks))
+  let earned = SearchStepsPerByte * (moved - moved mod blockBytes)
   min(attemptSteps + limit, limit + earned)
 
 proc stepLimitLagged(
@@ -5579,9 +5596,12 @@ proc stepLimitLagged(
   ##
   ## An attempt runs at most twice, so a search does at most about twice the
   ## work its budget counts.  The second runs pile up only where attempts
-  ## each cost more than half the limit.  Catching ``stepLimit`` up before
-  ## every attempt that might pass it would avoid them, but measured at up
-  ## to 10% where attempts are cheap, and 0.9% with the catch-up spaced out.
+  ## each cost more than half the limit, and none happens in the search's
+  ## first block of bytes ([stepBudget]).  Catching ``stepLimit`` up before
+  ## every attempt would avoid them too, but costs the cheap attempts of a
+  ## literal search 3-8% of the matcher's instructions, 1-2% over the
+  ## benchmark.  Spaced out, it would miss the reruns that cost the most: an
+  ## attempt after cheap ones is owed a few steps, not a spacing's worth.
   if ctx.steps <= ctx.stepLimit:
     return false
   let budget = stepBudget(ctx, attemptSteps, attemptStart)

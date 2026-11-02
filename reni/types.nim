@@ -1174,6 +1174,12 @@ const SearchStepsPerByte* = 100
   ## position moves, which keeps a search's work linear in the subject.  The
   ## densest pattern measured on the benchmark's code corpus,
   ## ``(\w+)\s+\1\b``, takes about 6.4 steps a byte.
+  ##
+  ## The bytes are earned in whole blocks, each worth a sixteenth of the step
+  ## limit rounded down to whole bytes, and at least one byte: 6,250 bytes at
+  ## ``DefaultStepLimit``, one byte below a limit of 3,200.  A search whose
+  ## start stays in its first block has the step limit and no more, so no
+  ## attempt there is run twice to pay out what it earned.
 const DefaultMaxRecursionDepth* = 20
   ## Subroutine calls (``\g<name>``, ``(?1)``) that may be open at once.  A
   ## call that would open one more fails, as Oniguruma's
