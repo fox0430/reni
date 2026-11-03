@@ -1469,7 +1469,7 @@ proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
   if variant != 1:
     return -1
   # Multi-char fold: pattern char folds to multiple chars (e.g., ß → ss)
-  if not multiCharFoldsApply(ctx.flags):
+  if not foldsAboveAscii(ctx.flags):
     return -1
   let fold = getMultiCharFold(target)
   if fold.len == 0:
@@ -1547,7 +1547,7 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
       continue
 
     # Try forward multi-char fold: pattern char folds to multiple subject chars (e.g., ß → ss)
-    if multiCharFoldsApply(ctx.flags):
+    if foldsAboveAscii(ctx.flags):
       let fold = getMultiCharFold(target)
       if fold.len > 0:
         p = posBeforeSubjChar
@@ -1569,7 +1569,7 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
 
     # Try reverse multi-char fold: subject char folds to consecutive pattern chars
     # e.g., subject "ß" matches pattern "ss" because ß full-folds to ss
-    if multiCharFoldsApply(ctx.flags):
+    if foldsAboveAscii(ctx.flags):
       let fold = getMultiCharFold(r)
       if fold.len > 0 and i + fold.len <= runes.len:
         var matched = true
@@ -2772,16 +2772,26 @@ proc boundsUsable(ctx: MatchContext, node: Node): bool {.inline.} =
     node.lookBoundsGm == ctx.graphemeMode
 
 proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
+  ## The bounds of look-behind ``node``'s body under the flags in force here.
+  ## Look-behinds only: the fallback measures the body as one (``behind``).
+  ## Not derived from ``lookKind`` in release builds, where that test moved
+  ## the matcher's ``Ir`` on bench items that hold no look-behind (code
+  ## layout, 2026-11-04).
+  when not defined(release):
+    assert node.lookKind in {lkBehind, lkNegBehind}
   if ctx.boundsUsable(node):
     node.lookBounds
   else:
-    lengthBounds(node.lookBody, ctx.flags, ctx.graphemeMode)
+    lengthBounds(node.lookBody, ctx.flags, ctx.graphemeMode, behind = true)
 
 proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.inline.} =
+  ## [bodyBounds] for branch ``i`` (``alt``) of a look-behind's alternation.
+  when not defined(release):
+    assert node.lookKind in {lkBehind, lkNegBehind}
   if ctx.boundsUsable(node) and i < node.lookAlts.len:
     node.lookAlts[i].bounds
   else:
-    lengthBounds(alt, ctx.flags, ctx.graphemeMode)
+    lengthBounds(alt, ctx.flags, ctx.graphemeMode, behind = true)
 
 proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
   ## Whether this look-behind body runs under a window; see

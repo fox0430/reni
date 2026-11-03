@@ -315,6 +315,68 @@ suite "case folding widens what a pattern character can consume":
     check search("\xE2\x84\xAA", re("(?i)k\\Z")).matchSpan == 0 .. 3
     check search("\xC5\xBF", re("(?i)s\\Z")).matchSpan == 0 .. 2
 
+  test "the widest ſ or K is a 4-byte overlong form":
+    # The decode reads ``\xF0\x80\x85\xBF`` as ſ and ``\xF0\x82\x84\xAA`` as K,
+    # and Oniguruma 6.9.10 folds both: every row below is its answer.
+    const LongS = "\xF0\x80\x85\xBF"
+    const Kelvin = "\xF0\x82\x84\xAA"
+    check re("(?i)s\\Z").semiEndDMax == 4
+    check search(LongS, re("(?i)s\\Z")).matchSpan == 0 .. 4
+    check search(Kelvin, re("(?i)k\\Z")).matchSpan == 0 .. 4
+    check search(LongS & LongS, re("(?i)s{2}\\Z")).matchSpan == 0 .. 8
+    check search("x" & LongS, re("(?i)xs\\Z")).matchSpan == 0 .. 5
+    check search(LongS & "x", re("(?<=(?i)s)x")).matchSpan == 4 .. 5
+    check search(Kelvin & "x", re("(?<=(?i)k)x")).matchSpan == 4 .. 5
+    check search("a" & LongS & "x", re("(?<=(?i)as)x")).matchSpan == 5 .. 6
+    check search(LongS & "x", re("(?<=(?i)s|ab)x")).matchSpan == 4 .. 5
+    check not search(LongS & "x", re("(?<!(?i)s)x")).found
+
+  test "an s in a fold pair keeps a canonical bound":
+    # Oniguruma matches a pair that starts a multi-character fold (``ff``,
+    # ``st``) against canonical text only.  A wider bound starts the ``\Z``
+    # scan on a stray lead byte before the match, which then swallows its
+    # start.  Every row is Oniguruma 6.9.10's answer.  (The pair's bound as a
+    # whole is still wider than Oniguruma's except for ``ff``: ``st`` is 5.)
+    check re("(?i)ff\\Z").semiEndDMax == 3
+    check search("\xF0aff", re("(?i)ff\\Z")).matchSpan == 2 .. 4
+    check search("\xF0\xEF\xAC\x80", re("(?i)ff\\Z")).matchSpan == 1 .. 4
+    check search("\xF0axff", re("(?i)xff\\Z")).matchSpan == 2 .. 5
+    check search("\xF0aff", re("(?i)(?:ff|ab)\\Z")).matchSpan == 2 .. 4
+    check search("\xF0aa\xEF\xAC\x86", re("(?i)st\\Z")).matchSpan == 3 .. 6
+    # A ``k`` or ``s`` beside the pair, outside it, still takes a 4-byte form.
+    const Pair = "ff\xF0\x82\x84\xAA\xF0\x80\x85\xBF"
+    check search(Pair, re("(?i)ffks\\Z")).matchSpan == 0 .. 10
+    check search(Pair & "x", re("(?<=(?i)ffks)x")).matchSpan == 10 .. 11
+    # A look-behind folds a string one character for one, pairs too.
+    const LongS = "\xF0\x80\x85\xBF"
+    check search(LongS & LongS & "x", re("(?<=(?i)ss)x")).matchSpan == 8 .. 9
+    check search(LongS & LongS & "x", re("(?<=(?i)ss|ab)x")).matchSpan == 8 .. 9
+    check not search(LongS & LongS & "x", re("(?<!(?i)ss)x")).found
+
+  test "(?I) folds nothing above U+007F":
+    # Not ſ, K or a pair, and a non-ASCII character matches itself alone, so
+    # every character is as wide as its own encoding.  Every row is
+    # Oniguruma 6.9.10's answer.
+    check re("(?iI)s\\Z").semiEndDMax == 1
+    check re("(?iI)ff\\Z").semiEndDMax == 2
+    check re("(?iI)é\\Z").semiEndDMax == 2
+    check search("\xF0s", re("(?iI)s\\Z")).matchSpan == 1 .. 2
+    check search("\xF0aas", re("(?iI)s\\Z")).matchSpan == 3 .. 4
+    check search("\xF0k", re("(?iI)k\\Z")).matchSpan == 1 .. 2
+    check search("\xF0aff", re("(?iI)ff\\Z")).matchSpan == 2 .. 4
+    check search("\xF0aé", re("(?iI)é\\Z")).matchSpan == 2 .. 4
+    check search("\xF0axé", re("(?iI)xé\\Z")).matchSpan == 2 .. 5
+    check search("\xF0aß", re("(?iI)ß\\Z")).matchSpan == 2 .. 4
+    check search("\xF0aK", re("(?iI)K\\Z")).matchSpan == 2 .. 5
+    check search("ffx", re("(?iI)(?<=ff)x")).matchSpan == 2 .. 3
+    check search("\xC5\xBFx", re("(?iI)(?<!s)x")).matchSpan == 2 .. 3
+    # A non-ASCII look-behind body is fixed-length, so the start is two bytes
+    # back, not one character: an overlong ``é`` there does not count.
+    check search("éx", re("(?iI)(?<=é)x")).matchSpan == 2 .. 3
+    check search("éax", re("(?iI)(?<=éa|b)x")).matchSpan == 3 .. 4
+    check not search("\xE0\x83\xA9x", re("(?iI)(?<=é)x")).found
+    check search("\xE0\x83\xA9x", re("(?iI)(?<!é)x")).matchSpan == 3 .. 4
+
   test "an ASCII literal keeps its narrow bound":
     check re("(?i)a\\Z").semiEndDMax == 1
     check re("a\\Z").semiEndDMax == 1

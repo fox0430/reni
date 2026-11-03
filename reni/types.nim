@@ -1708,6 +1708,15 @@ proc hasNonAsciiFoldEquiv(cp: int32): bool =
       cp
   lower == ord('s') or lower == ord('k') # ſ (U+017F) ↔ s, K (U+212A) ↔ k
 
+proc foldsAboveAscii*(flags: RegexFlags): bool {.inline.} =
+  ## Whether ``flags`` fold characters above U+007F: ``(?i)``, but not
+  ## ``(?I)``, which folds ASCII letters among themselves alone and leaves
+  ## every other character matching itself only ([caseInsensitiveMatch]).
+  ## Every multi-character fold needs it, since every fold source is above
+  ## U+007F ([AllMultiCharFoldSources]), and so does a non-ASCII fold equivalent
+  ## of an ASCII letter ([hasNonAsciiFoldEquiv]).
+  rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags
+
 const MultiCharFolds*:
   array[21, tuple[source: int32, expansion: array[3, int32], len: int]] = [
   ## The characters whose multi-character case fold the matcher expands, and
@@ -1883,10 +1892,9 @@ proc firstCharFromRune(cp: int32, flags: RegexFlags): FirstCharInfo =
       if lower < uint8('a') or lower > uint8('z'):
         return FirstCharInfo(kind: fcByte, byte: b)
       let upper = lower - 32
-      if hasNonAsciiFoldEquiv(cp) and rfIgnoreCaseAscii notin flags:
+      if hasNonAsciiFoldEquiv(cp) and foldsAboveAscii(flags):
         # ``ſ`` (U+017F) folds with ``s``, ``K`` (U+212A) with ``k``; the
-        # fold classes ``leafgate`` holds to these two.  ``(?I)`` folds
-        # neither ([caseInsensitiveMatch]).
+        # fold classes ``leafgate`` holds to these two.
         let other = if lower == uint8('s'): LongSLeads else: KelvinSignLeads
         return FirstCharInfo(kind: fcByteSet, bytes: {upper, lower} + other)
       FirstCharInfo(
@@ -2302,8 +2310,7 @@ proc extractFirstCharUncached(
       let info = firstCharFromRune(int32(node.runes[0]), flags)
       # A character can match the first two at once (``ﬁ`` for ``fi``), where
       # multi-character folds apply: under ``(?i)``, but not ``(?I)``.
-      if rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags and
-          info.kind == fcByteSet and node.runes.len >= 2:
+      if foldsAboveAscii(flags) and info.kind == fcByteSet and node.runes.len >= 2:
         let leads = foldPairSourceLeads(node.runes[0], node.runes[1])
         if leads != {}:
           # A letter's case pair and a non-ASCII lead at least: three bytes or
@@ -2568,23 +2575,51 @@ const MaxFoldExpansionRunes = 3
 const MaxAsciiFoldEquivBytes = 3
   ## Widest character whose fold reaches an ASCII one, on its own (U+212A →
   ## ``k``) or through an expansion (ẞ, ﬀ…ﬆ, ẖ, ẗ, ẘ, ẙ, ẚ — all three bytes).
+  ## It bounds an ``s`` inside a pair that starts a multi-character fold
+  ## (``st``, ``ss``), and the pair's allowance.  Canonical encodings:
+  ## Oniguruma matches such a pair (``ff`` too) against those only, and a
+  ## wider bound would move a ``\Z`` scan's start back past a stray lead byte,
+  ## which then swallows the match: ``(?i)ff\Z`` on ``\xF0aff``.  It is K's
+  ## width, not ſ's: no expansion holds a ``k``, so such an ``s`` needs only
+  ## 2.  And [lengthBounds] sums a bound per character and adds one byte a
+  ## pair, which is Oniguruma's own bound for ``ff`` (3) alone: ``st`` gets 5
+  ## and ``ss`` 7 where Oniguruma takes 3 and 4, and ``fff`` 5 where it takes 4.
 
-proc runeMaxByteLen*(r: Rune, flags: RegexFlags): int =
+const MaxLoneFoldEquivBytes = MaxRuneBytes
+  ## Widest subject character that folds to a ``k``, or to an ``s`` standing
+  ## outside such a pair: [decodeAt] also reads a 4-byte overlong ``ſ`` or
+  ## ``K``, and Oniguruma folds those there as it does the real ones: its
+  ## ``(?i)s\Z`` matches all four bytes of ``\xF0\x80\x85\xBF``.  Inside a
+  ## pair it folds neither (its ``(?i)st\Z`` matches none of
+  ## ``\xF0\x80\x85\xBFt``).  reni's matcher still takes that ``ſ`` there; the
+  ## bound does not widen for it.
+
+proc runeMaxByteLen*(r: Rune, flags: RegexFlags, inFoldPair = false): int =
   ## Upper bound on the subject bytes one pattern character can consume.
   ##
   ## Under ``(?i)`` that is not the character's own width: it also matches a
   ## fold equivalent with a wider encoding (``k`` ↔ U+212A), and a character
   ## with a multi-character fold matches that whole expansion (``ΐ`` ↔
   ## ``ι``+``◌̈``+``◌́``, six bytes), whose elements fold again in turn.
-  if rfIgnoreCase notin flags:
+  ## ``(?I)`` folds neither kind ([foldsAboveAscii]).
+  ## ``inFoldPair``: the character and a neighbour start a multi-character
+  ## fold (the ``s`` of ``st``; no fold holds a ``k``), so only a canonical
+  ## fold equivalent counts.
+  if not foldsAboveAscii(flags):
+    # The character itself, or under ``(?I)`` an ASCII letter's case pair,
+    # which is as wide.  Under ``(?I)`` reni's matcher also takes an overlong
+    # form of a non-ASCII character (``é`` for ``\xE0\x83\xA9``), which
+    # Oniguruma does not; the bound follows Oniguruma.
     return r.size
   let cp = int32(r)
   if cp < 128:
     # No ASCII character has a multi-character fold, and only ``s`` and ``k``
     # have a non-ASCII fold equivalent.  Standing inside another character's
-    # expansion needs a neighbour, which is invisible here: [lengthBounds]
-    # adds that allowance where it can see the pair.
-    return if hasNonAsciiFoldEquiv(cp): MaxAsciiFoldEquivBytes else: 1
+    # expansion needs a neighbour: [lengthBounds] adds that allowance where
+    # it sees the pair.
+    if not hasNonAsciiFoldEquiv(cp):
+      return 1
+    return if inFoldPair: MaxAsciiFoldEquivBytes else: MaxLoneFoldEquivBytes
   max(r.size, MaxFoldExpansionRunes * MaxRuneBytes)
 
 proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
@@ -2592,7 +2627,7 @@ proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
   ## when case folding lets it match text of another width — a fold
   ## equivalent with a wider encoding, or a multi-character fold expansion.
   ## See [runeMaxByteLen] for the bound that replaces it in that case.
-  if rfIgnoreCase notin flags:
+  if not foldsAboveAscii(flags):
     return r.size
   let cp = int32(r)
   if cp < 128 and not hasNonAsciiFoldEquiv(cp):
@@ -2726,7 +2761,9 @@ func followedBy(a, b: LenBounds): LenBounds =
         a.fixedLen + b.fixedLen,
   )
 
-proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
+proc lengthBounds*(
+    node: Node, flags: RegexFlags, gm = gmNone, behind = false
+): LenBounds =
   ## Bound what ``node`` consumes.  See [LenBounds].
   ##
   ## ``flags`` and ``gm`` are the ones in force where ``node`` sits: case
@@ -2739,6 +2776,12 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   ## runs last in the compiler and leaves no two literals adjacent in a
   ## concat, so summing concat children needs no allowance for a fold across
   ## them.
+  ##
+  ## ``behind``: ``node`` sits in a look-behind body, where Oniguruma folds a
+  ## string one character for one, so an ``s`` there takes a 4-byte overlong
+  ## ``ſ`` even inside a pair (``(?<=(?i)ss)x``).  reni's matcher still lets
+  ## one subject character match a pair there (``ß`` for ``ss``), which
+  ## Oniguruma does not, so the pair allowance below stays.
   if node == nil:
     return LenBounds(maxLen: 0, fixedLen: 0)
   case node.kind
@@ -2747,10 +2790,15 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
   of nkEscapedLiteral:
     runeBounds(node.escapedRune, flags)
   of nkString:
+    let pairs = foldsAboveAscii(flags)
     var total = 0
     var fixed = 0
+    var pairEnd = false # The previous character and this one start a fold.
     for i, r in node.runes:
-      total += runeMaxByteLen(r, flags)
+      let pairStart =
+        pairs and i + 1 < node.runes.len and
+        isMultiCharFoldPairStart(r, node.runes[i + 1])
+      total += runeMaxByteLen(r, flags, not behind and (pairStart or pairEnd))
       if fixed >= 0:
         let rl = runeFixedByteLen(r, flags)
         if rl < 0:
@@ -2761,10 +2809,10 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
       # pattern "ss"), so the length is not fixed.  It is at most
       # ``MaxAsciiFoldEquivBytes`` wide and replaces two pattern characters of
       # at least one byte each, hence at most one extra byte per pair.
-      if rfIgnoreCase in flags and i + 1 < node.runes.len and
-          isMultiCharFoldPairStart(r, node.runes[i + 1]):
+      if pairStart:
         fixed = -1
         total += MaxAsciiFoldEquivBytes - 2
+      pairEnd = pairStart
     LenBounds(maxLen: total, fixedLen: fixed)
   of nkConcat:
     var total = LenBounds(maxLen: 0, fixedLen: 0)
@@ -2778,7 +2826,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
         if child.graphemeMode != gmNone:
           currentGm = child.graphemeMode
         continue
-      total = total.followedBy(lengthBounds(child, currentFlags, currentGm))
+      total = total.followedBy(lengthBounds(child, currentFlags, currentGm, behind))
       if total.maxLen < 0 and total.fixedLen < 0:
         break
     total
@@ -2791,7 +2839,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     var best = 0
     var fixed = 0
     for i, alt in node.alternatives.view:
-      let ab = lengthBounds(alt, flags, gm)
+      let ab = lengthBounds(alt, flags, gm, behind)
       if ab.maxLen < 0:
         best = -1
       elif best >= 0:
@@ -2802,7 +2850,7 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
         fixed = -1
     LenBounds(maxLen: best, fixedLen: fixed)
   of nkQuantifier:
-    let bb = lengthBounds(node.quantBody, flags, gm)
+    let bb = lengthBounds(node.quantBody, flags, gm, behind)
     # Inverted range: use the swapped bounds.
     let (qlo, qhi) = effectiveQuantBounds(node.quantMin, node.quantMax)
     # ``{0,0}`` and repeats of zero-width bodies consume nothing.  A repeat
@@ -2821,22 +2869,23 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
         fixed = bb.fixedLen * qlo
     LenBounds(maxLen: total, fixedLen: fixed)
   of nkCapture:
-    lengthBounds(node.captureBody, flags, gm)
+    lengthBounds(node.captureBody, flags, gm, behind)
   of nkNamedCapture:
-    lengthBounds(node.namedCaptureBody, flags, gm)
+    lengthBounds(node.namedCaptureBody, flags, gm, behind)
   of nkGroup:
-    lengthBounds(node.groupBody, flags, gm)
+    lengthBounds(node.groupBody, flags, gm, behind)
   of nkFlagGroup:
     if node.flagBody != nil:
       lengthBounds(
         node.flagBody,
         flags + node.flagsOn - node.flagsOff,
         if node.graphemeMode != gmNone: node.graphemeMode else: gm,
+        behind,
       )
     else:
       LenBounds(maxLen: 0, fixedLen: 0)
   of nkAtomicGroup:
-    lengthBounds(node.atomicBody, flags, gm)
+    lengthBounds(node.atomicBody, flags, gm, behind)
   of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
     LenBounds(maxLen: 0, fixedLen: 0)
   of nkCharType:
@@ -2847,10 +2896,11 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
       (node.charType == ctDot and gm in {gmGrapheme, gmWord})
     LenBounds(maxLen: if unbounded: -1 else: MaxRuneBytes, fixedLen: -1)
   of nkCharClass:
-    # Under (?i) a class also matches the multi-character fold of a member.
+    # Under ``(?i)`` a class also matches the multi-character fold of a
+    # member; under ``(?I)`` it takes one character, as without folding.
     LenBounds(
       maxLen:
-        if rfIgnoreCase in flags:
+        if foldsAboveAscii(flags):
           MaxFoldExpansionRunes * MaxRuneBytes
         else:
           MaxRuneBytes,
@@ -2864,13 +2914,13 @@ proc lengthBounds*(node: Node, flags: RegexFlags, gm = gmNone): LenBounds =
     # ``(?(a)|)`` is not fixed.  The other tests are zero-width.
     let test =
       if node.condKind == ckRegexCond:
-        lengthBounds(node.condBody, flags, gm)
+        lengthBounds(node.condBody, flags, gm, behind)
       else:
         LenBounds(maxLen: 0, fixedLen: 0)
-    let yes = test.followedBy(lengthBounds(node.condYes, flags, gm))
+    let yes = test.followedBy(lengthBounds(node.condYes, flags, gm, behind))
     let no =
       if node.condNo != nil:
-        lengthBounds(node.condNo, flags, gm)
+        lengthBounds(node.condNo, flags, gm, behind)
       else:
         LenBounds(maxLen: 0, fixedLen: 0)
     LenBounds(
@@ -2905,14 +2955,15 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
     return
   case node.kind
   of nkLookaround:
-    node.lookBounds = lengthBounds(node.lookBody, flags, gm)
+    let behind = node.lookKind in {lkBehind, lkNegBehind}
+    node.lookBounds = lengthBounds(node.lookBody, flags, gm, behind)
     # ``tuneLookBehinds`` may have sized ``lookAlts`` already, to mark a
     # branch unclipped.
     let peeled = peelBareGroups(node.lookBody)
     if peeled != nil and peeled.kind == nkAlternation:
       node.lookAlts.setLen(peeled.alternatives.len)
       for i, alt in peeled.alternatives.view:
-        node.lookAlts[i].bounds = lengthBounds(alt, flags, gm)
+        node.lookAlts[i].bounds = lengthBounds(alt, flags, gm, behind)
     else:
       node.lookAlts.setLen(0)
     node.lookBoundsFlags = flags
