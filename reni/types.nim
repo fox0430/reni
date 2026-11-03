@@ -2988,8 +2988,7 @@ proc flagsBefore(
       if child.graphemeMode != gmNone:
         result.gm = child.graphemeMode
 
-type TailRead = object
-  ## What [readTail] finds in one piece of a look-behind body.
+type TailRead = object ## What [readTail] finds in one piece of a look-behind body.
   zero: bool ## The piece consumes nothing, whatever it meets.
   bytes: string
     ## When not ``zero``: the bytes every match of the piece ends with, or
@@ -3038,7 +3037,10 @@ proc readTail(node: Node, flags: RegexFlags, gm: GraphemeMode): TailRead =
         break
     for at in countdown(node.children.high, 0):
       let (f, g) =
-        if switches: flagsBefore(node, at, flags, gm) else: (flags, gm)
+        if switches:
+          flagsBefore(node, at, flags, gm)
+        else:
+          (flags, gm)
       result = readTail(node.children[at], f, g)
       if not result.zero:
         return

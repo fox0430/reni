@@ -2191,8 +2191,9 @@ suite "a look-behind branch the subject does not end with is passed over":
     # Zero-width items may follow it: they leave the end where it was.
     check tails(r"(?<=ab\b|c$|e(?<=e)|f(?i))x") == @["ab", "c", "e", "f"]
     # Groups that consume what their body consumes are looked through.
-    check tails(r"(?<=(ab)|(?:c)|(?>d)|(?<n>e)|(?-i:g))x") ==
-      @["ab", "c", "d", "e", "g"]
+    check tails(r"(?<=(ab)|(?:c)|(?>d)|(?<n>e)|(?-i:g))x") == @[
+      "ab", "c", "d", "e", "g"
+    ]
     # Its bytes are the ones the literal is compared by.
     check tails("(?<=\xC3\xA9|\\x{e9}|\\n)x") == @["\xC3\xA9", "\xC3\xA9", "\n"]
 
@@ -2249,23 +2250,16 @@ suite "a look-behind branch the subject does not end with is passed over":
 
   test "clearing the tails changes no answer":
     const patterns = [
-      r"(?<!\Wfor|^for)\(",
-      r"(?<=\Wfor \(|^for \(|\Wfor\(|^for\()",
-      r"(?<=^\n|[^\\]\n)(?=$)",
-      r"(?<=ab\b|c$|e(?<=e))\w",
-      r"(?<=(ab)|(?<n>cd)|x)y",
-      "(?<!ab|\\d|\xC3\xA9).",
-      "(?<=a|bc|d\xC3\xA9f)(?<!x|yz).",
-      r"(?<=/|q)x",
-      r"(?:(?<=ab|b)c)+",
-      r"(?<=ab|x)c|AB(?i:\g<0>)",
-      r"(?<=(?i:ab)|(?i:a)b|x)y",
+      r"(?<!\Wfor|^for)\(", r"(?<=\Wfor \(|^for \(|\Wfor\(|^for\()",
+      r"(?<=^\n|[^\\]\n)(?=$)", r"(?<=ab\b|c$|e(?<=e))\w", r"(?<=(ab)|(?<n>cd)|x)y",
+      "(?<!ab|\\d|\xC3\xA9).", "(?<=a|bc|d\xC3\xA9f)(?<!x|yz).", r"(?<=/|q)x",
+      r"(?:(?<=ab|b)c)+", r"(?<=ab|x)c|AB(?i:\g<0>)", r"(?<=(?i:ab)|(?i:a)b|x)y",
       r"(?<=(b)|x|(a)b)\2",
     ]
     const subjects = [
       "", "x", "abc", "for(", " for (x", "xfor(", "a\nb\n", "ab cd", "cdy",
-      "d\xC3\xA9f.", "\xC0\xAFx", "bcbc", "ABc", "abcabcx", "\xC3\xA9\xC3\xA9x",
-      "abab", "aba", "Aby", "ABy", "e1",
+      "d\xC3\xA9f.", "\xC0\xAFx", "bcbc", "ABc", "abcabcx", "\xC3\xA9\xC3\xA9x", "abab",
+      "aba", "Aby", "ABy", "e1",
     ]
     for p in patterns:
       let withTails = re(p)
