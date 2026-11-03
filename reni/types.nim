@@ -196,6 +196,13 @@ type
       ## branch of a divided look-behind (``lookDivided``) or of a negative
       ## one.  Set by ``tuneLookBehinds``, which sizes ``lookAlts`` for it.
     chars*: int32 ## As ``lookChars``, for the branch: read only when ``unclipped``.
+    tail*: string
+      ## Look-behinds only: the bytes every match of the branch ends with,
+      ## or empty.  A branch has to end where the look-behind stands, so
+      ## where the subject does not end with these, no start can match it
+      ## and the matcher passes it over.  Filled in by
+      ## ``annotateLookaroundBounds`` ([lookBehindTail]); read only where
+      ## ``lookBoundsFlags`` are the flags in force, as ``bounds`` is.
 
   NodeKind* = enum
     ## **Internal API.** Exposed only so this repository's tests can inspect
@@ -2948,9 +2955,111 @@ proc lengthBounds*(
     of abFunction, abExpression:
       LenBounds(maxLen: -1, fixedLen: -1)
 
+proc literalBytes*(node: Node): string =
+  ## The exact bytes ``node`` matches with case folding off, or ``""`` when it
+  ## is not a plain literal.  Read where the matcher reads them: an
+  ## ``nkString`` carries ``bytes``, a literal re-encodes its rune as
+  ## ``matchBytes`` (in ``engine``) does.
+  case node.kind
+  of nkString:
+    node.bytes
+  of nkLiteral, nkEscapedLiteral:
+    var buf: array[4, char]
+    let cp = int32(if node.kind == nkLiteral: node.rune else: node.escapedRune)
+    let n = utf8Encode(cp, buf)
+    var s = newString(n)
+    for i in 0 ..< n:
+      s[i] = buf[i]
+    s
+  else:
+    ""
+
+proc flagsBefore(
+    node: Node, at: int, flags: RegexFlags, gm: GraphemeMode
+): tuple[flags: RegexFlags, gm: GraphemeMode] =
+  ## The flags and grapheme mode in force at child ``at`` of the concat
+  ## ``node``, which ``flags`` and ``gm`` hold at its start: a bare flag group
+  ## switches them for the rest of the concat, as in [lengthBounds].
+  result = (flags, gm)
+  for i in 0 ..< at:
+    let child = node.children[i]
+    if child.kind == nkFlagGroup and child.flagBody == nil:
+      result.flags = result.flags + child.flagsOn - child.flagsOff
+      if child.graphemeMode != gmNone:
+        result.gm = child.graphemeMode
+
+type TailRead = object
+  ## What [readTail] finds in one piece of a look-behind body.
+  zero: bool ## The piece consumes nothing, whatever it meets.
+  bytes: string
+    ## When not ``zero``: the bytes every match of the piece ends with, or
+    ## empty when it names none.
+
+proc readTail(node: Node, flags: RegexFlags, gm: GraphemeMode): TailRead =
+  ## [lookBehindTail]'s walk.  Each piece is read once: a group by its body,
+  ## a concat from its end, and [lengthBounds] asked only of a piece no rule
+  ## here reads (a repeat, a class, an alternation, ...), which consumes
+  ## nothing when its maximum is 0.
+  if node == nil:
+    return TailRead(zero: true)
+  case node.kind
+  of nkString, nkLiteral, nkEscapedLiteral:
+    # [stringAdvance] and ``matchBytes`` compare these bytes and no others,
+    # overlong forms included, unless ``(?i)`` folds them.
+    if rfIgnoreCase notin flags:
+      result.bytes = literalBytes(node)
+  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    result.zero = true
+  of nkGroup:
+    result = readTail(node.groupBody, flags, gm)
+  of nkCapture:
+    result = readTail(node.captureBody, flags, gm)
+  of nkNamedCapture:
+    result = readTail(node.namedCaptureBody, flags, gm)
+  of nkAtomicGroup:
+    result = readTail(node.atomicBody, flags, gm)
+  of nkFlagGroup:
+    if node.flagBody == nil:
+      result.zero = true
+    else:
+      result = readTail(
+        node.flagBody,
+        flags + node.flagsOn - node.flagsOff,
+        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
+      )
+  of nkConcat:
+    # From the end, past what consumes nothing, to the last child that may
+    # consume.  The flags in force at a child are the concat's unless a bare
+    # flag group switches them on the way ([flagsBefore]).
+    var switches = false
+    for child in node.children.view:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        switches = true
+        break
+    for at in countdown(node.children.high, 0):
+      let (f, g) =
+        if switches: flagsBefore(node, at, flags, gm) else: (flags, gm)
+      result = readTail(node.children[at], f, g)
+      if not result.zero:
+        return
+    result.zero = true
+  else:
+    result.zero = lengthBounds(node, flags, gm, behind = true).maxLen == 0
+
+proc lookBehindTail(node: Node, flags: RegexFlags, gm = gmNone): string =
+  ## The bytes every match of ``node``, a branch of a look-behind body, ends
+  ## with, or empty when it names none: its last item that consumes anything,
+  ## when that is a string or a literal compared case-sensitively.  Only
+  ## items that consume nothing may follow it (anchors, look-arounds, flag
+  ## switches, anything [lengthBounds] gives a maximum of 0).  ``flags`` and
+  ## ``gm`` are those in force where ``node`` sits, threaded through flag
+  ## groups as [lengthBounds] threads them, so ``(?i)`` anywhere before the
+  ## item leaves it no tail.
+  readTail(node, flags, gm).bytes
+
 proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
-  ## Cache [lengthBounds] of every lookaround body on its node.
-  ## Must run on the final AST.
+  ## Cache [lengthBounds] of every lookaround body on its node, and each
+  ## look-behind branch's [lookBehindTail].  Must run on the final AST.
   if node == nil:
     return
   case node.kind
@@ -2964,6 +3073,8 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
       node.lookAlts.setLen(peeled.alternatives.len)
       for i, alt in peeled.alternatives.view:
         node.lookAlts[i].bounds = lengthBounds(alt, flags, gm, behind)
+        if behind:
+          node.lookAlts[i].tail = lookBehindTail(alt, flags, gm)
     else:
       node.lookAlts.setLen(0)
     node.lookBoundsFlags = flags

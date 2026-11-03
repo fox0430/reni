@@ -2149,6 +2149,135 @@ suite "an alternation passes over branches whose first byte cannot match":
     # ``(?~)`` is not a clear: the limit stays narrow and the branch out.
     check search("b", re("(?~|b)(?:|b)(?~)\\z")).matchSpan == 1 .. 1
 
+suite "a look-behind branch the subject does not end with is passed over":
+  # A look-behind branch has to end where the look-behind stands.  One whose
+  # last consuming item is a string or a literal compared case-sensitively
+  # ends with that item's bytes (``LookAlt.tail``), so where the subject
+  # before the position does not, the matcher passes the branch over without
+  # running it from any start.  The tail is only a necessary condition: the
+  # cases below answer what the branch run from its starts answers, and the
+  # last test runs the same patterns with every tail cleared.
+
+  proc firstLookBehind(n: Node): Node =
+    ## The first look-behind under ``n`` whose body is an alternation.
+    if n == nil:
+      return nil
+    if n.kind == nkLookaround and n.lookKind in {lkBehind, lkNegBehind} and
+        n.lookAlts.len > 0:
+      return n
+    for c in n.childNodes:
+      let r = firstLookBehind(c)
+      if r != nil:
+        return r
+    nil
+
+  proc tails(pattern: string): seq[string] =
+    let n = firstLookBehind(re(pattern).ast)
+    if n != nil:
+      for a in n.lookAlts:
+        result.add a.tail
+
+  proc clearTails(n: Node) =
+    if n == nil:
+      return
+    if n.kind == nkLookaround:
+      for a in n.lookAlts.mitems:
+        a.tail = ""
+    for c in n.childNodes:
+      clearTails(c)
+
+  test "the tail is the last string or literal a branch consumes":
+    check tails(r"(?<!\Wfor|^for)\(") == @["for", "for"]
+    # Zero-width items may follow it: they leave the end where it was.
+    check tails(r"(?<=ab\b|c$|e(?<=e)|f(?i))x") == @["ab", "c", "e", "f"]
+    # Groups that consume what their body consumes are looked through.
+    check tails(r"(?<=(ab)|(?:c)|(?>d)|(?<n>e)|(?-i:g))x") ==
+      @["ab", "c", "d", "e", "g"]
+    # Its bytes are the ones the literal is compared by.
+    check tails("(?<=\xC3\xA9|\\x{e9}|\\n)x") == @["\xC3\xA9", "\xC3\xA9", "\n"]
+
+  test "a branch that does not end in a case-sensitive string names none":
+    check tails(r"(?<=ab*|a+|\w|[ab])x") == @["", "", "", ""]
+    check tails(r"(?<=(?i:ab)|(?i:a)b|x)y") == @["", "b", "x"]
+    check tails(r"(?i:(?<=ab|x))y") == @["", ""]
+    check tails(r"(?i)(?<=ab|x)y") == @["", ""]
+
+  test "a zero-width item after the tail still reads the subject":
+    check search("ab c", re(r"(?<=ab\b|x) ")).matchSpan == 2 .. 3
+    check not search("abc", re(r"(?<=ab\b|x)c")).found
+    check search("ab\n", re(r"(?<=ab$|x)\n")).matchSpan == 2 .. 3
+    check search("abc", re(r"(?<=ab(?<=b)|x)c")).matchSpan == 2 .. 3
+    check not search("abc", re(r"(?<=ab(?<=a)|x)c")).found
+
+  test "negative and divided positive look-behinds pass over the same branches":
+    # The shapes of the C++ keyword list and of ``(?<=\Wfor \(|...)``.
+    let neg = re(r"(?<!\Wfor|^for)\(")
+    check not search("for(", neg).found
+    check not search(" for(", neg).found
+    check search("xfor(", neg).matchSpan == 4 .. 5
+    check search("(", neg).matchSpan == 0 .. 1
+    let pos = re(r"(?<=\Wfor \(|^for \(|\Wfor\(|^for\()x")
+    check search("for (x", pos).matchSpan == 5 .. 6
+    check search(" for(x", pos).matchSpan == 5 .. 6
+    check not search("xfor(x", pos).found
+    check not search("fo(x", pos).found
+    # A divided look-behind retries its later branches once the continuation
+    # fails, past one passed over: ``\2`` needs the third branch's group.
+    check search("aba", re(r"(?<=(b)|x|(a)b)\2")).matchSpan == 2 .. 3
+
+  test "the tail is compared as the literal is, byte for byte":
+    # An overlong form of the tail's character is not the tail, and the
+    # literal takes no overlong form either.
+    check not search("\xC0\xAFx", re(r"(?<=/|q)x")).found
+    check search("/x", re(r"(?<=/|q)x")).matchSpan == 1 .. 2
+    check search("\xC3\xA9x", re("(?<=\xC3\xA9|q)x")).matchSpan == 2 .. 3
+    # Fewer bytes before the position than the tail holds.
+    check not search("bx", re(r"(?<=abc|q)x")).found
+
+  test "the tails count only under the flags they were read under":
+    # As the bounds do (``boundsUsable``): under other flags in force, ``ab``
+    # might end with ``AB``, so every branch is run.  Wrong tails stand in
+    # for the case here, believed while the flags agree.
+    let rx = re(r"(?<=ab|x)c")
+    let lb = firstLookBehind(rx.ast)
+    check search("abc", rx).matchSpan == 2 .. 3
+    for a in lb.lookAlts.mitems:
+      a.tail = "zz"
+    check not search("abc", rx).found
+    lb.lookBoundsFlags = {rfIgnoreCase}
+    check search("abc", rx).matchSpan == 2 .. 3
+
+  test "clearing the tails changes no answer":
+    const patterns = [
+      r"(?<!\Wfor|^for)\(",
+      r"(?<=\Wfor \(|^for \(|\Wfor\(|^for\()",
+      r"(?<=^\n|[^\\]\n)(?=$)",
+      r"(?<=ab\b|c$|e(?<=e))\w",
+      r"(?<=(ab)|(?<n>cd)|x)y",
+      "(?<!ab|\\d|\xC3\xA9).",
+      "(?<=a|bc|d\xC3\xA9f)(?<!x|yz).",
+      r"(?<=/|q)x",
+      r"(?:(?<=ab|b)c)+",
+      r"(?<=ab|x)c|AB(?i:\g<0>)",
+      r"(?<=(?i:ab)|(?i:a)b|x)y",
+      r"(?<=(b)|x|(a)b)\2",
+    ]
+    const subjects = [
+      "", "x", "abc", "for(", " for (x", "xfor(", "a\nb\n", "ab cd", "cdy",
+      "d\xC3\xA9f.", "\xC0\xAFx", "bcbc", "ABc", "abcabcx", "\xC3\xA9\xC3\xA9x",
+      "abab", "aba", "Aby", "ABy", "e1",
+    ]
+    for p in patterns:
+      let withTails = re(p)
+      let without = re(p)
+      clearTails(without.ast)
+      for s in subjects:
+        for start in 0 .. s.len:
+          let a = search(s, withTails, start)
+          let b = search(s, without, start)
+          check a.found == b.found
+          check a.boundaries == b.boundaries
+
 suite "a positive lookaround's captures are rolled back like any other":
   # A positive lookaround keeps what its (zero-width) body captured.  Those
   # captures are written inside a nested machine, which releases its own
