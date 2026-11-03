@@ -7,16 +7,10 @@
 import std/unicode
 import types, unicode_utils
 
-proc multiCharFoldsApply*(flags: RegexFlags): bool {.inline.} =
-  ## Whether ``flags`` let a character fold to several: ``(?i)``, and not
-  ## ``(?I)``, which folds nothing above U+007F, where every fold source is
-  ## ([foldSourceRunesOf]).
-  rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags
-
 proc classFoldsApply*(node: Node, flags: RegexFlags): bool {.inline.} =
   ## Whether multi-char folds can apply to a class: a positive bracket class
-  ## under [multiCharFoldsApply].
-  multiCharFoldsApply(flags) and node.bracketClass and not node.negated
+  ## under [foldsAboveAscii].
+  foldsAboveAscii(flags) and node.bracketClass and not node.negated
 
 proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
   ## Whether ``node`` matches at most one way. Single-way bodies allow greedy
@@ -31,10 +25,10 @@ proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
     node.runes.len > 0
   of nkLiteral, nkEscapedLiteral:
     # The second way a literal can match is the multi-character fold, which
-    # only exists under [multiCharFoldsApply] and only for a character that
+    # only exists under [foldsAboveAscii] and only for a character that
     # has one.
     let r = if node.kind == nkLiteral: node.rune else: node.escapedRune
-    not multiCharFoldsApply(flags) or not hasMultiCharFold(r)
+    not foldsAboveAscii(flags) or not hasMultiCharFold(r)
   of nkCharClass:
     not classFoldsApply(node, flags)
   else:

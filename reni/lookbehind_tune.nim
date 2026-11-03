@@ -252,11 +252,11 @@ proc unravels(node: Node, flags: RegexFlags, behind: bool): bool =
     return false
   case node.kind
   of nkLiteral:
-    not behind and multiCharFoldsApply(flags) and foldsUnevenly([node.rune])
+    not behind and foldsAboveAscii(flags) and foldsUnevenly([node.rune])
   of nkEscapedLiteral:
-    not behind and multiCharFoldsApply(flags) and foldsUnevenly([node.escapedRune])
+    not behind and foldsAboveAscii(flags) and foldsUnevenly([node.escapedRune])
   of nkString:
-    not behind and multiCharFoldsApply(flags) and foldsUnevenly(node.runes)
+    not behind and foldsAboveAscii(flags) and foldsUnevenly(node.runes)
   of nkFlagGroup:
     unravels(node.flagBody, flags + node.flagsOn - node.flagsOff, behind)
   of nkConcat:
@@ -665,7 +665,7 @@ proc asciiView(h: HeadLit, members: var set[uint8], plain: var bool): bool =
       if not classAsciiMatches(node, ascii, nonAscii, predicate):
         return false
       plain = not node.negated and not nonAscii
-      if plain and rfIgnoreCase in flags and rfIgnoreCaseAscii notin flags:
+      if plain and foldsAboveAscii(flags):
         # Folding adds a member's wider variants -- ``k`` brings U+212A.
         for c in members:
           for v in caseFoldVariants(Rune(int32(c))):
