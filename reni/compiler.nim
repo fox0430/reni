@@ -1460,24 +1460,6 @@ const AltTrieMaxWordLen = 16
   ## every position.  Below the bound both paths compare byte at a time, and
   ## the walk does every branch at once.
 
-proc literalBytes(node: Node): string =
-  ## The exact bytes ``node`` matches with case folding off, or ``""`` when it
-  ## is not a plain literal.  Read where the matcher reads them: an
-  ## ``nkString`` carries ``bytes``, a literal re-encodes its rune.
-  case node.kind
-  of nkString:
-    node.bytes
-  of nkLiteral, nkEscapedLiteral:
-    var buf: array[4, char]
-    let cp = int32(if node.kind == nkLiteral: node.rune else: node.escapedRune)
-    let n = utf8Encode(cp, buf)
-    var s = newString(n)
-    for i in 0 ..< n:
-      s[i] = buf[i]
-    s
-  else:
-    ""
-
 proc buildAltTrie(alternatives: seq[Node]): AltTrie =
   ## Trie over ``alternatives`` when every one of them is a non-empty plain
   ## literal, else ``nil``.  Built as a linked tree and then flattened, so the

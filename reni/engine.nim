@@ -2863,6 +2863,29 @@ proc altChars(ctx: MatchContext, node: Node, i: int): int {.inline.} =
   else:
     -1
 
+proc altTails(ctx: MatchContext, node: Node, alts: Node): bool {.inline.} =
+  ## Whether the branches of look-behind ``node``'s alternation ``alts`` may
+  ## be passed over by their ``LookAlt.tail`` ([tailMisses]): the tails were
+  ## read under the flags ``lookBounds`` records, so they count only under
+  ## those, as the bounds do.
+  ctx.boundsUsable(node) and node.lookAlts.len == alts.alternatives.len
+
+proc tailMisses(ctx: MatchContext, tail: string, targetEnd: int): bool {.inline.} =
+  ## Whether the subject before ``targetEnd`` does not end with ``tail``, a
+  ## look-behind branch's ``LookAlt.tail``: then no start matches the branch,
+  ## which has to end at ``targetEnd`` with those bytes.  An empty ``tail``
+  ## names nothing and never misses.
+  let n = tail.len
+  if n == 0:
+    return false
+  if targetEnd < n:
+    return true
+  let base = targetEnd - n
+  for i in 0 ..< n:
+    if ctx.subject[base + i] != tail[i]:
+      return true
+  false
+
 proc fixedStart(ctx: MatchContext, targetEnd, fixedLen, chars: int): int {.inline.} =
   ## The one start of a look-behind body or branch of a fixed length:
   ## ``fixedLen`` bytes back, or failing that ``chars`` characters back
@@ -3038,7 +3061,10 @@ proc negLookbehindHolds(ctx: MatchContext, node: Node): bool =
   let body = peelBareGroups(node.lookBody)
   if body != nil and body.kind == nkAlternation:
     # Try each alternative independently — if ANY matches, negative fails
+    let tails = ctx.altTails(node, body)
     for i, alt in body.alternatives.view:
+      if tails and ctx.tailMisses(node.lookAlts[i].tail, targetEnd):
+        continue
       let altLen = ctx.altBounds(node, i, alt)
       let altFbl = altLen.fixedLen
       let chars = ctx.altChars(node, i)
@@ -3122,7 +3148,11 @@ proc lookbehindAltNext(ctx: MatchContext, top: int): bool =
     # left the exhaustion tail below does the same, so skip it here.
     rewind(ctx, ctx.choices[top].lbaSaved)
     restoreStackLens(ctx, @(ctx.stackLensSaves[int(ctx.choices[top].lbaLensOff)]))
+  let tails = ctx.altTails(node, alts)
   while k < alts.alternatives.len:
+    if tails and ctx.tailMisses(node.lookAlts[k].tail, targetEnd):
+      inc k
+      continue
     let alt {.cursor.} = alts.alternatives[k]
     let altLen = ctx.altBounds(node, k, alt)
     let altFbl = altLen.fixedLen
