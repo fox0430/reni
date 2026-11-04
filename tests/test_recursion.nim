@@ -150,6 +150,80 @@ suite "Subroutine calls and recursion":
     check not search("xXy", re("x(?i:\\g<0>|y)")).found
     check search("xxy", re("x(?i:\\g<0>|y)")).matchSpan == Span(a: 0, b: 3)
 
+  test "a called group runs under the grapheme mode it is written under":
+    # As under its flags: Oniguruma settles the mode while compiling, so the
+    # caller's has no say in what the body reads.  Spans read off Oniguruma
+    # 6.9.10.
+    check search("xab cd", re("(?<n>\\X)(?y{w}:\\g<n>)")).matchSpan == 0 .. 2
+    # By number and by a relative number, reading the mode of the group named
+    # and not of the one after it.
+    check search("xab cd", re("(\\X)(?y{w}:\\g<1>)")).matchSpan == 0 .. 2
+    check search("xab cd", re("(\\X)(?y{w}:\\g<-1>)")).matchSpan == 0 .. 2
+    check search("ab cd", re("(?y{w}:\\g<+1>)(\\X)")).matchSpan == 0 .. 2
+    check search("xabc d", re("(\\X)(?y{w}:(a))\\g<1>")).matchSpan == 0 .. 3
+    check search("ab cd e", re("(?y{w}:(\\X)) \\g<1>")).matchSpan == 0 .. 5
+    check search("ab cd e", re("(?y{w}:(\\X)) \\g<-1>")).matchSpan == 0 .. 5
+    # A group renumbered when the unnamed one before it stops capturing.
+    check search("xab cd", re("(x)(?y{w}:(?<n>\\X))\\g<n>")).matchSpan == 0 .. 4
+    check search("ab cd", re("(?y{g}:(?<n>\\X))(?y{w}:\\g<n>)")).matchSpan == 0 .. 2
+    check search("ab cd e", re("(?y{w}:(?<n>\\X)) \\g<n>")).matchSpan == 0 .. 5
+    check search("ab cd e", re("(?y{w}:(?<n>\\X)) (?y{g}:\\g<n>)")).matchSpan == 0 .. 5
+    # ``\y`` and ``\Y`` read it as ``\X`` does.
+    check search("abab", re("(?<n>a\\yb)(?y{w}:\\g<n>)")).matchSpan == 0 .. 4
+    check search("abab", re("(?y{w}:(?<n>a\\Yb))\\g<n>")).matchSpan == 0 .. 4
+    # A call in a look-ahead, and a call from a called group.
+    check search("ab cd", re("(?y{w}:(?=\\g<n>b)\\X)(?<n>\\X){0}")).matchSpan == 0 .. 2
+    check search("xab cd ef", re("(?<a>\\X)(?<b>(?y{w}:\\g<a>\\X))\\g<b>")).matchSpan ==
+      0 .. 6
+
+  test "\\g<0> runs under the modes the pattern writes, not the caller's":
+    check search("qbcd e", re("b\\X|(?y{w}:q\\g<0>)")).matchSpan == 0 .. 3
+    check search("qbcd e", re("(?y{w}:b\\X|q\\g<0>)")).matchSpan == 0 .. 4
+
+  test "a call leaves the caller's grapheme mode as it found it":
+    # After the body, whichever of the two set a mode.
+    check search("abcd ef", re("(?y{w}:\\g<n>\\X)(?<n>\\X){0}")).matchSpan == 0 .. 4
+    check search("aabc", re("(?y{w}:(?<n>a))\\g<n>\\X")).matchSpan == 0 .. 3
+    # After a call that failed.
+    check search("abcd ef", re("(?y{w}:(?:\\g<n>z|\\X))(?<n>\\X){0}")).matchSpan ==
+      0 .. 4
+    # Backtracking into the returned body runs it under its own mode again.
+    check search("abcde", re("(?<n>\\X?\\X)(?y{w}:\\g<n>)d")).matchSpan == 0 .. 4
+
+  test "only a call into another grapheme mode is wrapped":
+    proc wrappers(n: Node): seq[GraphemeMode] =
+      ## The mode of every flag group that holds a call and nothing else.
+      if n.kind == nkFlagGroup and n.flagBody != nil and n.flagBody.kind == nkSubexpCall:
+        result.add n.graphemeMode
+      for c in n.childNodes:
+        result.add wrappers(c)
+
+    check wrappers(re("(?<n>a)\\g<n>").ast).len == 0
+    check wrappers(re("(?y{g}:(?<n>a)\\g<n>)").ast).len == 0
+    check wrappers(re("(?y{g}:(?<n>a))\\g<n>").ast) == @[gmGrapheme]
+    check wrappers(re("(?<n>a)(?y{g}:b\\g<n>)").ast) == @[gmOff]
+    check wrappers(re("(?y{g}:(?<n>a))(?y{w}:b\\g<n>)").ast) == @[gmGrapheme]
+    # ``\g<0>`` enters under no mode, and a name called twice its first group.
+    check wrappers(re("(?y{w}:q\\g<0>?)").ast) == @[gmOff]
+    check wrappers(re("(?y{g}:(a))|q\\g<0>?").ast).len == 0
+    check wrappers(re("(?<n>a)|(?y{g}:(?<n>b))|c\\g<n>").ast).len == 0
+    # A repeat of a call keeps its target, wrapped or not.
+    check search("aaa", re("(?y{g}:(?<n>a))\\g<n>{2}")).matchSpan == 0 .. 3
+
+  test "a look-behind a call reaches keeps what the compiler marked on it":
+    # A mode the look-behind was not measured under used to cost it the mark
+    # that runs it without a window, and ``\b`` at a window's start holds where
+    # the subject's does not: ``2 .. 2``, past the two letters.
+    proc span(pattern: string): Span =
+      search("ck ", re(pattern, {rfCaptureGroup})).matchSpan
+
+    const body = "(?<=\\1\\b)"
+    check span("()(?<n>" & body & ")\\g<n>") == 0 .. 0
+    check span("()(?<n>" & body & ")(?y{g}:\\g<n>)") == 0 .. 0
+    check span("()(?<n>" & body & ")(?y{w}:\\g<n>)") == 0 .. 0
+    check span("(?y{g}:()(?<n>" & body & "))\\g<n>") == 0 .. 0
+    check span("(?y{g}:()(?<n>" & body & "))(?y{w}:\\g<n>)") == 0 .. 0
+
 suite "Mutual recursion detection":
   test "direct self-recursion (?<a>(?&a)) detected":
     expect RegexError:

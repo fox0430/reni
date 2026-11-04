@@ -1163,6 +1163,86 @@ proc mergeLiterals(node: Node): Node =
   else:
     node
 
+proc collectGroupModes(node: Node, modes: var seq[GraphemeMode], mode: GraphemeMode) =
+  ## Walk the AST for the grapheme mode each capture group is written under,
+  ## which ``mode`` holds where ``node`` sits.  A flag group that names none
+  ## leaves it, as in ``annotateLookaroundBounds``.  An isolated ``(?y{g})``
+  ## wraps what follows it (``parseConcat``), so no concat threads one along.
+  if node == nil:
+    return
+  var active = mode
+  case node.kind
+  of nkCapture:
+    if node.captureIndex >= modes.len:
+      modes.setLen(node.captureIndex + 1)
+    modes[node.captureIndex] = active
+  of nkNamedCapture:
+    if node.namedCaptureIndex >= modes.len:
+      modes.setLen(node.namedCaptureIndex + 1)
+    modes[node.namedCaptureIndex] = active
+  of nkFlagGroup:
+    if node.graphemeMode != gmNone:
+      active = node.graphemeMode
+  else:
+    discard
+  for child in node.childNodes:
+    collectGroupModes(child, modes, active)
+
+proc calledGroupMode(
+    call: Node, modes: seq[GraphemeMode], names: seq[(string, int)]
+): GraphemeMode =
+  ## The mode the group ``call`` enters is written under.  ``\g<0>`` enters
+  ## the whole pattern, under none, and a name declared twice its first group,
+  ## as the matcher does.
+  var group = -1
+  if call.callIndex > 0:
+    group = call.callIndex - 1
+  elif call.callIndex < 0 and call.callName.len > 0:
+    for idx in names.namedGroupsRead(call.callName, EveryNamedGroup):
+      group = idx
+      break
+  if group >= 0 and group < modes.len:
+    modes[group]
+  else:
+    gmNone
+
+proc settleCallModes(
+    node: Node, modes: seq[GraphemeMode], names: seq[(string, int)], mode: GraphemeMode
+) =
+  ## Oniguruma settles the grapheme mode while compiling, so a group reads
+  ## ``\X``, ``\y`` and ``\Y`` under the mode written around it, whoever calls
+  ## it: ``(?<n>\X)(?y{w}:\g<n>)`` takes one character.  The matcher carries the
+  ## mode at run time and a call does not touch it, so a call written under
+  ## another mode than its group's becomes ``(?y{m}:\g<n>)`` here, and the flag
+  ## group sets the mode and puts the caller's back, on the way out and when
+  ## backtracking.  In place, as a call has no one parent kind.
+  ##
+  ## A call into its own mode stays bare, so what holds no mode costs nothing.
+  ## ``annotateLookaroundBounds`` counts on this: past here a look-around only
+  ## ever runs under the mode written around it.
+  if node == nil:
+    return
+  var active = mode
+  case node.kind
+  of nkSubexpCall:
+    let target = calledGroupMode(node, modes, names)
+    if target != active:
+      let call = Node(kind: nkSubexpCall)
+      call[] = node[]
+      node[] = Node(
+        kind: nkFlagGroup,
+        flagBody: call,
+        graphemeMode: if target == gmNone: gmOff else: target,
+      )[]
+    return
+  of nkFlagGroup:
+    if node.graphemeMode != gmNone:
+      active = node.graphemeMode
+  else:
+    discard
+  for child in node.childNodes:
+    settleCallModes(child, modes, names, active)
+
 proc markQuantBodyPure(node: Node): bool =
   ## Records on every quantifier, lookaround and consuming conditional whether
   ## its body can write state that a rollback snapshot restores: captures,
@@ -3306,6 +3386,12 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # divide the look-behinds Oniguruma does.  Runs before every pass that reads
   # bounds; a reduced body may become fixed-length.
   tuneLookBehinds(ast, namedCaptures, flags, p.sawGroupRead or p.sawCall)
+  # On the tree's final shape, as what wraps a call is a flag group, which
+  # the passes below record as a write.
+  if p.sawCall and p.sawGraphemeMode:
+    var modes: seq[GraphemeMode]
+    collectGroupModes(ast, modes, gmNone)
+    settleCallModes(ast, modes, namedCaptures, gmNone)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).
