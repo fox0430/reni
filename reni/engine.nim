@@ -2767,7 +2767,9 @@ proc endCheckFrame(targetPos: int): Frame {.inline.} =
   Frame(kind: ckEndCheckPos, parent: TrueCont, ecpTargetPos: targetPos)
 
 proc boundsUsable(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether ``node`` bounds were compiled under current flags/mode.
+  ## Whether ``node`` bounds were compiled under current flags/mode.  The
+  ## matcher reaches a look-around under the ones written around it: a call
+  ## takes its group's flags, and [settleCallModes] gives it the group's mode.
   node.lookBoundsValid and node.lookBoundsFlags == ctx.flags and
     node.lookBoundsGm == ctx.graphemeMode
 
@@ -4293,7 +4295,8 @@ proc runMachine(
           ctx.pushChoice Choice(kind: chUndoFlagsGM, ugFlags: savedFlags, ugGM: savedGM)
           ctx.flags = ctx.flags + node.flagsOn - node.flagsOff
           if node.graphemeMode != gmNone:
-            ctx.graphemeMode = node.graphemeMode
+            ctx.graphemeMode =
+              if node.graphemeMode == gmOff: gmNone else: node.graphemeMode
           cont = pushFrame(
             ctx,
             Frame(

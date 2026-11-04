@@ -1039,10 +1039,10 @@ proc takesClusters(piece: Node, g: var GroupSpans): bool =
   ## counts it as one character: [charSpan] counts as Oniguruma does, and
   ## under ``(?y{g})`` and ``(?y{w})`` the matcher's ``.`` is a cluster
   ## (``charTypeAdvance`` in ``engine``).  It may be in ``piece``, or in a
-  ## group whose text a reference reads or a call runs, under whatever mode
-  ## the group ran in.  So in a pattern that sets either mode anywhere, any
-  ## ``.`` reached counts, and such a piece keeps its window.  A look-around
-  ## takes nothing.
+  ## group whose text a reference reads or a call runs.  The walk does not
+  ## follow the modes, so in a pattern that sets either mode anywhere, any
+  ## ``.`` reached counts, under a mode or not, and such a piece keeps its
+  ## window.  A look-around takes nothing.
   if not g.clusterModes:
     return false
   var seen = newSeq[bool](g.bodies.len + 1)

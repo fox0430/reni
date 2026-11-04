@@ -85,6 +85,9 @@ type Parser* = object
   sawCall*: bool
     ## True once a subexpression call has been parsed, so the compiler can
     ## skip ``checkNeverEndingRecursion`` when nothing calls a group.
+  sawGraphemeMode*: bool
+    ## True once a ``(?y{g})`` or ``(?y{w})`` has been parsed, so the compiler
+    ## can skip ``settleCallModes`` when every group is ``gmNone``.
   sawAhead*: bool
     ## True once a ``(?=...)`` group has been parsed, so the compiler can skip
     ## the first-byte walk that reads look-aheads when there is none.  A
@@ -1912,6 +1915,7 @@ proc parseGroup(p: var Parser, atHead = false): Node =
       result = Node(kind: nkAtomicGroup, atomicBody: body)
     of 'y':
       # (?y{g}) or (?y{w}) — grapheme mode flag
+      p.sawGraphemeMode = true
       p.advance() # skip 'y'
       p.expect('{')
       var mode = ""

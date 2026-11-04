@@ -76,6 +76,10 @@ type
     gmNone ## default (no grapheme mode)
     gmGrapheme ## (?y{g}) - grapheme cluster mode
     gmWord ## (?y{w}) - word mode
+    gmOff
+      ## On a flag group, where ``gmNone`` leaves the mode alone: back to
+      ## ``gmNone``.  Only [settleCallModes] writes it, around a call into a
+      ## group written under no mode; the matcher's own mode is never this.
 
   AbsentKind* = enum
     abClear ## (?~|) - range clear: matches empty, widens the range back out
@@ -454,9 +458,9 @@ type
       lookBounds*: LenBounds
         ## [lengthBounds] of ``lookBody`` (and of each alternative, in
         ## ``lookAlts``), so a lookbehind need not rewalk the body's tree
-        ## at every position.  Filled in by ``annotateLookaroundBounds``; only
-        ## usable while ``lookBoundsFlags`` matches the flags in force, since a
-        ## subexpression call can reach the same lookaround under others.
+        ## at every position.  Filled in by ``annotateLookaroundBounds`` under
+        ## the flags and mode written around it, which are the ones it runs
+        ## under, through a call too (``boundsUsable`` in ``engine``).
       lookAlts*: seq[LookAlt]
         ## [lengthBounds] of each alternative when ``lookBody`` is an
         ## alternation, empty otherwise. Cached because ``altWindow`` runs per
