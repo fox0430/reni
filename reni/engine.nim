@@ -7,7 +7,7 @@ import std/[unicode, tables, macros, bitops]
 from std/strutils import find
 from std/typetraits import supportsCopyMem
 
-import types, unicode_utils, stackguard, leafgate
+import types, unicode_utils, stackguard, leafgate, fold_unravel
 
 # Re-exported so callers can read the compiled-in budget (used by tests).
 export stackguard.MaxStackBytes
@@ -722,6 +722,10 @@ template oa(s: Subject): untyped =
   ## The view as an ``openArray[char]``, for the Unicode helpers.
   toOpenArray(s.data, 0, s.size - 1)
 
+template oaTo(s: Subject, limit: int): untyped =
+  ## The view up to ``limit`` as an ``openArray[char]``.
+  toOpenArray(s.data, 0, limit - 1)
+
 const NoLookLimit = int.high ## ``lookLimit`` outside a look-behind body.
 
 template subjectEnd(ctx: MatchContext): int =
@@ -735,7 +739,7 @@ proc decodeCharUpTo(
 ): bool {.inline.} =
   ## Decode char at ``p`` against a subject that ends at ``limit``; false if
   ## truncated there.
-  decodeAt(toOpenArray(ctx.subject.data, 0, limit - 1), p, code, next)
+  decodeAt(ctx.subject.oaTo(limit), p, code, next)
 
 proc decodeChar(
     ctx: MatchContext, p: int, code: var int32, next: var int
@@ -1410,7 +1414,10 @@ proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
   ok
 
 proc matchEncodedBytes(ctx: MatchContext, target: Rune, p: int): int =
-  ## [matchBytes] for a character of more than one byte.
+  ## [matchBytes] for a character of more than one byte.  Indexes the
+  ## subject directly: a helper shared with ``fold_unravel.spelledAs`` over
+  ## ``oaTo`` cost the lazy bench item +2.6% instructions (the view's bound
+  ## checks).
   var buf: array[4, char]
   let n = utf8Encode(int32(target), buf)
   if p + n > ctx.subjectEnd:
@@ -1442,9 +1449,10 @@ const
   LiteralWays = 0b11'u32
     ## Ways one literal can match: direct compare plus ``(?i)`` multi-char fold.
 
-proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
-  ## End offset of the ``variant``-th way ``target`` matches at ``ctx.pos``,
-  ## or -1. Leaves ``ctx.pos`` alone; caller keeps untried variants.
+proc literalAdvance(ctx: MatchContext, node: Node, target: Rune, variant: int): int =
+  ## End offset of the ``variant``-th way ``target``, the rune of literal
+  ## ``node``, matches at ``ctx.pos``, or -1. Leaves ``ctx.pos`` alone; caller
+  ## keeps untried variants.
   let start = ctx.pos
   if start >= ctx.subjectEnd:
     return -1
@@ -1464,69 +1472,45 @@ proc literalAdvance(ctx: MatchContext, target: Rune, variant: int): int =
     let r = Rune(code)
     if codeIsClassifiable(code, next - start) and
         (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
+      # Only a fold source has a plain way to check ([plainSpelled]); the
+      # set test keeps every other literal off the call.
+      if hasMultiCharFold(target) and
+          not plainSpelled(
+            ctx.subject.oaTo(ctx.subjectEnd), node, target, start, next, code, ctx.flags
+          ):
+        return -1
       return next
     return -1
   if variant != 1:
     return -1
   # Multi-char fold: pattern char folds to multiple chars (e.g., ß → ss)
-  if not foldsAboveAscii(ctx.flags):
-    return -1
-  let fold = getMultiCharFold(target)
-  if fold.len == 0:
-    return -1
-  var p = start
-  for i in 0 ..< fold.len:
-    if p >= ctx.subjectEnd:
-      return -1
-    var sc: int32
-    var sn: int
-    if not decodeChar(ctx, p, sc, sn) or not codeIsClassifiable(sc, sn - p) or
-        not caseInsensitiveMatch(Rune(sc), fold.runes[i], ctx.flags):
-      return -1
-    p = sn
-  p
+  literalFoldEnd(ctx.subject.oaTo(ctx.subjectEnd), node, target, start, ctx.flags)
 
 const BulkCompareLen = 16
   ## Byte length from which a run goes through ``memcmp``; below it the call
   ## costs more than the compares it saves.
 
-proc stringAdvance(ctx: MatchContext, node: Node): int =
-  ## End offset of ``node``'s run of literals matched at ``ctx.pos``, or -1.
-  ## Single parse, no variants. Leaves ``ctx.pos`` alone.
-  if rfIgnoreCase notin ctx.flags:
-    # Every character has one encoding here, so comparing the run's bytes is
-    # the same test as comparing it character by character.
-    let n = node.bytes.len
-    if n == 0:
-      return -1
-    if ctx.pos + n > ctx.subjectEnd:
-      return -1
-    if n >= BulkCompareLen:
-      if not equalMem(addr ctx.subject.data[ctx.pos], unsafeAddr node.bytes[0], n):
-        return -1
-    else:
-      for i in 0 ..< n:
-        if ctx.subject[ctx.pos + i] != node.bytes[i]:
-          return -1
-    return ctx.pos + n
-
+proc generalRunEnd(ctx: MatchContext, node: Node): int {.noinline.} =
+  ## [stringAdvance] past its ASCII compare: a subject byte above 0x7F, a
+  ## non-ASCII run, or too little subject left for one byte a character.
+  ## Out of line, so the common compare keeps a short prologue.
   let runes {.cursor.} = node.runes
-  if node.bytes.len == runes.len and ctx.pos + runes.len <= ctx.subjectEnd:
-    # One byte per character: the run is pure ASCII, and no multi-character
-    # fold starts from ASCII, so while the subject stays ASCII the two line up
-    # byte for character.  A high byte can still match through a fold (ſ for
-    # s), so it hands the run back to the general loop instead of rejecting.
-    var k = 0
-    while k < runes.len:
-      let sb = uint8(ctx.subject[ctx.pos + k])
-      if sb >= 0x80'u8:
-        break
-      if asciiFoldByte(sb) != uint8(node.foldedBytes[k]):
-        return -1
-      inc k
-    if k == runes.len:
-      return ctx.pos + runes.len
-
+  if ctx.pos >= ctx.subjectEnd:
+    # Most runs that get here: a start at the end, which no call need answer.
+    return -1
+  when not defined(release):
+    # A string built after ``markFoldedRuns`` reads both marks ``false``,
+    # the plain loop's reading, and would go wrong only on a non-canonical
+    # subject.
+    if foldsAboveAscii(ctx.flags):
+      assert node.runUneven == (not node.runBehind and foldsUnevenly(runes)),
+        "nkString built after markFoldedRuns"
+  if node.runUneven and foldsAboveAscii(ctx.flags):
+    # Oniguruma's windows ([foldedRunEnd]).  Inside a look-behind it applies
+    # no multi-character fold at all; reni still does, below.  A string with
+    # no window or fold source reads the same in the loop below, whose
+    # multi-character fold tries never fire on it.
+    return foldedRunEnd(ctx.subject.oaTo(ctx.subjectEnd), ctx.pos, runes, ctx.flags)
   var p = ctx.pos
   var i = 0
   while i < runes.len:
@@ -1583,6 +1567,45 @@ proc stringAdvance(ctx: MatchContext, node: Node): int =
           continue
     return -1
   p
+
+proc stringAdvance(ctx: MatchContext, node: Node): int =
+  ## End offset of ``node``'s run of literals matched at ``ctx.pos``, or -1.
+  ## Single parse, no variants. Leaves ``ctx.pos`` alone.
+  if rfIgnoreCase notin ctx.flags:
+    # Every character has one encoding here, so comparing the run's bytes is
+    # the same test as comparing it character by character.
+    let n = node.bytes.len
+    if n == 0:
+      return -1
+    if ctx.pos + n > ctx.subjectEnd:
+      return -1
+    if n >= BulkCompareLen:
+      if not equalMem(addr ctx.subject.data[ctx.pos], unsafeAddr node.bytes[0], n):
+        return -1
+    else:
+      for i in 0 ..< n:
+        if ctx.subject[ctx.pos + i] != node.bytes[i]:
+          return -1
+    return ctx.pos + n
+
+  let runes {.cursor.} = node.runes
+  if node.bytes.len == runes.len and ctx.pos + runes.len <= ctx.subjectEnd:
+    # One byte per character: the run is pure ASCII, and no multi-character
+    # fold starts from ASCII, so while the subject stays ASCII the two line up
+    # byte for character.  A high byte can still match through a fold (ſ for
+    # s), so it hands the run back to the general loop instead of rejecting.
+    var k = 0
+    while k < runes.len:
+      let sb = uint8(ctx.subject[ctx.pos + k])
+      if sb >= 0x80'u8:
+        break
+      if asciiFoldByte(sb) != uint8(node.foldedBytes[k]):
+        return -1
+      inc k
+    if k == runes.len:
+      return ctx.pos + runes.len
+
+  generalRunEnd(ctx, node)
 
 proc charTypeAdvance(ctx: MatchContext, ct: CharTypeKind): int =
   ## End offset of ``ct`` matched at ``ctx.pos``, or -1. Single way only.
@@ -2056,9 +2079,9 @@ proc leafVariantAdvance(ctx: MatchContext, node: Node, variant: int): int {.inli
   ## enumerating a leaf's ways does not have to branch on the node kind first.
   case node.kind
   of nkLiteral:
-    literalAdvance(ctx, node.rune, variant)
+    literalAdvance(ctx, node, node.rune, variant)
   of nkEscapedLiteral:
-    literalAdvance(ctx, node.escapedRune, variant)
+    literalAdvance(ctx, node, node.escapedRune, variant)
   of nkCharClass:
     classAdvance(ctx, node, variant)
   else:
@@ -4153,7 +4176,7 @@ proc runMachine(
         else:
           # A literal without a multi-character fold has no second way.
           tryLeafVariants(
-            LiteralWays, not isSingleWayLeaf(ctx, node), literalAdvance(ctx, r, v)
+            LiteralWays, not isSingleWayLeaf(ctx, node), literalAdvance(ctx, node, r, v)
           )
       of nkCharClass:
         # Through ``leafVariantAdvance`` although the kind is known: calling

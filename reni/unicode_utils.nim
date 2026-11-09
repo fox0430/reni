@@ -1694,6 +1694,20 @@ const FullFoldExpansions = block:
         folds.add fold
   folds
 
+template foldPairKey(a, b: int32): uint16 =
+  ## A 16-bit key for the first two characters of a fold, low bytes only:
+  ## distinct pairs may share one, so a hit still walks the table.
+  uint16((a and 0xFF) shl 8 or (b and 0xFF))
+
+const FullFoldExpansionPairs = block:
+  ## [foldPairKey] of every [FullFoldExpansions] fold's first two
+  ## characters.  Rejects a run no fold begins with in one set test, before
+  ## the table walk ``s``, ``f`` and ``i`` would pay at every position.
+  var keys: set[uint16]
+  for fold in FullFoldExpansions:
+    keys.incl foldPairKey(fold[0], fold[1])
+  keys
+
 proc foldsUnevenly*(runes: openArray[Rune]): bool =
   ## Whether a ``(?i)`` string holds a character, or a run of them, that
   ## folds with something of another number of characters: a character with
@@ -1703,11 +1717,18 @@ proc foldsUnevenly*(runes: openArray[Rune]): bool =
   ## lengths -- ``ß`` one of ``ß`` and ``ss``, ``ſt`` one of ``ſt``, ``ﬅ``
   ## and ``ﬆ`` -- outside a look-behind.
   for i, r in runes:
-    if inRangeTable(int32(r), AllMultiCharFoldSources):
+    let cp = int32(r)
+    # Every fold source is at or above ``ß`` (U+00DF).
+    if cp >= 0xDF and inRangeTable(cp, AllMultiCharFoldSources):
       return true
+    if i + 1 >= runes.len:
+      continue
+    let first = int32(simpleFold(r))
+    if foldPairKey(first, int32(simpleFold(runes[i + 1]))) notin FullFoldExpansionPairs:
+      continue
     for fold in FullFoldExpansions:
-      if i + fold.len <= runes.len:
-        var j = 0
+      if fold[0] == first and i + fold.len <= runes.len:
+        var j = 1
         while j < fold.len and int32(simpleFold(runes[i + j])) == fold[j]:
           inc j
         if j == fold.len:
