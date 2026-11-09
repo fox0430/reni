@@ -292,8 +292,10 @@ type
     case kind*: NodeKind
     of nkLiteral:
       rune*: Rune
+      literalBehind*: bool ## See ``runBehind``.
     of nkEscapedLiteral:
       escapedRune*: Rune
+      escapedBehind*: bool ## See ``runBehind``.
     of nkConcat:
       children*: seq[Node]
     of nkAlternation:
@@ -556,6 +558,19 @@ type
         ## ``bytes`` under ``asciiFoldByte``, for the ignore-case compare of an
         ## ASCII run. Built alongside ``bytes`` so the compare loop tests a
         ## folded subject byte against a constant.
+      runBehind*: bool
+        ## Inside a look-behind, where Oniguruma unravels a ``(?i)`` string
+        ## one character for one (``unravel_cf_look_behind_add``) and no
+        ## multi-character fold window applies (``fold_unravel``).  Set by
+        ## ``markFoldedRuns`` on the final tree; a node built after it
+        ## reads ``false``.  In the padding after ``foldedBytes``, so the
+        ## node stays 64 bytes.
+      runUneven*: bool
+        ## Outside a look-behind and ``foldsUnevenly(runes)``: some window or
+        ## fold source Oniguruma unravels into a choice of plain strings
+        ## (``fold_unravel``).  Without one every character is a class of
+        ## its case variants, the plain loop's reading.  Set with
+        ## ``runBehind``; also in the padding.
 
   AltTrieEdge* = object
     ## One labelled step of an [AltTrie]. The edges leaving a state are

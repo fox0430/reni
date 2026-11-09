@@ -1060,6 +1060,28 @@ proc newStringNode(runes: seq[Rune]): Node =
     folded[i] = char(asciiFoldByte(uint8(bytes[i])))
   Node(kind: nkString, runes: runes, bytes: bytes, foldedBytes: folded)
 
+proc markFoldedRuns(node: Node, behind: bool) =
+  ## Mark every literal and string inside a look-behind body (``runBehind``),
+  ## a look-ahead nested in one included, as Oniguruma's ``IN_LOOK_BEHIND``
+  ## state reaches it, and every string outside one that Oniguruma unravels
+  ## into fold windows (``runUneven``).  A group a call runs is marked where
+  ## it is written.
+  if node == nil:
+    return
+  case node.kind
+  of nkLiteral:
+    node.literalBehind = behind
+  of nkEscapedLiteral:
+    node.escapedBehind = behind
+  of nkString:
+    node.runBehind = behind
+    node.runUneven = not behind and foldsUnevenly(node.runes)
+  of nkLookaround:
+    markFoldedRuns(node.lookBody, behind or node.lookKind in {lkBehind, lkNegBehind})
+  else:
+    for child in node.childNodes:
+      markFoldedRuns(child, behind)
+
 proc mergeLiterals(node: Node): Node =
   ## Merge consecutive nkLiteral/nkEscapedLiteral children in nkConcat into nkString.
   if node == nil:
@@ -3381,7 +3403,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   # literal, as Oniguruma does while parsing and in ``tune_quant``.  Must run
   # before the look-behind reduction, which only sees a leading repeat over a
   # simple atom and so needs both shapes settled first.
-  tuneRepeats(ast, expand = not foldsAnywhere(ast, flags))
+  let folds = foldsAnywhere(ast, flags)
+  tuneRepeats(ast, expand = not folds)
   # Pin a look-behind body's leading repeats to their lower bound, and drop or
   # divide the look-behinds Oniguruma does.  Runs before every pass that reads
   # bounds; a reduced body may become fixed-length.
@@ -3392,6 +3415,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     var modes: seq[GraphemeMode]
     collectGroupModes(ast, modes, gmNone)
     settleCallModes(ast, modes, namedCaptures, gmNone)
+  # On the final tree, as a node rebuilt after it would read ``false``
+  # (generalRunEnd checks the marks in a debug build).  Only a folding string
+  # or literal reads them.
+  if folds:
+    markFoldedRuns(ast, false)
   # Must run on the final AST: ``mergeLiterals`` rebuilds nodes and would drop
   # the annotation.  Nodes default to ``quantBodyPure == false``, so a rewrite
   # added after this line stays safe (it just always snapshots).

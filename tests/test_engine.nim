@@ -5177,3 +5177,64 @@ suite "an alternation takes no capture snapshot":
   test "a group written next to \\K and a backreference":
     check readsUnset("(?:a|a.)(?:\\K(b)x|c)")
     check readsUnset("(?:a|a.)(?:(b)\\1x|c)")
+
+suite "a (?i) string unravels as Oniguruma's fold windows":
+  # Oniguruma's ``unravel_case_fold_string`` cuts a ``(?i)`` string left to
+  # right into windows: three or two characters whose folds spell a
+  # multi-character fold (``ffi``, ``ss``), the longer first, else one.  A
+  # window, and a fold source written alone (``ß``), is a choice of plain
+  # strings; any other character a class of its case variants.  Every row is
+  # libonig 6.9.10's answer.
+  const LongS3 = "\xE0\x85\xBF" # ſ, overlong
+  const LongS4 = "\xF0\x80\x85\xBF" # ſ, overlong
+  const LongSharpS = "\xE0\x83\x9F" # ß, overlong
+
+  test "a fold matches inside one window, not across two":
+    check search("ßs", re("(?i)sss")).matchSpan == 0 .. 3
+    check not search("sß", re("(?i)sss")).found
+    check search("ßß", re("(?i)ssss")).matchSpan == 0 .. 4
+    check not search("sßß", re("(?i)sssss")).found
+    check not search("sﬆ", re("(?i)sst")).found
+    check search("aßt", re("(?i)asst")).matchSpan == 0 .. 4
+    check search("xß", re("(?i)xss")).matchSpan == 0 .. 3
+
+  test "the three-character window comes first":
+    check search("ﬃ", re("(?i)ffi")).matchSpan == 0 .. 3
+    check not search("ﬀi", re("(?i)ffi")).found
+    check not search("fﬁ", re("(?i)ffi")).found
+    check search("ﬀf", re("(?i)fff")).matchSpan == 0 .. 4
+    check not search("fﬀ", re("(?i)fff")).found
+
+  test "a window matches its characters' case variants one by one":
+    check search("sſ", re("(?i)ss")).matchSpan == 0 .. 3
+    check search("\xC5\xBF\xC5\xBF", re("(?i)ss")).matchSpan == 0 .. 4
+    check search("ẞ", re("(?i)ss")).matchSpan == 0 .. 3
+    check search("ﬆ", re("(?i)ſt")).matchSpan == 0 .. 3
+
+  test "a window takes no overlong or stray-byte form":
+    check not search(LongS3 & "s", re("(?i)ss")).found
+    check not search("s" & LongS3, re("(?i)ss")).found
+    check not search(LongS4 & LongS4, re("(?i)ss")).found
+    check not matchAt(LongS4 & LongS4, re("(?i)ss\\Z"), 0).found
+    check not search(LongS4 & "t", re("(?i)st")).found
+    check not search(LongSharpS, re("(?i)ss")).found
+    check not matchAt("\xF0\x8F\xAC\x80", re("(?i)ff\\Z"), 0).found
+    check not search("\xC5?s", re("(?i)ss")).found
+    # Outside a window an s is a class, which reads an overlong ſ.
+    check search(LongS4 & "a", re("(?i)sa")).matchSpan == 0 .. 5
+    check search("\xC5?a", re("(?i)sa")).matchSpan == 0 .. 3
+
+  test "a fold source written alone takes no overlong form":
+    check not search("1" & LongSharpS, re("(?i)\\x{DF}")).found
+    check not search("s" & LongS3, re("(?i)ß")).found
+    check search("sſ", re("(?i)ß")).matchSpan == 0 .. 3
+    check search("ẞ", re("(?i)ß")).matchSpan == 0 .. 3
+    # A class still reads it.
+    check search("1" & LongSharpS, re("(?i)[\\x{DF}]")).matchSpan == 1 .. 4
+
+  test "a look-behind keeps reni's reading":
+    # Oniguruma unravels a string one character for one there, so an overlong
+    # ſ matches; it also applies no multi-character fold, which reni still
+    # does (``(?<=(?i)ss)x`` on ``ßx``).
+    check search(LongS3 & "sx", re("(?<=(?i)ss)x")).matchSpan == 4 .. 5
+    check search(LongS3 & "sx", re("(?i)(?<=ss)x")).matchSpan == 4 .. 5
