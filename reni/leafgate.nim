@@ -25,10 +25,10 @@ proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
     node.runes.len > 0
   of nkLiteral, nkEscapedLiteral:
     # The second way a literal can match is the multi-character fold, which
-    # only exists under [foldsAboveAscii] and only for a character that
-    # has one.
+    # only exists under [foldsAboveAscii], only for a character that has
+    # one, and only outside a look-behind.
     let r = if node.kind == nkLiteral: node.rune else: node.escapedRune
-    not foldsAboveAscii(flags) or not hasMultiCharFold(r)
+    not foldsAboveAscii(flags) or not hasMultiCharFold(r) or leafBehind(node)
   of nkCharClass:
     not classFoldsApply(node, flags)
   else:

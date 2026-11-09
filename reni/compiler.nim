@@ -1062,10 +1062,10 @@ proc newStringNode(runes: seq[Rune]): Node =
 
 proc markFoldedRuns(node: Node, behind: bool) =
   ## Mark every literal and string inside a look-behind body (``runBehind``),
-  ## a look-ahead nested in one included, as Oniguruma's ``IN_LOOK_BEHIND``
-  ## state reaches it, and every string outside one that Oniguruma unravels
-  ## into fold windows (``runUneven``).  A group a call runs is marked where
-  ## it is written.
+  ## a look-behind nested in a look-ahead included, as Oniguruma's
+  ## ``IN_LOOK_BEHIND`` state reaches it, and every string outside one that
+  ## Oniguruma unravels into fold windows (``runUneven``).  A group a call
+  ## runs is marked where it is written.
   if node == nil:
     return
   case node.kind
@@ -1075,12 +1075,35 @@ proc markFoldedRuns(node: Node, behind: bool) =
     node.escapedBehind = behind
   of nkString:
     node.runBehind = behind
-    node.runUneven = not behind and foldsUnevenly(node.runes)
+    node.runUneven = unevenMark(node.runes, behind)
   of nkLookaround:
     markFoldedRuns(node.lookBody, behind or node.lookKind in {lkBehind, lkNegBehind})
   else:
     for child in node.childNodes:
       markFoldedRuns(child, behind)
+
+proc foldMarksHold(node: Node, behind: bool): bool =
+  ## Whether every literal and string under ``node`` carries the marks
+  ## [markFoldedRuns] gives it.  A node a later pass built reads them unset,
+  ## which loses its multi-character folds outside a look-behind or brings
+  ## them back inside one, on canonical text too.  A debug build checks the
+  ## final tree.
+  if node == nil:
+    return true
+  case node.kind
+  of nkLiteral:
+    node.literalBehind == behind
+  of nkEscapedLiteral:
+    node.escapedBehind == behind
+  of nkString:
+    node.runBehind == behind and node.runUneven == unevenMark(node.runes, behind)
+  of nkLookaround:
+    foldMarksHold(node.lookBody, behind or node.lookKind in {lkBehind, lkNegBehind})
+  else:
+    for child in node.childNodes:
+      if not foldMarksHold(child, behind):
+        return false
+    true
 
 proc mergeLiterals(node: Node): Node =
   ## Merge consecutive nkLiteral/nkEscapedLiteral children in nkConcat into nkString.
@@ -3490,6 +3513,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags))
   let leadAnchors = leadAnchorSet(ast, finalFlags)
   let semiEnd = semiEndAnchored(ast)
+  when not defined(release):
+    # The tree is final here: the matcher reads these marks as they stand.
+    if folds:
+      doAssert foldMarksHold(ast, false),
+        "a literal or string built after markFoldedRuns"
   result = initRegex(
     pattern = pattern,
     ast = ast,

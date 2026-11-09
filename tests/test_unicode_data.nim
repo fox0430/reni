@@ -122,3 +122,37 @@ suite "Unicode data alignment":
     check agree
     for f in MultiCharFolds:
       check inRangeTable(f.source, AllMultiCharFoldSources)
+
+  test "a fold source shares its simple fold with those sharing its full fold":
+    # ``foldSourceAlone`` reads from the simple folds which fold sources
+    # Oniguruma keeps as their own bytes inside a look-behind: those whose
+    # full fold no other character has (``FOLDS2_UNFOLDS``).
+    proc fullFold(cp: int32): seq[int32] =
+      for r in casing.caseFold(Rune(cp)):
+        result.add int32(r)
+
+    var sources: seq[int32]
+    for (first, last) in AllMultiCharFoldSources:
+      for cp in first .. last:
+        sources.add cp
+    var agree = true
+    for cp in sources:
+      var simple: seq[int32]
+      for v in caseFoldVariants(Rune(cp)):
+        if int32(v) != cp:
+          simple.add int32(v)
+      var full: seq[int32]
+      for other in sources:
+        if other != cp and fullFold(other) == fullFold(cp):
+          full.add other
+      var same = simple.len == full.len
+      for v in simple:
+        if v notin full:
+          same = false
+      if not same:
+        checkpoint("U+" & toHex(cp, 4))
+        agree = false
+      if foldSourceAlone(Rune(cp)) != (full.len == 0):
+        checkpoint("foldSourceAlone U+" & toHex(cp, 4))
+        agree = false
+    check agree

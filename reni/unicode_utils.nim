@@ -1735,6 +1735,47 @@ proc foldsUnevenly*(runes: openArray[Rune]): bool =
           return true
   false
 
+proc unevenMark*(runes: openArray[Rune], behind: bool): bool {.inline.} =
+  ## The ``runUneven`` mark of a string over ``runes`` whose ``runBehind`` is
+  ## ``behind``: [foldsUnevenly] outside a look-behind, never inside one,
+  ## where Oniguruma cuts no fold window.  ``compiler.markFoldedRuns`` gives
+  ## it, and the debug checks of the final tree hold every string to it.
+  not behind and foldsUnevenly(runes)
+
+const FoldSourcesAlone = block:
+  ## The [AllMultiCharFoldSources] no other character shares a fold with
+  ## (``ﬁ``, ``ŉ``, ``ﬓ``, ``ὒ``; not ``ß``, which ``ẞ`` shares).  Read from
+  ## the simple folds: for a fold source those are shared by exactly the
+  ## characters sharing its full fold (tests/test_unicode_data.nim).
+  var cps: set[uint16]
+  for (first, last) in AllMultiCharFoldSources:
+    for cp in first .. last:
+      doAssert cp <= 0xFFFF, "a fold source above the BMP"
+      var n = 0
+      for _ in caseFoldVariants(Rune(cp)):
+        inc n
+      if n == 1:
+        cps.incl uint16(cp)
+  cps
+
+proc foldSourceAlone*(r: Rune): bool {.inline.} =
+  ## Whether ``r`` folds to several characters and no other character folds
+  ## as it does.  Oniguruma unravels a ``(?i)`` ``r`` inside a look-behind
+  ## into ``r``'s own bytes, and any other fold source into a class of the
+  ## characters sharing its fold (``unravel_cf_look_behind_add``).
+  let cp = int32(r)
+  cp >= 0 and cp <= 0xFFFF and uint16(cp) in FoldSourcesAlone
+
+const PlainWayChecked = MultiCharFoldSources + FoldSourcesAlone
+
+proc plainWayChecked*(r: Rune): bool {.inline.} =
+  ## Whether the plain way of a ``(?i)`` literal ``r`` can refuse what its
+  ## class compare took (``fold_unravel.plainSpelled``): ``r`` is a source
+  ## the matcher expands, a choice of plain strings outside a look-behind,
+  ## or [foldSourceAlone], its own bytes inside one.  One set test.
+  let cp = int32(r)
+  cp >= 0 and cp <= 0xFFFF and uint16(cp) in PlainWayChecked
+
 const MaxFoldBytes = 12
   ## Room for the longest [caseFoldBytesAt] output: a fold to several
   ## characters is three in the BMP at most, nine bytes, and every other
