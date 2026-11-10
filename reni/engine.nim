@@ -1474,7 +1474,7 @@ proc literalAdvance(ctx: MatchContext, node: Node, target: Rune, variant: int): 
         (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
       # Only a fold source has a plain way to check ([plainSpelled]); the
       # set test keeps every other literal off the call.
-      if hasMultiCharFold(target) and
+      if plainWayChecked(target) and
           not plainSpelled(
             ctx.subject.oaTo(ctx.subjectEnd), node, target, start, next, code, ctx.flags
           ):
@@ -1499,73 +1499,41 @@ proc generalRunEnd(ctx: MatchContext, node: Node): int {.noinline.} =
     # Most runs that get here: a start at the end, which no call need answer.
     return -1
   when not defined(release):
-    # A string built after ``markFoldedRuns`` reads both marks ``false``,
-    # the plain loop's reading, and would go wrong only on a non-canonical
-    # subject.
+    # A string built after ``markFoldedRuns`` reads both marks ``false`` and
+    # takes the loop below, which applies no multi-character fold: ``(?i)ss``
+    # would miss ``ß``.  The compiler checks every mark on the final tree
+    # too (``foldMarksHold``).
     if foldsAboveAscii(ctx.flags):
-      assert node.runUneven == (not node.runBehind and foldsUnevenly(runes)),
+      assert node.runUneven == unevenMark(runes, node.runBehind),
         "nkString built after markFoldedRuns"
   if node.runUneven and foldsAboveAscii(ctx.flags):
-    # Oniguruma's windows ([foldedRunEnd]).  Inside a look-behind it applies
-    # no multi-character fold at all; reni still does, below.  A string with
-    # no window or fold source reads the same in the loop below, whose
-    # multi-character fold tries never fire on it.
+    # Oniguruma's windows ([foldedRunEnd]).
     return foldedRunEnd(ctx.subject.oaTo(ctx.subjectEnd), ctx.pos, runes, ctx.flags)
+  # One character at a time, each compared as a class of its case variants,
+  # with no multi-character fold: outside a look-behind such a string holds
+  # no window and no fold source, or folding stops at U+007F; inside one
+  # Oniguruma unravels it one character for one, and a fold source no other
+  # character shares stays its own bytes ([behindSpelled]).  Oniguruma
+  # also keeps a non-ASCII character with no case fold at all as its bytes,
+  # inside a look-behind and out, and under ``(?I)`` every non-ASCII one;
+  # this loop reads those leniently still (MALFORMED_SUBJECTS).
+  let behind = node.runBehind and foldsAboveAscii(ctx.flags)
   var p = ctx.pos
-  var i = 0
-  while i < runes.len:
+  for target in runes:
     if p >= ctx.subjectEnd:
       return -1
-    let target = runes[i]
-    let posBeforeSubjChar = p
     var code: int32
     var next: int
     if not decodeChar(ctx, p, code, next):
       return -1
     let r = Rune(code)
-    let classifiable = codeIsClassifiable(code, next - p)
+    if not codeIsClassifiable(code, next - p) or
+        not (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
+      return -1
+    if behind and
+        not behindSpelled(ctx.subject.oaTo(ctx.subjectEnd), target, p, next, code):
+      return -1
     p = next
-    let posAfterSubjChar = next
-    if classifiable and (r == target or caseInsensitiveMatch(r, target, ctx.flags)):
-      inc i
-      continue
-
-    # Try forward multi-char fold: pattern char folds to multiple subject chars (e.g., ß → ss)
-    if foldsAboveAscii(ctx.flags):
-      let fold = getMultiCharFold(target)
-      if fold.len > 0:
-        p = posBeforeSubjChar
-        var matched = true
-        for j in 0 ..< fold.len:
-          if p >= ctx.subjectEnd:
-            matched = false
-            break
-          var sc: int32
-          var sn: int
-          if not decodeChar(ctx, p, sc, sn) or not codeIsClassifiable(sc, sn - p) or
-              not caseInsensitiveMatch(Rune(sc), fold.runes[j], ctx.flags):
-            matched = false
-            break
-          p = sn
-        if matched:
-          inc i
-          continue
-
-    # Try reverse multi-char fold: subject char folds to consecutive pattern chars
-    # e.g., subject "ß" matches pattern "ss" because ß full-folds to ss
-    if foldsAboveAscii(ctx.flags):
-      let fold = getMultiCharFold(r)
-      if fold.len > 0 and i + fold.len <= runes.len:
-        var matched = true
-        for j in 0 ..< fold.len:
-          if not caseInsensitiveMatch(fold.runes[j], runes[i + j], ctx.flags):
-            matched = false
-            break
-        if matched:
-          p = posAfterSubjChar
-          i += fold.len
-          continue
-    return -1
   p
 
 proc stringAdvance(ctx: MatchContext, node: Node): int =

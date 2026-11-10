@@ -1832,6 +1832,10 @@ proc hasMultiCharFold*(r: Rune): bool {.inline.} =
   let cp = int32(r)
   cp >= 0 and cp <= 0xFFFF and uint16(cp) in MultiCharFoldSources
 
+proc leafBehind*(node: Node): bool {.inline.} =
+  ## Whether literal ``node`` sits in a look-behind body; see ``runBehind``.
+  if node.kind == nkLiteral: node.literalBehind else: node.escapedBehind
+
 proc canStartFoldExpansion*(r: Rune): bool {.inline.} =
   ## Whether a multi-character fold expansion can begin with ``r``.
   let cp = int32(r)
@@ -2620,7 +2624,9 @@ const MaxLoneFoldEquivBytes = MaxRuneBytes
   ## ``\xF0\x80\x85\xBFt``).  reni's matcher still takes that ``ſ`` there; the
   ## bound does not widen for it.
 
-proc runeMaxByteLen*(r: Rune, flags: RegexFlags, inFoldPair = false): int =
+proc runeMaxByteLen*(
+    r: Rune, flags: RegexFlags, inFoldPair = false, behind = false
+): int =
   ## Upper bound on the subject bytes one pattern character can consume.
   ##
   ## Under ``(?i)`` that is not the character's own width: it also matches a
@@ -2631,6 +2637,8 @@ proc runeMaxByteLen*(r: Rune, flags: RegexFlags, inFoldPair = false): int =
   ## ``inFoldPair``: the character and a neighbour start a multi-character
   ## fold (the ``s`` of ``st``; no fold holds a ``k``), so only a canonical
   ## fold equivalent counts.
+  ## ``behind``: the character sits in a look-behind body, where it matches
+  ## one subject character, multi-character fold or not.
   if not foldsAboveAscii(flags):
     # The character itself, or under ``(?I)`` an ASCII letter's case pair,
     # which is as wide.  Under ``(?I)`` reni's matcher also takes an overlong
@@ -2646,6 +2654,9 @@ proc runeMaxByteLen*(r: Rune, flags: RegexFlags, inFoldPair = false): int =
     if not hasNonAsciiFoldEquiv(cp):
       return 1
     return if inFoldPair: MaxAsciiFoldEquivBytes else: MaxLoneFoldEquivBytes
+  if behind:
+    # One character, read as a class reads it, or a fold source's own bytes.
+    return MaxRuneBytes
   max(r.size, MaxFoldExpansionRunes * MaxRuneBytes)
 
 proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
@@ -2660,8 +2671,11 @@ proc runeFixedByteLen*(r: Rune, flags: RegexFlags): int =
     return 1
   -1
 
-proc runeBounds(r: Rune, flags: RegexFlags): LenBounds {.inline.} =
-  LenBounds(maxLen: runeMaxByteLen(r, flags), fixedLen: runeFixedByteLen(r, flags))
+proc runeBounds(r: Rune, flags: RegexFlags, behind: bool): LenBounds {.inline.} =
+  LenBounds(
+    maxLen: runeMaxByteLen(r, flags, behind = behind),
+    fixedLen: runeFixedByteLen(r, flags),
+  )
 
 proc peelBareGroups*(node: Node): Node {.inline.} =
   ## Follow ``(?:...)`` wrappers to the body they hold. Bare groups match what
@@ -2804,19 +2818,21 @@ proc lengthBounds*(
   ## them.
   ##
   ## ``behind``: ``node`` sits in a look-behind body, where Oniguruma folds a
-  ## string one character for one, so an ``s`` there takes a 4-byte overlong
-  ## ``ſ`` even inside a pair (``(?<=(?i)ss)x``).  reni's matcher still lets
-  ## one subject character match a pair there (``ß`` for ``ss``), which
-  ## Oniguruma does not, so the pair allowance below stays.
+  ## string, and a literal, one character for one: no pair there takes one
+  ## subject character (``ß`` for ``ss``) nor a fold source several, and an
+  ## ``s`` takes a 4-byte overlong ``ſ`` even inside a pair
+  ## (``(?<=(?i)ss)x``).  The matcher reads what ``markFoldedRuns`` marked
+  ## inside one the same way.  A call or a reference has no bound, so
+  ## nothing written outside the body is measured under ``behind``.
   if node == nil:
     return LenBounds(maxLen: 0, fixedLen: 0)
   case node.kind
   of nkLiteral:
-    runeBounds(node.rune, flags)
+    runeBounds(node.rune, flags, behind)
   of nkEscapedLiteral:
-    runeBounds(node.escapedRune, flags)
+    runeBounds(node.escapedRune, flags, behind)
   of nkString:
-    let pairs = foldsAboveAscii(flags)
+    let pairs = foldsAboveAscii(flags) and not behind
     var total = 0
     var fixed = 0
     var pairEnd = false # The previous character and this one start a fold.
@@ -2824,7 +2840,7 @@ proc lengthBounds*(
       let pairStart =
         pairs and i + 1 < node.runes.len and
         isMultiCharFoldPairStart(r, node.runes[i + 1])
-      total += runeMaxByteLen(r, flags, not behind and (pairStart or pairEnd))
+      total += runeMaxByteLen(r, flags, pairStart or pairEnd, behind)
       if fixed >= 0:
         let rl = runeFixedByteLen(r, flags)
         if rl < 0:
@@ -3081,6 +3097,10 @@ proc lookBehindTail(node: Node, flags: RegexFlags, gm = gmNone): string =
 proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
   ## Cache [lengthBounds] of every lookaround body on its node, and each
   ## look-behind branch's [lookBehindTail].  Must run on the final AST.
+  ## A look-around's own kind says whether its body is measured as one in a
+  ## look-behind: no look-behind body holds a look-ahead
+  ## (``compiler.validateLookbehinds``), and one nested in another is a
+  ## look-behind itself.
   if node == nil:
     return
   case node.kind

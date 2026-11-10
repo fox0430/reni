@@ -381,13 +381,59 @@ suite "case folding widens what a pattern character can consume":
     check re("(?i)a\\Z").semiEndDMax == 1
     check re("a\\Z").semiEndDMax == 1
 
-  test "a lookbehind of a folding character is not fixed-length":
-    check search("\xCE\xB9\xCC\x88\xCC\x81x", re("(?<=(?i)ΐ)x")).matchSpan == 6 .. 7
+  test "a lookbehind of a folding character is not fixed-length by its fold equivalents":
+    # Inside a look-behind Oniguruma folds one character for one, so the
+    # widths that differ are those of a fold equivalent: ``ſ`` for ``s``,
+    # ``ẞ`` for ``ß``, U+1FD3 for ``ΐ``.  Every row is Oniguruma 6.9.10's
+    # answer.
+    check search("\xE1\xBF\x93x", re("(?<=(?i)ΐ)x")).matchSpan == 3 .. 4
     check search("\xC5\xBFx", re("(?<=(?i)s)x")).matchSpan == 2 .. 3
     check search("\xE2\x84\xAAx", re("(?<=(?i)k)x")).matchSpan == 3 .. 4
-    # A pair the subject can match with one folded character, and back.
-    check search("ßx", re("(?<=(?i)ss)x")).matchSpan == 2 .. 3
-    check search("ssx", re("(?<=(?i)ß)x")).matchSpan == 2 .. 3
+    check search("ẞx", re("(?<=(?i)ß)x")).matchSpan == 3 .. 4
+    check search("ßx", re("(?<=(?i)ẞ)x")).matchSpan == 2 .. 3
+
+  test "a lookbehind applies no multi-character fold":
+    # Not a fold source's expansion, nor one subject character for a pair,
+    # either way round, in a string or a literal (``unravel_cf_look_behind_add``).
+    check not search("\xCE\xB9\xCC\x88\xCC\x81x", re("(?<=(?i)ΐ)x")).found
+    check not search("ßx", re("(?<=(?i)ss)x")).found
+    check not search("ssx", re("(?<=(?i)ß)x")).found
+    check not search("ssx", re("(?i)(?<=aß|ß)x")).found
+    check not search("ﬁx", re("(?i)(?<=fi)x")).found
+    check search("ssx", re("(?i)(?<!ß)x")).matchSpan == 2 .. 3
+    check search("ßx", re("(?i)(?<!ss)x")).matchSpan == 2 .. 3
+    # So a pair there is fixed-length, and a fold source one character wide
+    # (``ß``, ``ẞ``, or a 4-byte overlong form of either).
+    check search("FIx", re("(?i)(?<=fi)x")).matchSpan == 2 .. 3
+    check lengthBounds(re("(?i)fi").ast, {}, behind = true) ==
+      LenBounds(maxLen: 2, fixedLen: 2)
+    check lengthBounds(re("(?i)ß").ast, {}, behind = true) ==
+      LenBounds(maxLen: 4, fixedLen: -1)
+    check search("\xF0\x81\xBA\x9Ex", re("(?i)(?<=ẞ)x")).matchSpan == 4 .. 5
+    # A look-behind inside a look-ahead is read the same way.
+    check not search("ssx", re("(?i)(?=(?<=ß)x)")).found
+    # A group written inside one keeps the reading where a call runs it.
+    check not search("ẞxss", re("(?i)(?<=(ß))x\\g<1>")).found
+    check search("ẞxẞ", re("(?i)(?<=(ß))x\\g<1>")).matchSpan == 3 .. 7
+
+  test "a fold source in a lookbehind is a class or its own bytes":
+    # A class of the characters sharing its fold, read leniently, where
+    # another does (``ß`` and ``ẞ``, ``ﬅ`` and ``ﬆ``); its own bytes where
+    # none does (``ﬁ``, ``ŉ``).  Oniguruma 6.9.10's answers.
+    check search("\xE0\x83\x9Fx", re("(?i)(?<=ß)x")).matchSpan == 3 .. 4
+    check search("\xF0\x8F\xAC\x86x", re("(?i)(?<=ﬅ)x")).matchSpan == 4 .. 5
+    check search("ﬆx", re("(?i)(?<=ﬅ)x")).matchSpan == 3 .. 4
+    check not search("\xF0\x8F\xAC\x81x", re("(?i)(?<=ﬁ)x")).found
+    check not search("\xF0\x8F\xAC\x81x", re("(?i)(?<=aﬁ|ﬁ)x")).found
+    check not search("\xE0\x85\x89x", re("(?i)(?<=ŉ)x")).found
+    check search("\xF0\x8F\xAC\x81x", re("(?i)(?<!ﬁ)x")).matchSpan == 4 .. 5
+    check search("ﬁx", re("(?i)(?<=ﬁ)x")).matchSpan == 3 .. 4
+    # Any of the 104 fold sources, not only those the matcher expands: ``ﬓ``
+    # shares its fold with none, ``ᾀ`` with ``ᾈ``.
+    check not search("\xF0\x8F\xAC\x93x", re("(?i)(?<=ﬓ)x")).found
+    check not search("a\xF0\x8F\xAC\x93x", re("(?i)(?<=aﬓ)x")).found
+    check search("aﬓx", re("(?i)(?<=aﬓ)x")).matchSpan == 4 .. 5
+    check search("\xF0\x81\xBE\x88x", re("(?i)(?<=ᾀ)x")).matchSpan == 4 .. 5
 
 suite "the reverse fold reads a run of literals, groups and all":
   # One subject character can stand for two or three pattern characters
@@ -433,11 +479,12 @@ suite "the reverse fold reads a run of literals, groups and all":
 
   test "the length analysis follows the run through the groups":
     # A run that can be matched by one wider character is no longer
-    # fixed-length, so a lookbehind over it has to scan.  It used to depend
-    # on the two ``f``s being written as bare neighbours.
+    # fixed-length, so the ``\Z`` scan may not skip the only position it can
+    # start from.  It used to depend on the two ``f``s being written as bare
+    # neighbours.  A look-behind folds one character for one, so there the
+    # run takes no ``ﬀ`` however it is written (Oniguruma 6.9.10).
     for pattern in ["(?<=(?i)ff)x", "(?<=(?i)f(?:f))x", "(?<=(?i)(?:f)(?:f))x"]:
-      check search(Ff & "x", re(pattern)).matchSpan == 3 .. 4
-    # And the ``\Z`` scan may not skip the only position it can start from.
+      check not search(Ff & "x", re(pattern)).found
     for pattern in ["(?i)ff\\Z", "(?i)f(?:f)\\Z", "(?i)(?:ff)\\Z"]:
       check search("x" & Ff, re(pattern)).matchSpan == 1 .. 4
     # Three characters: the window has to leave room for the fold width.

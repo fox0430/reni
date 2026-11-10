@@ -1,11 +1,12 @@
-## How Oniguruma unravels a ``(?i)`` string outside a look-behind
-## (``unravel_case_fold_string``), for the matcher: the string is cut left to
-## right into windows of three or two characters whose simple folds spell a
+## How Oniguruma unravels a ``(?i)`` string (``unravel_case_fold_string``),
+## for the matcher.  Outside a look-behind the string is cut left to right
+## into windows of three or two characters whose simple folds spell a
 ## multi-character fold (``ffi``, ``ss``), the longer first, and single
 ## characters.  A window, and a fold source on its own (``ß``), becomes a
 ## choice of plain strings, so only canonical UTF-8 matches it; any other
 ## character becomes a class of its case variants, which reads the subject
-## leniently (``\xE0\x85\xBF`` is ``ſ``).
+## leniently (``\xE0\x85\xBF`` is ``ſ``).  Inside a look-behind every
+## character is unravelled alone, a fold source included ([plainSpelled]).
 ##
 ## Its own module, out of ``engine``'s translation unit: the matcher reaches
 ## it only on a subject the ASCII compare hands back, and code added to
@@ -30,6 +31,17 @@ proc spelledAs(s: openArray[char], p, next: int, code: int32): bool {.noinline.}
       return false
   true
 
+proc behindSpelled*(
+    s: openArray[char], target: Rune, p, next: int, code: int32
+): bool {.inline.} =
+  ## Whether ``code`` at ``p``, which matched ``target`` as a class of its
+  ## case variants, holds as Oniguruma unravels ``target`` alone inside a
+  ## look-behind (``unravel_cf_look_behind_add``): a fold source no other
+  ## character shares (``ﬁ``, [foldSourceAlone]) is its own bytes, any other
+  ## character a class.  A literal ([plainSpelled]) and a string
+  ## (``engine.generalRunEnd``) both ask it.
+  not foldSourceAlone(target) or spelledAs(s, p, next, code)
+
 proc foldSourceSpelled(
     s: openArray[char], target: Rune, p, next: int, code: int32, flags: RegexFlags
 ): bool =
@@ -53,9 +65,6 @@ proc foldSourceSpelled(
       return false
   true
 
-proc literalBehind(node: Node): bool {.inline.} =
-  if node.kind == nkLiteral: node.literalBehind else: node.escapedBehind
-
 proc plainSpelled*(
     s: openArray[char],
     node: Node,
@@ -65,17 +74,24 @@ proc plainSpelled*(
     flags: RegexFlags,
 ): bool {.noinline.} =
   ## Whether the plain way of ``(?i)`` literal ``node``, rune ``target``,
-  ## which matched ``code`` at ``p``, holds: outside a look-behind and under
-  ## flags that fold above U+007F a fold source is a choice of plain strings
-  ## ([foldSourceSpelled]), anything else a class.
-  literalBehind(node) or not foldsAboveAscii(flags) or not hasMultiCharFold(target) or
+  ## which matched ``code`` at ``p``, holds, under flags that fold above
+  ## U+007F.  Outside a look-behind a source the matcher expands is a choice
+  ## of plain strings ([foldSourceSpelled]).  Inside one Oniguruma unravels
+  ## a character alone ([behindSpelled]): a fold source no other character
+  ## shares (``ﬁ``) is its own bytes, any other a class of the characters
+  ## sharing its fold (``[ßẞ]``), read leniently.  Anything else a class.
+  if not foldsAboveAscii(flags):
+    true
+  elif leafBehind(node):
+    behindSpelled(s, target, p, next, code)
+  elif hasMultiCharFold(target):
     foldSourceSpelled(s, target, p, next, code, flags)
+  else:
+    true
 
-proc foldRunEnd(
-    s: openArray[char], fold: RuneBuf, start: int, flags: RegexFlags, spelled: bool
-): int =
-  ## End of ``fold``'s characters matched one by one from ``start``, or -1;
-  ## with ``spelled``, each only as its own bytes ([spelledAs]).
+proc foldRunEnd(s: openArray[char], fold: RuneBuf, start: int, flags: RegexFlags): int =
+  ## End of ``fold``'s characters matched one by one from ``start``, each
+  ## only as its own bytes ([spelledAs]), or -1.
   var p = start
   for i in 0 ..< fold.len:
     if p >= s.len:
@@ -85,7 +101,7 @@ proc foldRunEnd(
     if not decodeAt(s, p, sc, sn) or not codeIsClassifiable(sc, sn - p) or
         not caseInsensitiveMatch(Rune(sc), fold.runes[i], flags):
       return -1
-    if spelled and sn - p > 1 and not spelledAs(s, p, sn, sc):
+    if sn - p > 1 and not spelledAs(s, p, sn, sc):
       return -1
     p = sn
   p
@@ -95,13 +111,13 @@ proc literalFoldEnd*(
 ): int {.noinline.} =
   ## End of ``(?i)`` literal ``node``'s second way, ``target``'s
   ## multi-character fold matched one character at a time from ``start``,
-  ## or -1.  Outside a look-behind each character only as its own bytes.
-  if not foldsAboveAscii(flags):
+  ## or -1.  None inside a look-behind ([plainSpelled]).
+  if not foldsAboveAscii(flags) or leafBehind(node):
     return -1
   let fold = getMultiCharFold(target)
   if fold.len == 0:
     return -1
-  foldRunEnd(s, fold, start, flags, not literalBehind(node))
+  foldRunEnd(s, fold, start, flags)
 
 proc foldedCode(r: Rune): int32 {.inline.} =
   ## ``simpleFold(r)``, without the table search for an ASCII ``r``.
@@ -190,7 +206,7 @@ proc foldedRunEnd*(
       if foldSourceSpelled(s, target, p, next, code, flags):
         p = next
       else:
-        p = foldRunEnd(s, getMultiCharFold(target), p, flags, true)
+        p = foldRunEnd(s, getMultiCharFold(target), p, flags)
         if p < 0:
           return -1
     else:
