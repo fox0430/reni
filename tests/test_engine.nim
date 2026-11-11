@@ -1825,10 +1825,32 @@ suite "Grapheme features":
     let m = search("\r\n", re("^\\X$"))
     check m.found
 
-  test "(?y{g}) dot matches grapheme cluster":
-    let m = search("e\xCC\x81", re("(?y{g})."))
-    check m.found
-    check m.boundaries[0] == 0 .. 3
+  test "(?y{g}) leaves dot one character wide":
+    # Oniguruma's mode changes ``\X``, ``\y`` and ``\Y`` only.  The cluster
+    # is ``(?!\n)\X``: ``\X`` takes a newline, ``.`` does not.
+    check search("e\xCC\x81", re("(?y{g}).")).matchSpan == 0 .. 1
+    check search("\r\n", re("(?y{g}).")).matchSpan == 0 .. 1
+    check search("e\xCC\x81", re("(?y{g})(?!\\n)\\X")).matchSpan == 0 .. 3
+    check search("\r\n", re("(?y{g})(?!\\n)\\X")).matchSpan == 0 .. 2
+    check not search("\n", re("(?y{g})(?!\\n)\\X")).found
+    check not search("\n", re("(?y{g}).")).found
+
+  test "a dot under a grapheme mode runs, repeats and looks back by characters":
+    # The repeat's byte-set run, a repeated sequence of leaves and the
+    # look-behind's scan of one leaf all take ``.`` under a mode, now that it
+    # is one character there.  Over multi-byte characters and a newline,
+    # spans read off Oniguruma 6.9.10.
+    check search("e\xCC\x81\nx", re("(?y{g}).+")).matchSpan == 0 .. 3
+    check search("e\xCC\x81\nx", re("(?y{g})(?m).+")).matchSpan == 0 .. 5
+    check search("ab cd\nef", re("(?y{w}).+")).matchSpan == 0 .. 5
+    check search("e\xCC\x81", re("(?y{g}).{2}")).matchSpan == 0 .. 3
+    check search("axae\xCC\x81ay", re("(?y{g})(?:a.)+")).matchSpan == 0 .. 4
+    check search("axa\nab", re("(?y{g})(?:a.)+")).matchSpan == 0 .. 2
+    check search("axa\nab", re("(?y{g})(?m:(?:a.)+)")).matchSpan == 0 .. 6
+    check search("e\xCC\x81x", re("(?y{g})(?<=.)x")).matchSpan == 3 .. 4
+    check not search("\nx", re("(?y{g})(?<=.)x")).found
+    check search("\nx", re("(?y{g})(?m)(?<=.)x")).matchSpan == 1 .. 2
+    check search("\u{1F170}x", re("(?y{w})(?<=.)x")).matchSpan == 4 .. 5
 
   test "\\y grapheme boundary between base chars":
     let m = search("ab", re("a\\yb"))
@@ -2363,14 +2385,12 @@ suite "Edge cases":
     check m.matchSpan == 0 .. 20000
 
 suite "Grapheme mode (?y{w})":
-  test "(?y{w}) dot matches word segment":
-    # In word mode, . matches one word segment per UAX#29
-    let m = search("hello world", re("(?y{w})."))
-    check m.found
-    check m.boundaries[0] == 0 .. 5 # "hello" is one word segment
+  test "(?y{w}) leaves dot one character wide":
+    check search("hello world", re("(?y{w}).")).matchSpan == 0 .. 1
+    check search("hello world", re("(?y{w}:.+)")).matchSpan == 0 .. 11
 
   test "(?y{w}) scoped mode":
-    let m = search("hello", re("(?y{w}:.)"))
+    let m = search("hello", re("(?y{w}:\\X)"))
     check m.found
     check m.boundaries[0] == 0 .. 5
 
@@ -2398,13 +2418,13 @@ suite "Grapheme mode (?y{w})":
   test "(?y{w}) letters that are also Extended_Pictographic stay one word":
     # U+1F170 and U+1F171 are Word_Break=ALetter as well as
     # Extended_Pictographic; WB5 keeps them in one segment.
-    let m = search("\u{1F170}\u{1F171}", re("(?y{w})."))
+    let m = search("\u{1F170}\u{1F171}", re("(?y{w})\\X"))
     check m.found
     check m.boundaries[0] == 0 .. 8
 
   test "(?y{w}) WB3c holds for ALetter Extended_Pictographic":
     # ZWJ x Extended_Pictographic: no boundary after the ZWJ.
-    let m = search("\u200D\u{1F170}", re("(?y{w})."))
+    let m = search("\u200D\u{1F170}", re("(?y{w})\\X"))
     check m.found
     check m.boundaries[0] == 0 .. 7
 
@@ -3363,7 +3383,8 @@ suite "look-behind body window":
 
     check not search("a\xCC\x81b", re("(?<!\\X)\xCC\x81")).found
 
-    # ``.`` in grapheme mode is the same cluster, so it clips the same way.
+    # ``.`` reads one character in grapheme mode too, so the look-behind at 1
+    # holds the "a" and the ``.`` takes U+0301.
     let m3 = search("a\xCC\x81b", re("(?y{g})(?<=.)."))
     check m3.found
     check m3.boundaries[0] == 1 .. 3
@@ -4340,12 +4361,16 @@ suite "Backreference case fold":
     # And a body of one alternation repeated once divides as the alternation.
     check search("kk", re("(?<=(?:(k)|kk|(k)){1})\\2")).matchSpan == 1 .. 2
     check not search("kk", re("(?<=(?:(k)|kk|(k)){1}?)\\2")).found
-    # Under ``(?y{g})`` a ``.`` takes a cluster, which no count of characters
-    # measures, so a body reaching one keeps its window and answers as the
-    # same body without the reference does.
-    check search("aé", re("(?y{g})(a).(?<=\\1.)")).matchSpan == 0 .. 4
-    check search("aé", re("(?y{g})(a).(?<=a.)")).matchSpan == 0 .. 4
-    check search("aéx", re("(?y{g})(.)(?<=\\1)x")).matchSpan == 1 .. 5
+    # ``\X`` takes a cluster, which no count of characters measures, so a
+    # body reaching one keeps its window and answers as the same body
+    # without the reference does.
+    check search("aé", re("(a)\\X(?<=\\1\\X)")).matchSpan == 0 .. 4
+    check search("aé", re("(a)\\X(?<=a\\X)")).matchSpan == 0 .. 4
+    check search("aéx", re("(\\X)(?<=\\1)x")).matchSpan == 1 .. 5
+    # A ``.`` is one character under ``(?y{g})`` too, and steps back as one.
+    check search("aé", re("(?y{g})(a).(?<=\\1.)")).matchSpan == 0 .. 2
+    check search("aé", re("(?y{g})(a).(?<=a.)")).matchSpan == 0 .. 2
+    check search("aéx", re("(?y{g})(.)(?<=\\1)x")).matchSpan == 2 .. 5
 
   test "a (?i) class holding a fold of several characters varies in length":
     # Oniguruma's parser makes ``[ß]`` the class or ``ss``, inside a

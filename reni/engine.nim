@@ -1581,20 +1581,16 @@ proc charTypeAdvance(ctx: MatchContext, ct: CharTypeKind): int =
   let start = ctx.pos
   if start >= ctx.subjectEnd:
     return -1
-  # Grapheme cluster: \X or . in grapheme/word mode.  These work on byte
-  # sequences rather than a single decoded character, so they run first.
-  if ct == ctGraphemeCluster or
-      (ct == ctDot and ctx.graphemeMode in {gmGrapheme, gmWord}):
+  # \X works on a byte sequence rather than a single decoded character, so it
+  # runs first.  It reads a cluster, or a word under (?y{w}); ``.`` reads one
+  # character under any mode, as in Oniguruma.
+  if ct == ctGraphemeCluster:
     # A cluster still starts with a character, so a sequence truncated by the
     # end of the subject is no cluster either.
     var probe: int32
     var probeNext: int
     if not decodeChar(ctx, start, probe, probeNext):
       return -1
-    if ct == ctDot:
-      let isNewline = codeIsClassifiable(probe, probeNext - start) and probe == 0x0A
-      if isNewline and rfMultiLine notin ctx.flags:
-        return -1
     # Resolve the cluster against the consumption window, not the subject:
     # one running past it ends at it.
     template clipped(): untyped =
@@ -1990,13 +1986,10 @@ proc leafRunAccepts(
   ## it; see [LeafGate].
   if ctx.gates != nil and ctx.flags == ctx.boundFlags:
     let gate = ctx.gateAt(node.id)
-    # ``.`` is a cluster in grapheme mode, which the table is not derived under.
-    if not gate.runnable or (gate.graphemeDep and ctx.graphemeMode != gmNone):
+    if not gate.runnable:
       return false
     accept = gate.accept
     return true
-  if leafRunGraphemeDep(node) and ctx.graphemeMode != gmNone:
-    return false
   leafRunAccepts(node, ctx.flags, accept)
 
 proc leafRunEnd(ctx: MatchContext, accept: set[uint8], limit: int): int {.inline.} =
@@ -2758,11 +2751,11 @@ proc endCheckFrame(targetPos: int): Frame {.inline.} =
   Frame(kind: ckEndCheckPos, parent: TrueCont, ecpTargetPos: targetPos)
 
 proc boundsUsable(ctx: MatchContext, node: Node): bool {.inline.} =
-  ## Whether ``node`` bounds were compiled under current flags/mode.  The
+  ## Whether ``node`` bounds were compiled under the current flags.  The
   ## matcher reaches a look-around under the ones written around it: a call
-  ## takes its group's flags, and [settleCallModes] gives it the group's mode.
-  node.lookBoundsValid and node.lookBoundsFlags == ctx.flags and
-    node.lookBoundsGm == ctx.graphemeMode
+  ## takes its group's flags.  Grapheme mode changes no bound
+  ## ([lengthBounds]).
+  node.lookBoundsValid and node.lookBoundsFlags == ctx.flags
 
 proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
   ## The bounds of look-behind ``node``'s body under the flags in force here.
@@ -2775,7 +2768,7 @@ proc bodyBounds(ctx: MatchContext, node: Node): LenBounds {.inline.} =
   if ctx.boundsUsable(node):
     node.lookBounds
   else:
-    lengthBounds(node.lookBody, ctx.flags, ctx.graphemeMode, behind = true)
+    lengthBounds(node.lookBody, ctx.flags, behind = true)
 
 proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.inline.} =
   ## [bodyBounds] for branch ``i`` (``alt``) of a look-behind's alternation.
@@ -2784,7 +2777,7 @@ proc altBounds(ctx: MatchContext, node: Node, i: int, alt: Node): LenBounds {.in
   if ctx.boundsUsable(node) and i < node.lookAlts.len:
     node.lookAlts[i].bounds
   else:
-    lengthBounds(alt, ctx.flags, ctx.graphemeMode, behind = true)
+    lengthBounds(alt, ctx.flags, behind = true)
 
 proc bodyWindow(ctx: MatchContext, node: Node): bool {.inline.} =
   ## Whether this look-behind body runs under a window; see
@@ -2936,21 +2929,15 @@ proc oneCharLeaf(ctx: MatchContext, body: Node): bool =
   ## Whether leaf ``body`` ([isLeafBody]) matches one character and only one
   ## way, however many bytes the character takes.  Not a class whose
   ## multi-character folds apply, a literal with a multi-character fold,
-  ## ``\X``, ``\R`` (``"\r\n"`` is two) or ``.`` running as a cluster.  A
-  ## string never reaches a scan as one.
+  ## ``\X`` or ``\R`` (``"\r\n"`` is two).  A string never reaches a scan as
+  ## one.
   case body.kind
   of nkCharClass:
     not classFoldsLive(ctx, body)
   of nkLiteral, nkEscapedLiteral:
     singleWayLeaf(body, ctx.flags)
   of nkCharType:
-    case body.charType
-    of ctGraphemeCluster, ctNewlineSeq:
-      false
-    of ctDot:
-      ctx.graphemeMode notin {gmGrapheme, gmWord}
-    else:
-      true
+    body.charType notin {ctGraphemeCluster, ctNewlineSeq}
   else:
     false
 

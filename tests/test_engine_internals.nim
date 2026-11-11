@@ -223,13 +223,12 @@ suite "the \\Z jump never skips a start position":
     check search("क्षि", re("\\X\\Z")).matchSpan == 6 .. 12
     check search("क्षि", re("\\X")).matchSpan == 0 .. 6
 
-  test "so does a dot in grapheme or word mode":
-    check re("(?y{g}).\\Z").semiEndDMax == -1
-    check re("(?y{w}).\\Z").semiEndDMax == -1
-    check search("क्षि", re("(?y{g}).\\Z")).matchSpan == 6 .. 12
-    check search("क्षि", re("(?y{w}).\\Z")).matchSpan == 0 .. 12
-    # Outside those modes a dot is one character wide again.
+  test "a dot is one character wide in grapheme or word mode too":
     check re(".\\Z").semiEndDMax == 4
+    check re("(?y{g}).\\Z").semiEndDMax == 4
+    check re("(?y{w}).\\Z").semiEndDMax == 4
+    check search("क्षि", re("(?y{g}).\\Z")).matchSpan == 9 .. 12
+    check search("क्षि", re("(?y{w}).\\Z")).matchSpan == 9 .. 12
 
 suite "caseFoldBytesAt folds as Oniguruma's mbc_case_fold does":
   # Rows read off libonig 6.9.10's ``ONIGENC_MBC_CASE_FOLD`` for UTF-8: the
@@ -2294,16 +2293,6 @@ suite "a look-behind branch the subject does not end with is passed over":
     check not search("abc", rx).found
     lb.lookBoundsFlags = {rfIgnoreCase}
     check search("abc", rx).matchSpan == 2 .. 3
-
-  test "a call runs a look-behind under the mode its tails were read under":
-    # The group runs only from the call, under another mode where it is
-    # called: the wrong tails standing in are believed all the same.
-    let rx = re(r"(?<n>ab(?<=ab|x)c){0}(?y{g}:\g<n>)")
-    let lb = firstLookBehind(rx.ast)
-    check search("abc", rx).matchSpan == 0 .. 3
-    for a in lb.lookAlts.mitems:
-      a.tail = "zz"
-    check not search("abc", rx).found
 
   test "clearing the tails changes no answer":
     const patterns = [
