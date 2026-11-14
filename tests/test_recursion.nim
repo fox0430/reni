@@ -175,6 +175,11 @@ suite "Subroutine calls and recursion":
     check search("ab cd", re("(?y{w}:(?=\\g<n>b)\\X)(?<n>\\X){0}")).matchSpan == 0 .. 2
     check search("xab cd ef", re("(?<a>\\X)(?<b>(?y{w}:\\g<a>\\X))\\g<b>")).matchSpan ==
       0 .. 6
+    # A look-behind in the called group, against the same body under the
+    # caller's mode, and one whose branches its tails pass over.
+    check not search("ab-", re("(?<n>(?<=^\\X)-){0}(?y{w}:\\g<n>)")).found
+    check search("ab-", re("(?y{w}:(?<=^\\X)-)")).matchSpan == 2 .. 3
+    check search("abc", re("(?<n>ab(?<=ab|x)c){0}(?y{g}:\\g<n>)")).matchSpan == 0 .. 3
 
   test "\\g<0> runs under the modes the pattern writes, not the caller's":
     check search("qbcd e", re("b\\X|(?y{w}:q\\g<0>)")).matchSpan == 0 .. 3

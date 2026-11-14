@@ -81,9 +81,6 @@ type
       ## under, and whether it sits in a look-behind.  Collected with the
       ## bodies.
     uneven: seq[int8] ## By group: whether it [unravels], 1 or 0, -1 until asked.
-    clusterModes: bool
-      ## Whether the pattern sets ``(?y{g})`` or ``(?y{w})`` anywhere, for
-      ## [takesClusters].  Collected with the bodies.
 
 const CharSpanCap = 1 shl 30
   ## Where a count saturates, as Oniguruma's ``distance_add`` and
@@ -191,9 +188,6 @@ proc ensureGroups(g: var GroupSpans) =
       g.groupBehind[node.namedCaptureIndex] = behind
     of nkLookaround:
       inner = behind or node.lookKind in {lkBehind, lkNegBehind}
-    of nkFlagGroup:
-      if node.graphemeMode in {gmGrapheme, gmWord}:
-        g.clusterModes = true
     of nkBackreference:
       mark(g, node.backrefIndex - 1)
     of nkNamedBackref:
@@ -989,80 +983,22 @@ proc readsGroup(node: Node): bool =
       return true
   false
 
-proc dotsIn(node: Node, g: var GroupSpans, seen: var seq[bool]): bool =
-  ## [takesClusters]' walk, with ``seen`` holding a slot per group and a last
-  ## one for the whole pattern.
-  if node == nil:
-    return false
-  case node.kind
-  of nkCharType:
-    return node.charType == ctDot
-  of nkLookaround:
-    return false
-  of nkBackreference, nkNamedBackref, nkSubexpCall:
-    var targets: seq[int]
-    case node.kind
-    of nkBackreference:
-      targets.add node.backrefIndex - 1
-    of nkNamedBackref:
-      for idx in g.names.namedGroupsRead(node.backrefName, node.backrefScope):
-        targets.add idx
-    else:
-      if node.callIndex > 0:
-        targets.add node.callIndex - 1
-      elif node.callName.len > 0:
-        for idx in g.names.namedGroupsRead(node.callName, EveryNamedGroup):
-          targets.add idx
-      else:
-        targets.add g.bodies.len # ``\g<0>``
-    for idx in targets:
-      if idx < 0 or idx > g.bodies.len or seen[idx]:
-        continue
-      seen[idx] = true
-      let body =
-        if idx == g.bodies.len:
-          g.root
-        else:
-          g.bodies[idx]
-      if dotsIn(body, g, seen):
-        return true
-    return false
-  else:
-    discard
-  for child in node.childNodes:
-    if dotsIn(child, g, seen):
-      return true
-  false
-
-proc takesClusters(piece: Node, g: var GroupSpans): bool =
-  ## Whether a ``.`` may take a whole grapheme cluster where ``piece``
-  ## counts it as one character: [charSpan] counts as Oniguruma does, and
-  ## under ``(?y{g})`` and ``(?y{w})`` the matcher's ``.`` is a cluster
-  ## (``charTypeAdvance`` in ``engine``).  It may be in ``piece``, or in a
-  ## group whose text a reference reads or a call runs.  The walk does not
-  ## follow the modes, so in a pattern that sets either mode anywhere, any
-  ## ``.`` reached counts, under a mode or not, and such a piece keeps its
-  ## window.  A look-around takes nothing.
-  if not g.clusterModes:
-    return false
-  var seen = newSeq[bool](g.bodies.len + 1)
-  dotsIn(piece, g, seen)
-
-proc stepsBack(piece: Node, span: CharSpan, g: var GroupSpans): int =
-  ## [fixedChars] of a ``piece`` that reads a group, measured ``span``:
-  ## ``span.lo``, or -1 where that varies, or where a ``.`` may take a
-  ## cluster ([takesClusters]) and step over more characters than counted.
-  if span.fixed and not takesClusters(piece, g): span.lo else: -1
+proc stepsBack(span: CharSpan): int =
+  ## [fixedChars] of a piece that reads a group, measured ``span``:
+  ## ``span.lo``, or -1 where that varies.  The matcher steps back over as
+  ## many characters as Oniguruma counts: a ``.`` reads one under any
+  ## grapheme mode, and ``\X`` has no fixed count.
+  if span.fixed: span.lo else: -1
 
 proc fixedChars(piece: Node, g: var GroupSpans, flags: RegexFlags): int =
   ## The length in characters of the look-behind ``piece``, which Oniguruma
   ## steps back over and runs with no window where the matcher would scan it
   ## under one (``charsBackStart`` in ``engine``), or -1.  Only a piece that
   ## reads a group ([readsGroup]) and whose length in characters is fixed
-  ## has one, and only where the matcher steps over as many ([stepsBack]).
+  ## has one ([stepsBack]).
   if not readsGroup(piece):
     return -1
-  stepsBack(piece, charSpan(piece, g, flags), g)
+  stepsBack(charSpan(piece, g, flags))
 
 proc markBranch(node: Node, k, count, chars: int) =
   ## Record in ``lookAlts`` that the matcher runs branch ``k`` of the
@@ -1123,7 +1059,7 @@ proc tuneLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags, reads: boo
       node[] = Node(kind: nkConcat, children: @[])[]
       return
   if reads and readsGroup(node.lookBody):
-    markBody(node, stepsBack(node.lookBody, span, g))
+    markBody(node, stepsBack(span))
   reduceBody(node.lookBody, flags, fastPath = true)
 
 proc tuneNegLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags, reads: bool) =
@@ -1153,12 +1089,12 @@ proc tuneNegLookBehind(node: Node, g: var GroupSpans, flags: RegexFlags, reads: 
     elif b.whole.fixed:
       for k, alt in peeled.alternatives.view:
         if readsGroup(alt):
-          markBranch(node, k, peeled.alternatives.len, stepsBack(alt, b.whole, g))
+          markBranch(node, k, peeled.alternatives.len, stepsBack(b.whole))
   else:
     let span = charSpan(node.lookBody, g, flags)
     checkLength(span)
     if marks:
-      markBody(node, stepsBack(node.lookBody, span, g))
+      markBody(node, stepsBack(span))
     elif span.hi < 0 and peeled != nil and peeled.kind == nkAlternation:
       # Oniguruma divides it even so, and checks each piece.
       checkLengths(peeled, measure(peeled, g, flags), g, flags)

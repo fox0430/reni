@@ -1211,8 +1211,8 @@ proc mergeLiterals(node: Node): Node =
 proc collectGroupModes(node: Node, modes: var seq[GraphemeMode], mode: GraphemeMode) =
   ## Walk the AST for the grapheme mode each capture group is written under,
   ## which ``mode`` holds where ``node`` sits.  A flag group that names none
-  ## leaves it, as in ``annotateLookaroundBounds``.  An isolated ``(?y{g})``
-  ## wraps what follows it (``parseConcat``), so no concat threads one along.
+  ## leaves it, as the matcher's does.  An isolated ``(?y{g})`` wraps what
+  ## follows it (``parseConcat``), so no concat threads one along.
   if node == nil:
     return
   var active = mode
@@ -1263,8 +1263,6 @@ proc settleCallModes(
   ## backtracking.  In place, as a call has no one parent kind.
   ##
   ## A call into its own mode stays bare, so what holds no mode costs nothing.
-  ## ``annotateLookaroundBounds`` counts on this: past here a look-around only
-  ## ever runs under the mode written around it.
   if node == nil:
     return
   var active = mode
@@ -1834,6 +1832,14 @@ const LeadZeroWidth =
   {nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp}
   ## Zero-width node kinds skipped when finding the first consuming node.
 
+const NoLeadLeafTypes = {ctDot, ctGraphemeCluster, ctNewlineSeq}
+  ## Char types [leadFirstLeaf], [soleLeafBody] and [leafTestable] take for
+  ## no leaf.  ``\X`` and ``\R`` vary in width, so neither is a single
+  ## character test.  ``.`` is one character under every mode, the test
+  ## ``\N`` makes (``\O`` under ``(?m)``), and both of those are taken.  It
+  ## stays out only because it once varied with the mode: what taking it
+  ## would cost or save is not measured.
+
 proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
   ## Leaf every match must start with, or nil. The scan tests it at each
   ## candidate start, so a refusal costs one character test, not a full
@@ -1869,8 +1875,7 @@ proc leadFirstLeaf(node: Node, flags: RegexFlags): Node =
     var s: set[uint8]
     if exactAsciiLeaf(node, s): nil else: node
   of nkCharType:
-    # Variable-width types are no single character test.
-    if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+    if node.charType in NoLeadLeafTypes: nil else: node
   else:
     nil
 
@@ -1898,8 +1903,7 @@ proc soleLeafBody(node: Node, flags: RegexFlags): Node =
   of nkLiteral, nkEscapedLiteral, nkCharClass:
     node
   of nkCharType:
-    # Variable-width types are no single character test.
-    if node.charType in {ctDot, ctGraphemeCluster, ctNewlineSeq}: nil else: node
+    if node.charType in NoLeadLeafTypes: nil else: node
   else:
     nil
 
@@ -2126,14 +2130,14 @@ proc leafAccept(node: Node, flags: RegexFlags, s: var AcceptSet): bool =
 
 proc leafTestable(node: Node): bool =
   ## Whether ``leadLeafEnd`` can answer this node at a position.  Only kinds
-  ## with a ``leadLeafMatches`` arm qualify, and not ``.``, ``\X`` or ``\R``,
-  ## which fix no character.  Case folding widens every leaf; the whole walk
-  ## is gated on it being off.
+  ## with a ``leadLeafMatches`` arm qualify, and no type in
+  ## [NoLeadLeafTypes].  Case folding widens every leaf; the whole walk is
+  ## gated on it being off.
   case node.kind
   of nkLiteral, nkEscapedLiteral, nkCharClass, nkString:
     true
   of nkCharType:
-    node.charType notin {ctDot, ctGraphemeCluster, ctNewlineSeq}
+    node.charType notin NoLeadLeafTypes
   else:
     false
 

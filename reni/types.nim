@@ -461,14 +461,13 @@ type
         ## [lengthBounds] of ``lookBody`` (and of each alternative, in
         ## ``lookAlts``), so a lookbehind need not rewalk the body's tree
         ## at every position.  Filled in by ``annotateLookaroundBounds`` under
-        ## the flags and mode written around it, which are the ones it runs
-        ## under, through a call too (``boundsUsable`` in ``engine``).
+        ## the flags written around it, which are the ones it runs under,
+        ## through a call too (``boundsUsable`` in ``engine``).
       lookAlts*: seq[LookAlt]
         ## [lengthBounds] of each alternative when ``lookBody`` is an
         ## alternation, empty otherwise. Cached because ``altWindow`` runs per
         ## attempt.
       lookBoundsFlags*: RegexFlags
-      lookBoundsGm*: GraphemeMode
       lookBoundsValid*: bool
       lookBodyPure*: bool
         ## ``quantBodyPure``'s rule applied to ``lookBody``.  An impure body
@@ -1044,7 +1043,6 @@ type
     accept*: set[uint8] ## Bytes a run consumes, meaningful while ``runnable``.
     singleWay*: bool
     runnable*: bool
-    graphemeDep*: bool ## ``.`` alone: the answers hold while grapheme mode is off.
 
   ClassFold* = object
     ## What a class answers under ``(?i)`` without reading the subject,
@@ -2801,14 +2799,13 @@ func followedBy(a, b: LenBounds): LenBounds =
         a.fixedLen + b.fixedLen,
   )
 
-proc lengthBounds*(
-    node: Node, flags: RegexFlags, gm = gmNone, behind = false
-): LenBounds =
+proc lengthBounds*(node: Node, flags: RegexFlags, behind = false): LenBounds =
   ## Bound what ``node`` consumes.  See [LenBounds].
   ##
-  ## ``flags`` and ``gm`` are the ones in force where ``node`` sits: case
-  ## folding and grapheme mode both change how much subject a node eats, and
-  ## a flag group anywhere above or beside it can have turned them on.
+  ## ``flags`` are the ones in force where ``node`` sits: case folding changes
+  ## how much subject a node eats, and a flag group anywhere above or beside
+  ## it can have turned it on.  Grapheme mode changes no bound: ``\X`` has
+  ## none under any mode, and ``.`` reads one character under all of them.
   ##
   ## Under ``(?i)`` one subject character can stand for two pattern characters
   ## (``ﬀ`` for ``ff``).  The matcher only folds like that inside an
@@ -2859,16 +2856,13 @@ proc lengthBounds*(
   of nkConcat:
     var total = LenBounds(maxLen: 0, fixedLen: 0)
     var currentFlags = flags
-    var currentGm = gm
     for child in node.children.view:
-      # A bare flag group — (?i), (?y{g}) — applies to the rest of the concat
-      # rather than to a body of its own.
+      # A bare flag group — (?i) — applies to the rest of the concat rather
+      # than to a body of its own.
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
-        if child.graphemeMode != gmNone:
-          currentGm = child.graphemeMode
         continue
-      total = total.followedBy(lengthBounds(child, currentFlags, currentGm, behind))
+      total = total.followedBy(lengthBounds(child, currentFlags, behind))
       if total.maxLen < 0 and total.fixedLen < 0:
         break
     total
@@ -2881,7 +2875,7 @@ proc lengthBounds*(
     var best = 0
     var fixed = 0
     for i, alt in node.alternatives.view:
-      let ab = lengthBounds(alt, flags, gm, behind)
+      let ab = lengthBounds(alt, flags, behind)
       if ab.maxLen < 0:
         best = -1
       elif best >= 0:
@@ -2892,7 +2886,7 @@ proc lengthBounds*(
         fixed = -1
     LenBounds(maxLen: best, fixedLen: fixed)
   of nkQuantifier:
-    let bb = lengthBounds(node.quantBody, flags, gm, behind)
+    let bb = lengthBounds(node.quantBody, flags, behind)
     # Inverted range: use the swapped bounds.
     let (qlo, qhi) = effectiveQuantBounds(node.quantMin, node.quantMax)
     # ``{0,0}`` and repeats of zero-width bodies consume nothing.  A repeat
@@ -2911,31 +2905,24 @@ proc lengthBounds*(
         fixed = bb.fixedLen * qlo
     LenBounds(maxLen: total, fixedLen: fixed)
   of nkCapture:
-    lengthBounds(node.captureBody, flags, gm, behind)
+    lengthBounds(node.captureBody, flags, behind)
   of nkNamedCapture:
-    lengthBounds(node.namedCaptureBody, flags, gm, behind)
+    lengthBounds(node.namedCaptureBody, flags, behind)
   of nkGroup:
-    lengthBounds(node.groupBody, flags, gm, behind)
+    lengthBounds(node.groupBody, flags, behind)
   of nkFlagGroup:
     if node.flagBody != nil:
-      lengthBounds(
-        node.flagBody,
-        flags + node.flagsOn - node.flagsOff,
-        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
-        behind,
-      )
+      lengthBounds(node.flagBody, flags + node.flagsOn - node.flagsOff, behind)
     else:
       LenBounds(maxLen: 0, fixedLen: 0)
   of nkAtomicGroup:
-    lengthBounds(node.atomicBody, flags, gm, behind)
+    lengthBounds(node.atomicBody, flags, behind)
   of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
     LenBounds(maxLen: 0, fixedLen: 0)
   of nkCharType:
-    # A grapheme cluster — \X, or ``.`` in grapheme/word mode — runs over as
-    # many characters as the cluster holds, so it has no bound at all.
-    let unbounded =
-      node.charType == ctGraphemeCluster or
-      (node.charType == ctDot and gm in {gmGrapheme, gmWord})
+    # ``\X`` runs over as many characters as the cluster or the word holds,
+    # so it has no bound at all.
+    let unbounded = node.charType == ctGraphemeCluster
     LenBounds(maxLen: if unbounded: -1 else: MaxRuneBytes, fixedLen: -1)
   of nkCharClass:
     # Under ``(?i)`` a class also matches the multi-character fold of a
@@ -2956,13 +2943,13 @@ proc lengthBounds*(
     # ``(?(a)|)`` is not fixed.  The other tests are zero-width.
     let test =
       if node.condKind == ckRegexCond:
-        lengthBounds(node.condBody, flags, gm, behind)
+        lengthBounds(node.condBody, flags, behind)
       else:
         LenBounds(maxLen: 0, fixedLen: 0)
-    let yes = test.followedBy(lengthBounds(node.condYes, flags, gm, behind))
+    let yes = test.followedBy(lengthBounds(node.condYes, flags, behind))
     let no =
       if node.condNo != nil:
-        lengthBounds(node.condNo, flags, gm, behind)
+        lengthBounds(node.condNo, flags, behind)
       else:
         LenBounds(maxLen: 0, fixedLen: 0)
     LenBounds(
@@ -3009,19 +2996,15 @@ proc literalBytes*(node: Node): string =
   else:
     ""
 
-proc flagsBefore(
-    node: Node, at: int, flags: RegexFlags, gm: GraphemeMode
-): tuple[flags: RegexFlags, gm: GraphemeMode] =
-  ## The flags and grapheme mode in force at child ``at`` of the concat
-  ## ``node``, which ``flags`` and ``gm`` hold at its start: a bare flag group
-  ## switches them for the rest of the concat, as in [lengthBounds].
-  result = (flags, gm)
+proc flagsBefore(node: Node, at: int, flags: RegexFlags): RegexFlags =
+  ## The flags in force at child ``at`` of the concat ``node``, which
+  ## ``flags`` hold at its start: a bare flag group switches them for the rest
+  ## of the concat, as in [lengthBounds].
+  result = flags
   for i in 0 ..< at:
     let child = node.children[i]
     if child.kind == nkFlagGroup and child.flagBody == nil:
-      result.flags = result.flags + child.flagsOn - child.flagsOff
-      if child.graphemeMode != gmNone:
-        result.gm = child.graphemeMode
+      result = result + child.flagsOn - child.flagsOff
 
 type TailRead = object ## What [readTail] finds in one piece of a look-behind body.
   zero: bool ## The piece consumes nothing, whatever it meets.
@@ -3029,7 +3012,7 @@ type TailRead = object ## What [readTail] finds in one piece of a look-behind bo
     ## When not ``zero``: the bytes every match of the piece ends with, or
     ## empty when it names none.
 
-proc readTail(node: Node, flags: RegexFlags, gm: GraphemeMode): TailRead =
+proc readTail(node: Node, flags: RegexFlags): TailRead =
   ## [lookBehindTail]'s walk.  Each piece is read once: a group by its body,
   ## a concat from its end, and [lengthBounds] asked only of a piece no rule
   ## here reads (a repeat, a class, an alternation, ...), which consumes
@@ -3045,22 +3028,18 @@ proc readTail(node: Node, flags: RegexFlags, gm: GraphemeMode): TailRead =
   of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
     result.zero = true
   of nkGroup:
-    result = readTail(node.groupBody, flags, gm)
+    result = readTail(node.groupBody, flags)
   of nkCapture:
-    result = readTail(node.captureBody, flags, gm)
+    result = readTail(node.captureBody, flags)
   of nkNamedCapture:
-    result = readTail(node.namedCaptureBody, flags, gm)
+    result = readTail(node.namedCaptureBody, flags)
   of nkAtomicGroup:
-    result = readTail(node.atomicBody, flags, gm)
+    result = readTail(node.atomicBody, flags)
   of nkFlagGroup:
     if node.flagBody == nil:
       result.zero = true
     else:
-      result = readTail(
-        node.flagBody,
-        flags + node.flagsOn - node.flagsOff,
-        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
-      )
+      result = readTail(node.flagBody, flags + node.flagsOn - node.flagsOff)
   of nkConcat:
     # From the end, past what consumes nothing, to the last child that may
     # consume.  The flags in force at a child are the concat's unless a bare
@@ -3071,30 +3050,30 @@ proc readTail(node: Node, flags: RegexFlags, gm: GraphemeMode): TailRead =
         switches = true
         break
     for at in countdown(node.children.high, 0):
-      let (f, g) =
+      let f =
         if switches:
-          flagsBefore(node, at, flags, gm)
+          flagsBefore(node, at, flags)
         else:
-          (flags, gm)
-      result = readTail(node.children[at], f, g)
+          flags
+      result = readTail(node.children[at], f)
       if not result.zero:
         return
     result.zero = true
   else:
-    result.zero = lengthBounds(node, flags, gm, behind = true).maxLen == 0
+    result.zero = lengthBounds(node, flags, behind = true).maxLen == 0
 
-proc lookBehindTail(node: Node, flags: RegexFlags, gm = gmNone): string =
+proc lookBehindTail(node: Node, flags: RegexFlags): string =
   ## The bytes every match of ``node``, a branch of a look-behind body, ends
   ## with, or empty when it names none: its last item that consumes anything,
   ## when that is a string or a literal compared case-sensitively.  Only
   ## items that consume nothing may follow it (anchors, look-arounds, flag
-  ## switches, anything [lengthBounds] gives a maximum of 0).  ``flags`` and
-  ## ``gm`` are those in force where ``node`` sits, threaded through flag
-  ## groups as [lengthBounds] threads them, so ``(?i)`` anywhere before the
-  ## item leaves it no tail.
-  readTail(node, flags, gm).bytes
+  ## switches, anything [lengthBounds] gives a maximum of 0).  ``flags`` are
+  ## those in force where ``node`` sits, threaded through flag groups as
+  ## [lengthBounds] threads them, so ``(?i)`` anywhere before the item leaves
+  ## it no tail.
+  readTail(node, flags).bytes
 
-proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
+proc annotateLookaroundBounds*(node: Node, flags: RegexFlags) =
   ## Cache [lengthBounds] of every lookaround body on its node, and each
   ## look-behind branch's [lookBehindTail].  Must run on the final AST.
   ## A look-around's own kind says whether its body is measured as one in a
@@ -3106,54 +3085,46 @@ proc annotateLookaroundBounds*(node: Node, flags: RegexFlags, gm = gmNone) =
   case node.kind
   of nkLookaround:
     let behind = node.lookKind in {lkBehind, lkNegBehind}
-    node.lookBounds = lengthBounds(node.lookBody, flags, gm, behind)
+    node.lookBounds = lengthBounds(node.lookBody, flags, behind)
     # ``tuneLookBehinds`` may have sized ``lookAlts`` already, to mark a
     # branch unclipped.
     let peeled = peelBareGroups(node.lookBody)
     if peeled != nil and peeled.kind == nkAlternation:
       node.lookAlts.setLen(peeled.alternatives.len)
       for i, alt in peeled.alternatives.view:
-        node.lookAlts[i].bounds = lengthBounds(alt, flags, gm, behind)
+        node.lookAlts[i].bounds = lengthBounds(alt, flags, behind)
         if behind:
-          node.lookAlts[i].tail = lookBehindTail(alt, flags, gm)
+          node.lookAlts[i].tail = lookBehindTail(alt, flags)
     else:
       node.lookAlts.setLen(0)
     node.lookBoundsFlags = flags
-    node.lookBoundsGm = gm
     node.lookBoundsValid = true
-    annotateLookaroundBounds(node.lookBody, flags, gm)
+    annotateLookaroundBounds(node.lookBody, flags)
   of nkConcat:
     var currentFlags = flags
-    var currentGm = gm
     for child in node.children.view:
       # A bare flag group applies to the rest of the concat, as in
       # [lengthBounds].
       if child.kind == nkFlagGroup and child.flagBody == nil:
         currentFlags = currentFlags + child.flagsOn - child.flagsOff
-        if child.graphemeMode != gmNone:
-          currentGm = child.graphemeMode
         continue
-      annotateLookaroundBounds(child, currentFlags, currentGm)
+      annotateLookaroundBounds(child, currentFlags)
   of nkFlagGroup:
     if node.flagBody != nil:
-      annotateLookaroundBounds(
-        node.flagBody,
-        flags + node.flagsOn - node.flagsOff,
-        if node.graphemeMode != gmNone: node.graphemeMode else: gm,
-      )
+      annotateLookaroundBounds(node.flagBody, flags + node.flagsOn - node.flagsOff)
   else:
     for child in node.childNodes:
-      annotateLookaroundBounds(child, flags, gm)
+      annotateLookaroundBounds(child, flags)
 
-proc maxByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
+proc maxByteLen*(node: Node, flags: RegexFlags): int {.inline.} =
   ## Upper bound on the bytes ``node`` consumes, or -1 when unbounded.
   ## See [lengthBounds].
-  lengthBounds(node, flags, gm).maxLen
+  lengthBounds(node, flags).maxLen
 
-proc fixedByteLen*(node: Node, flags: RegexFlags, gm = gmNone): int {.inline.} =
+proc fixedByteLen*(node: Node, flags: RegexFlags): int {.inline.} =
   ## The one length every match of ``node`` consumes, or -1 when it varies.
   ## See [lengthBounds].
-  lengthBounds(node, flags, gm).fixedLen
+  lengthBounds(node, flags).fixedLen
 
 proc holdsAbsentLoop(node: Node): bool =
   ## Whether ``node`` holds an absent operator other than the range clear

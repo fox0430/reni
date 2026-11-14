@@ -34,15 +34,10 @@ proc singleWayLeaf*(node: Node, flags: RegexFlags): bool =
   else:
     false
 
-proc leafRunGraphemeDep*(node: Node): bool {.inline.} =
-  ## Whether [leafRunAccepts]'s answer depends on grapheme mode, which is off
-  ## where this is derived.  ``.`` alone: it runs as a cluster under
-  ## ``(?y{g})`` and ``(?y{w})``, so no byte set decides it there.
-  node.kind == nkCharType and node.charType == ctDot
-
 proc leafRunAccepts*(node: Node, flags: RegexFlags, accept: var set[uint8]): bool =
-  ## The ASCII bytes ``node`` accepts under ``flags`` with grapheme mode off,
-  ## or false when no byte set decides it. Gives what ``classAdvance`` and
+  ## The ASCII bytes ``node`` accepts under ``flags``, or false when no byte
+  ## set decides it.  Grapheme mode changes none of them: it changes ``\X``,
+  ## which no byte set decides anyway.  Gives what ``classAdvance`` and
   ## ``charTypeAdvance`` give on their ASCII fast paths, without the call.
   ## Nothing at or above 0x80 is ever admitted, so the run loop can test
   ## membership alone.
@@ -65,9 +60,8 @@ proc leafRunAccepts*(node: Node, flags: RegexFlags, accept: var set[uint8]): boo
     of ctGraphemeCluster, ctNewlineSeq:
       false
     of ctDot:
-      # Grapheme and word mode are [leafRunGraphemeDep]'s business; outside
-      # them ``.`` is the byte set ``charTypeAdvance``'s fast path reads
-      # ``rfMultiLine`` for, fixed for the repeat.
+      # The byte set ``charTypeAdvance``'s fast path reads ``rfMultiLine``
+      # for, fixed for the repeat.
       accept =
         if rfMultiLine in flags:
           AllAsciiBytes
@@ -97,9 +91,7 @@ proc buildLeafGates*(nodes: seq[Node], flags: RegexFlags): seq[LeafGate] =
     let node {.cursor.} = nodes[i]
     if not gateWorthy(node):
       continue
-    var gate = LeafGate(
-      singleWay: singleWayLeaf(node, flags), graphemeDep: leafRunGraphemeDep(node)
-    )
+    var gate = LeafGate(singleWay: singleWayLeaf(node, flags))
     gate.runnable = leafRunAccepts(node, flags, gate.accept)
     result[i] = gate
 
@@ -400,7 +392,7 @@ proc buildSeqRuns*(nodes: seq[Node], flags: RegexFlags) =
     for j in 0 ..< k:
       let leaf {.cursor.} = nodes[elems[j].leaf.int]
       var accept: set[uint8]
-      if elems[j].emin < 0 or not singleWayLeaf(leaf, flags) or leafRunGraphemeDep(leaf) or
+      if elems[j].emin < 0 or not singleWayLeaf(leaf, flags) or
           not leafRunAccepts(leaf, flags, accept):
         ok = false
         break
