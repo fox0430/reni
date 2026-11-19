@@ -1269,6 +1269,58 @@ proc recordStart(p: Parser, node: Node, start: int) =
   if start <= high(int32):
     node.patternPos = int32(start)
 
+func newlineOnly(a: CcAtom): bool =
+  ## Whether the class atom ``a`` stands for ``\n`` and nothing else.
+  case a.kind
+  of ccLiteral:
+    a.rune == Rune(0x0A)
+  of ccRange:
+    a.rangeFrom == Rune(0x0A) and a.rangeTo == Rune(0x0A)
+  of ccNestedClass:
+    if a.nestedNegated or a.nestedAtoms.len == 0:
+      return false
+    for b in a.nestedAtoms:
+      if not newlineOnly(b):
+        return false
+    true
+  else:
+    false
+
+func spellsNewline(node: Node): bool =
+  ## Whether ``node``, an atom as [parseAtom] returns it, is a ``\n``
+  ## written out: a literal in any spelling, a run of escaped code points
+  ## holding one (``\x{61 0A}``), or a bracket class of nothing but ``\n``.
+  ## A class with other members is not: it is a class that never meets a
+  ## ``\n`` in line mode.  That is rg's rule, which empties a class by
+  ## taking ``\n`` out and refuses only what is left with nothing; this one
+  ## reads the syntax, so a class that comes to ``\n`` alone only through
+  ## negation or an intersection never matches instead.
+  case node.kind
+  of nkLiteral:
+    node.rune == Rune(0x0A)
+  of nkEscapedLiteral:
+    node.escapedRune == Rune(0x0A)
+  of nkConcat:
+    for c in node.children:
+      if spellsNewline(c):
+        return true
+    false
+  of nkCharClass:
+    if not node.bracketClass or node.negated or node.atoms.len == 0:
+      return false
+    for a in node.atoms:
+      if not newlineOnly(a):
+        return false
+    true
+  else:
+    false
+
+proc refuseNewline(p: Parser, node: Node, at: int) {.inline.} =
+  ## Under ``rfLineMode`` no line holds a ``\n``, so a pattern that spells
+  ## one out is refused, as rg refuses it, rather than left never to match.
+  if rfLineMode in p.flags and spellsNewline(node):
+    p.error("newline not allowed in line mode", at)
+
 proc parseAtom(p: var Parser): Node =
   if p.atEnd:
     p.error("unexpected end of pattern")
@@ -1286,8 +1338,11 @@ proc parseAtom(p: var Parser): Node =
       # Return empty — parseConcat will continue with normal parsing
       return Node(kind: nkConcat, children: @[])
     # Everything is literal (including \, |, ), etc.)
+    let at = p.pos
     let r = p.advanceRune()
-    return Node(kind: nkLiteral, rune: r)
+    result = Node(kind: nkLiteral, rune: r)
+    p.refuseNewline(result, at)
+    return
 
   let ch = p.peek
   let start = p.pos
@@ -1323,6 +1378,7 @@ proc parseAtom(p: var Parser): Node =
     # Literal rune
     let r = p.advanceRune()
     result = Node(kind: nkLiteral, rune: r)
+  p.refuseNewline(result, start)
 
 proc repeatApplies(p: var Parser, body: Node, refuses: bool): bool =
   ## Whether the repeat operator at ``p.pos`` applies to ``body``, which

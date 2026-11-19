@@ -88,6 +88,39 @@ This lets a line tokenizer share one compiled pattern across anchor modes.
 See [the TextMate benchmark](bench/README.md#textmate-captures-and-anchor-options)
 for a comparison with separately compiled variants.
 
+### Line mode
+
+Compile with `rfLineMode` to search a buffer of lines the way grep does: each
+line, without its `\n`, is matched as a subject of its own, and positions are
+reported in the whole buffer.
+
+- No match holds a `\n`, so `\s` and `[^x]` stop at the end of the line.
+- `\A` and `^` hold at the start of a line, and `\z`, `\Z` and `$` at its
+  end.
+- Look-arounds do not see past the line.
+- A final `\n` ends the last line; it does not begin an empty one.
+- `moNotBeginString` disables `\A` only in the line at offset 0, the one
+  that begins the buffer. `moNotBeginPosition` disables `\G` only in the
+  line holding `start`.
+
+```nim
+let r = re(r"(\w+\s+){2}\w+\(", {rfLineMode})
+assert search("a b\nc(\nd e f(", r).matchSpan == 7 .. 13
+```
+
+One search covers the whole buffer. A forward search skips lines that lack a
+byte every match needs without searching them; a backward search searches
+each line from `start` back. A pattern that spells out a newline, such as
+`\n`, `\x0a` or `[\n]`, raises `RegexError` under this flag. A class that
+also holds other characters, such as `[\na]`, is allowed. The step budget
+counts the whole call, not each line. Scan with `findAll` or a
+`MatchScanner`: they keep the line they are in. A loop of `searchIntoCtx`,
+`searchBackwardIntoCtx` or `matchAtIntoCtx` reads to both ends of the line
+holding its position on every call, so walking one long line that way takes
+quadratic time. Such a loop also cannot step past an empty match with
+`nextRunePos`: the step runs on over a `\n` that cuts a sequence short and
+skips the start of the next line.
+
 ### Match at position
 
 ```nim

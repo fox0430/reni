@@ -3006,6 +3006,32 @@ proc requiredLiteral(
       result.kind = rlSet
       result.set = w.set.bs
 
+proc lineLiteral(ast: Node, flags: RegexFlags): RequiredLiteral =
+  ## Under ``rfLineMode``: what every match holds in its line, for
+  ## ``line_mode``'s pass over the whole subject that picks the lines worth
+  ## searching.  [requiredLiteral]'s walk, but nothing is left out: not what
+  ## the match begins with, nor the byte ``requiredByte`` tests, which the scan
+  ## inside a line looks for again but cannot skip the lines between with.
+  ## Nor is anything given up for ``\A`` or ``\Z``, which hold at every line's
+  ## start and end.
+  var w = ReqWalk(atStart: true, skipByte: -1, set: ReqSet(weight: -1))
+  w.reqWalk(ast, flags)
+  w.flushRun()
+  if w.str.len > 0:
+    result.kind = rlString
+    result.str = w.str
+    for i in 1 ..< w.str.len:
+      if ByteWeight[uint8(w.str[i])] < ByteWeight[uint8(w.str[result.at])]:
+        result.at = i
+  elif w.set.weight >= 0:
+    if w.set.bs.card == 1:
+      result.kind = rlString
+      for b in w.set.bs:
+        result.str = $char(b)
+    else:
+      result.kind = rlSet
+      result.set = w.set.bs
+
 type LeadBehindStep = enum
   lbsNone ## Zero-width; the walk may look past it.
   lbsFound
@@ -3909,6 +3935,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredLit = requiredLiteral(
       ast, finalFlags, firstChar, firstConsumed, requiredByte, leadAnchors, semiEnd
     ),
+    lineLit =
+      if rfLineMode in finalFlags:
+        lineLiteral(ast, finalFlags)
+      else:
+        RequiredLiteral(),
     semiEndAnchored = semiEnd,
     # [anchorDMax] parts from [maxByteLen] only over an absent operator.
     semiEndDMax =
