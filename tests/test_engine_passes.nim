@@ -591,9 +591,11 @@ suite "auto-possessification":
       for cp in 0x80 .. 0x10FFFF:
         let r = Rune(cp)
         if matchPosixClass(r, cls, false) and
-            not ((naWord in family and isWordChar(r, false)) or
+            not (
+              (naWord in family and isWordChar(r, false)) or
               (naDigit in family and isDigitChar(r, false)) or
-              (naSpace in family and isSpaceChar(r, false))):
+              (naSpace in family and isSpaceChar(r, false))
+            ):
           stray = cp
           break
       checkpoint($cls)

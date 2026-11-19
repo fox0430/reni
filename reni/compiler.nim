@@ -3448,7 +3448,7 @@ proc annotateContinuations(
       if node.quantMax == 0:
         NothingReq
       elif node.quantKind == qkPossessive or node.quantBody == nil or
-          node.quantBody.kind in LeafKinds:
+        node.quantBody.kind in LeafKinds:
         UnknownReq
       elif node.quantMax == 1:
         after
@@ -3458,11 +3458,14 @@ proc annotateContinuations(
         var r = dropLeaf(after)
         discard joinReq(r, before(ownReq(node.quantBody, flags), after))
         r
-    let bodyOwn =
-      annotateContinuations(
-        node.quantBody, flags, bodyAfter, wantOwn and node.quantMax != 0, mayRewrite,
-        calls,
-      )
+    let bodyOwn = annotateContinuations(
+      node.quantBody,
+      flags,
+      bodyAfter,
+      wantOwn and node.quantMax != 0,
+      mayRewrite,
+      calls,
+    )
     if wantOwn:
       result =
         if node.quantMax == 0:
