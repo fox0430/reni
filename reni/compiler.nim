@@ -2019,9 +2019,11 @@ type
     nonAscii: set[NonAsciiSet]
 
   FollowStep = enum
+    ## The zero value is ``fsUnknown``, so an [OwnReq] no arm wrote gives
+    ## its reader up rather than claim anything ([annotateContinuations]).
+    fsUnknown ## not even consumption is stated; the caller must give up
     fsStop ## the node consumes a character; the walk ends at it
     fsPass ## it may match empty, so the next node speaks too
-    fsUnknown ## not even consumption is stated; the caller must give up
 
   ContinuationReq = object
     ## What the continuation requires at the position a give-back or a lazy
@@ -2033,11 +2035,20 @@ type
     ## [leafAccept] refuses.
     accept: AcceptSet
     acceptKnown: bool ## ``accept`` is a superset of the first characters
-    leaf: Node
+    leaf {.cursor.}: Node
       ## The single node that can consume first, and one ``leadLeafEnd`` can
       ## test in place; nil where two nodes can, or where that one is not a
-      ## leaf kind.
+      ## leaf kind.  A cursor: every leaf is a node of the tree the walk is
+      ## annotating, which outlives it, and the req is copied at every node
+      ## the walk passes.
     leafMulti: bool ## a second node reached the position; ``leaf`` stays nil
+
+  OwnReq = object
+    ## What a node requires at its start on its own -- what [addReq] adds to
+    ## a fresh [ContinuationReq] -- and whether the node after it speaks too.
+    ## [before] folds what follows the node into it.
+    req: ContinuationReq
+    step: FollowStep
 
 template UnknownReq(): ContinuationReq =
   ## Nothing stated on either track.  A template, not a ``const``: that
@@ -2056,12 +2067,16 @@ proc noteLeaf(r: var ContinuationReq, leaf: Node) =
   else:
     r.leaf = leaf
 
+proc joinAccept(s: var AcceptSet, a: AcceptSet) {.inline.} =
+  ## Widen ``s`` to hold what ``a`` holds as well.
+  s.ascii = s.ascii + a.ascii
+  s.nonAscii = s.nonAscii + a.nonAscii
+
 proc mergeTail(r: var ContinuationReq, tail: ContinuationReq) =
   ## Fold what follows a node that may match empty into what the node itself
   ## requires: either can consume first, so both tracks widen.
   if r.acceptKnown and tail.acceptKnown:
-    r.accept.ascii = r.accept.ascii + tail.accept.ascii
-    r.accept.nonAscii = r.accept.nonAscii + tail.accept.nonAscii
+    r.accept.joinAccept(tail.accept)
   else:
     r.acceptKnown = false
   if r.leafMulti or tail.leafMulti or (r.leaf != nil and tail.leaf != nil):
@@ -2069,6 +2084,96 @@ proc mergeTail(r: var ContinuationReq, tail: ContinuationReq) =
     r.leafMulti = true
   elif r.leaf == nil:
     r.leaf = tail.leaf
+
+template PassOwn(): OwnReq =
+  ## A node that requires nothing and lets the next one speak: the start of
+  ## a concat's fold.
+  OwnReq(req: ContinuationReq(acceptKnown: true), step: fsPass)
+
+template UnknownOwn(): OwnReq =
+  OwnReq(req: UnknownReq, step: fsUnknown)
+
+proc before(own: OwnReq, tail: ContinuationReq): ContinuationReq {.inline.} =
+  ## What the continuation requires just before a node that requires
+  ## ``own``, given ``tail`` is what it requires just after it.
+  case own.step
+  of fsStop:
+    result = own.req
+  of fsPass:
+    result = own.req
+    result.mergeTail(tail)
+  of fsUnknown:
+    result = UnknownReq
+
+proc thenReq(first: OwnReq, rest: var OwnReq) {.inline.} =
+  ## Turn ``rest``, what the nodes after one requiring ``first`` require,
+  ## into what the run from that node requires.  Folded right to left over a
+  ## concat, this is [addReq]'s walk left to right: the first node that
+  ## consumes, or does not state, ends it.
+  if first.step == fsPass:
+    var r = first.req
+    r.mergeTail(rest.req)
+    rest.req = r
+  else:
+    rest = first
+
+proc orReq(into: var OwnReq, alt: OwnReq) {.inline.} =
+  ## Join one more branch into what an alternation requires: every branch
+  ## can consume first, and one that may match empty lets the next node speak.
+  if into.step == fsUnknown:
+    return
+  if alt.step == fsUnknown:
+    into = UnknownOwn
+    return
+  into.req.mergeTail(alt.req)
+  if alt.step == fsPass:
+    into.step = fsPass
+
+proc lookAheadInto(f: var ContinuationReq, body: OwnReq): FollowStep =
+  ## Add what a positive look-ahead whose body requires ``body`` requires at
+  ## its position.  It demands its own first character right there, its
+  ## leaf included.  A body that cannot be stated leaves ``f`` alone: the
+  ## look-ahead is zero-width, so dropping its share leaves the union a
+  ## superset of what the rest of the continuation requires, and the node
+  ## after it speaks at this same position.
+  if body.step == fsStop and body.req.acceptKnown:
+    f.accept.joinAccept(body.req.accept)
+    f.noteLeaf(body.req.leaf)
+    fsStop
+  else:
+    fsPass
+
+proc flagBodyInto(f: var ContinuationReq, body: OwnReq): FollowStep =
+  ## Add what a switch that folds nothing requires, given what its body
+  ## requires under the switched flags.  The accept set is the body's -- its
+  ## ASCII bytes do not depend on the ASCII-only flags, and ``nonAscii`` is a
+  ## superset -- but not the leaf, which the lazy arm tests under the flags
+  ## it runs under.  A body that consumes nothing first (``(?m:\b)``) puts no
+  ## node at the position, so the leaf after it still stands.
+  if body.step == fsUnknown:
+    return fsUnknown
+  if body.req.acceptKnown:
+    f.accept.joinAccept(body.req.accept)
+  else:
+    f.acceptKnown = false
+  # Every arm that adds to ``accept``, or gives it up, notes a leaf in
+  # lockstep ([noteLeaf]), so the leaf track alone says whether one did.
+  when not defined(release):
+    doAssert body.req.leaf != nil or body.req.leafMulti or
+      (body.req.acceptKnown and body.req.accept == AcceptSet()),
+      "flagBodyInto: a body that consumes first noted no leaf"
+  if body.req.leaf != nil or body.req.leafMulti:
+    f.noteLeaf(nil)
+  body.step
+
+proc repeatStep(node: Node, body: FollowStep): FollowStep =
+  ## Whether the node after a repeat that can run its body speaks too.
+  if body == fsUnknown:
+    fsUnknown
+  elif node.quantMin >= 1:
+    body
+  else:
+    fsPass
 
 proc nonAsciiDisjoint(a, b: NonAsciiSet): bool =
   ## Whether two non-ASCII families provably share no character.  Only these
@@ -2088,17 +2193,78 @@ proc disjointAccept(a, b: AcceptSet): bool =
         return false
   true
 
+proc posixNonAscii(cls: PosixClassName): set[NonAsciiSet] =
+  ## A family holding every character above U+007F that ``[[:cls:]]`` accepts
+  ## under any flags.  ``test_engine_passes.nim`` pins each answer against
+  ## every code point.
+  case cls
+  of pcAlnum, pcAlpha, pcLower, pcUpper, pcWord:
+    {naWord}
+  of pcDigit:
+    {naDigit}
+  of pcBlank, pcSpace:
+    {naSpace}
+  of pcAscii, pcXdigit:
+    {}
+  of pcCntrl, pcGraph, pcPrint, pcPunct:
+    {naOther}
+
+proc classNonAscii(node: Node): set[NonAsciiSet] =
+  ## The families of the characters above U+007F a bracket class that is not
+  ## negated accepts, for a class [classAsciiMatches] could read.  A superset,
+  ## as ``nonAscii`` is.
+  for atom in node.atoms:
+    case atom.kind
+    of ccLiteral:
+      if int32(atom.rune) >= 128:
+        result.incl naOther
+    of ccRange:
+      if int32(atom.rangeTo) >= 128:
+        result.incl naOther
+    of ccCharType:
+      case atom.charType
+      of ctWord:
+        result.incl naWord
+      of ctDigit:
+        result.incl naDigit
+      of ctSpace:
+        result.incl naSpace
+      of ctHexDigit:
+        discard
+      else:
+        result.incl naOther
+    of ccPosix:
+      result = result + posixNonAscii(atom.posixClass)
+    else:
+      result.incl naOther
+
 proc leafAccept(node: Node, flags: RegexFlags, s: var AcceptSet): bool =
   ## The set ``node`` accepts as its first character, or false when it cannot
-  ## be stated.  Callers must have ruled out case folding first.
-  if node == nil:
+  ## be stated -- always under case folding, which widens a leaf to its ASCII
+  ## case closure plus every character above U+007F folding into it.
+  if node == nil or flags * {rfIgnoreCase, rfIgnoreCaseAscii} != {}:
     return false
   case node.kind
-  of nkLiteral, nkEscapedLiteral, nkCharClass:
+  of nkLiteral, nkEscapedLiteral:
     var ascii: set[uint8]
     if not exactAsciiLeaf(node, ascii):
       return false
     s = AcceptSet(ascii: ascii)
+    true
+  of nkCharClass:
+    # Below U+0080 the atoms read the same under every ASCII-only flag, so the
+    # byte set is exact and a negated class may complement it; above, a family
+    # that holds the class's characters is all a reader needs.
+    var ascii: set[uint8]
+    var nonAscii, predicate: bool
+    if not classAsciiMatches(node, ascii, nonAscii, predicate):
+      return false
+    ascii = ascii * AllAsciiBytes
+    s =
+      if node.negated:
+        AcceptSet(ascii: AllAsciiBytes - ascii, nonAscii: {naOther})
+      else:
+        AcceptSet(ascii: ascii, nonAscii: classNonAscii(node))
     true
   of nkString:
     # Only the first character stands at the position in question.
@@ -2128,11 +2294,15 @@ proc leafAccept(node: Node, flags: RegexFlags, s: var AcceptSet): bool =
   else:
     false
 
+const LeafKinds = {nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType, nkString}
+  ## The kinds [addReq] answers as one leaf, and a repeat over one reads no
+  ## follower for its body ([annotateContinuations]).
+
 proc leafTestable(node: Node): bool =
   ## Whether ``leadLeafEnd`` can answer this node at a position.  Only kinds
   ## with a ``leadLeafMatches`` arm qualify, and no type in
-  ## [NoLeadLeafTypes].  Case folding widens every leaf; the whole walk is
-  ## gated on it being off.
+  ## [NoLeadLeafTypes].  Case folding widens every leaf, so the lazy arm tests
+  ## one only while folding is off ([addReq]).
   case node.kind
   of nkLiteral, nkEscapedLiteral, nkCharClass, nkString:
     true
@@ -2150,29 +2320,36 @@ proc addReq(node: Node, flags: RegexFlags, f: var ContinuationReq): FollowStep =
   ## node that cannot be stated stops the walk, unless it is zero-width and
   ## can only refuse positions.  ``f.leaf`` carries the same direction, and
   ## survives only where exactly one node can consume first.
+  ##
+  ## Every reader asks about a position with a character after it: a
+  ## give-back hands the continuation the character it gave back, and the
+  ## follow byte is read at give-backs only ([retreatToFollowByte]).  So an
+  ## anchor that holds at the end of the subject requires what it requires
+  ## before a character; the lazy arm's leaf, which is tested at the end as
+  ## well, stops there.
   if node == nil:
     return fsUnknown
   case node.kind
   of nkAnchor:
-    fsPass # zero-width, ``\K`` included: a failed continuation rolls it back
+    case node.anchor
+    of akLineEnd, akStringEndOrNewline:
+      # Before a character, both hold only before ``\n``.
+      f.accept.ascii.incl uint8('\n')
+      f.noteLeaf(nil)
+      fsStop
+    of akStringEnd:
+      # Before a character, ``\z`` never holds.
+      f.noteLeaf(nil)
+      fsStop
+    else:
+      fsPass # zero-width, ``\K`` included: a failed continuation rolls it back
   of nkLookaround:
     if node.lookKind == lkAhead:
-      # A positive look-ahead demands its own first character right here, so
-      # what its body requires at its start is required at this position, its
-      # leaf included.  The body walks into its own ``ContinuationReq`` so a
-      # refusal inside it leaves ``f`` alone: the look-ahead is zero-width, so
-      # dropping its share leaves the union a superset of what the rest of the
-      # continuation requires.
-      var body = ContinuationReq(acceptKnown: true)
-      if addReq(node.lookBody, flags, body) == fsStop and body.acceptKnown:
-        f.accept.ascii = f.accept.ascii + body.accept.ascii
-        f.accept.nonAscii = f.accept.nonAscii + body.accept.nonAscii
-        f.noteLeaf(body.leaf)
-        fsStop
-      else:
-        # Nothing was taken from the body, so nothing is claimed for it; the
-        # node after the look-ahead speaks at this same position.
-        fsPass
+      # The body walks into its own ``ContinuationReq`` so a refusal inside it
+      # leaves ``f`` alone.
+      var body = PassOwn
+      body.step = addReq(node.lookBody, flags, body.req)
+      f.lookAheadInto(body)
     else:
       # A negative look-ahead and both look-behinds only refuse positions.
       fsPass
@@ -2211,29 +2388,30 @@ proc addReq(node: Node, flags: RegexFlags, f: var ContinuationReq): FollowStep =
   of nkQuantifier:
     if node.quantMax == 0:
       return fsPass # ``{0,0}`` matches empty, so the node after it speaks
-    let step = addReq(node.quantBody, flags, f)
-    if step == fsUnknown:
-      fsUnknown
-    elif node.quantMin >= 1:
-      step
-    else:
-      fsPass
+    node.repeatStep(addReq(node.quantBody, flags, f))
   of nkFlagGroup:
-    # Recursing under the new flags would not help: a folded leaf's set is its
-    # ASCII case closure plus every character above U+007F folding into it, so
-    # ``nonAscii`` widens to ``naOther`` and both readers of ``accept`` give up
-    # anyway.  The isolated ``(?imx)`` form carries ``flagBody == nil`` and
-    # moves its *siblings*' flags, which this walk cannot carry either.
-    fsUnknown
-  of nkLiteral, nkEscapedLiteral, nkCharClass, nkCharType, nkString:
+    # Under folding, recursing would not help: [leafAccept] states no folded
+    # leaf's set.  The isolated ``(?imx)`` form carries ``flagBody == nil``
+    # and moves its *siblings*' flags, which this walk cannot carry either.
+    # Any other switch is [flagBodyInto]'s.
+    if node.flagBody == nil or
+        (node.flagsOn * {rfIgnoreCase, rfIgnoreCaseAscii}).card != 0:
+      return fsUnknown
+    var body = PassOwn
+    body.step = addReq(node.flagBody, (flags + node.flagsOn) - node.flagsOff, body.req)
+    f.flagBodyInto(body)
+  of LeafKinds:
+    # Under folding [leafAccept] states no set, so the accept track is given
+    # up.  The leaf is still claimed: no join carries it ([joinReq]), a switch
+    # that folds nothing drops it, and the lazy arm drops it at match time
+    # wherever folding is on.
     var a: AcceptSet
     let stated = leafAccept(node, flags, a)
     let testable = leafTestable(node)
     if not stated and not testable:
       return fsUnknown # ``.``, ``\X``, ``\R``: neither track has anything
     if stated:
-      f.accept.ascii = f.accept.ascii + a.ascii
-      f.accept.nonAscii = f.accept.nonAscii + a.nonAscii
+      f.accept.joinAccept(a)
     else:
       f.acceptKnown = false
     f.noteLeaf(if testable: node else: nil)
@@ -2241,19 +2419,10 @@ proc addReq(node: Node, flags: RegexFlags, f: var ContinuationReq): FollowStep =
   else:
     fsUnknown
 
-proc reqBefore(node: Node, flags: RegexFlags, tail: ContinuationReq): ContinuationReq =
-  ## What the continuation requires just before ``node``, given ``tail`` is
-  ## what it requires just after it.  A concat folds right to left with this,
-  ## reaching every child once.
-  var here = ContinuationReq(acceptKnown: true)
-  case addReq(node, flags, here)
-  of fsStop:
-    here
-  of fsPass:
-    here.mergeTail(tail)
-    here
-  of fsUnknown:
-    UnknownReq
+proc ownReq(node: Node, flags: RegexFlags): OwnReq =
+  ## What ``node`` requires at its start on its own.
+  result = PassOwn
+  result.step = addReq(node, flags, result.req)
 
 type RegionStep = enum
   ## Walk-back result on the mandatory path to the required byte.
@@ -3174,9 +3343,60 @@ proc tuneRepeats(node: Node, expand: bool) =
     if expand:
       expandStringRepeat(node)
 
+template NothingReq(): ContinuationReq =
+  ## A continuation never reached: the identity of [joinReq].  The leaf track
+  ## is given up already, as [joinReq] gives it up.
+  ContinuationReq(acceptKnown: true, leafMulti: true)
+
+proc joinReq(into: var ContinuationReq, r: ContinuationReq): bool =
+  ## Widen ``into`` to hold what ``r`` requires as well, for a position either
+  ## continuation may follow, and say whether it grew.  Only the accept track
+  ## joins: a leaf is necessary for one continuation, not for the other.
+  if not into.acceptKnown:
+    return false
+  if not r.acceptKnown:
+    into.acceptKnown = false
+    return true
+  let was = into.accept
+  into.accept.joinAccept(r.accept)
+  into.accept != was
+
+proc dropLeaf(r: ContinuationReq): ContinuationReq =
+  ## ``r`` on its accept track alone, for a position another continuation
+  ## may follow as well: [joinReq] of ``r`` into [NothingReq].
+  ContinuationReq(accept: r.accept, acceptKnown: r.acceptKnown, leafMulti: true)
+
+type CallAfters = object
+  ## What follows a group a ``\g<...>`` can run, wherever it runs: the join of
+  ## what follows it where it is written and at every call to it, by 0-based
+  ## group.  A call returns to its own continuation, so the body's end holds
+  ## each of them in turn.
+  after: seq[ContinuationReq]
+  collect: bool ## the joins are being worked out; nothing is written
+  body: seq[Node] ## a called group's body, once the walk has been through it
+  bodyFlags: seq[RegexFlags] ## the flags it was walked under
+  stale: seq[int]
+    ## Groups whose join widened after their body was walked, so the calls
+    ## inside it read too little.
+  queued: seq[bool]
+  bodies: seq[Node] ## for [callTarget]
+  namedCaptures: seq[(string, int)]
+
+proc widen(calls: var CallAfters, g: int, r: ContinuationReq) =
+  ## Join ``r`` into group ``g``'s end, and queue its body for another walk
+  ## if the walk has been through it already.
+  if joinReq(calls.after[g], r) and calls.body[g] != nil and not calls.queued[g]:
+    calls.queued[g] = true
+    calls.stale.add g
+
 proc annotateContinuations(
-    node: Node, flags: RegexFlags, after: ContinuationReq, calls: bool, mayRewrite: bool
-) =
+    node: Node,
+    flags: RegexFlags,
+    after: ContinuationReq,
+    wantOwn: bool,
+    mayRewrite: bool,
+    calls: var CallAfters,
+): OwnReq =
   ## Give every repeat what its continuation requires at the position it
   ## stops, and rewrite the greedy ones that cannot use a give-back at all --
   ## PCRE2's auto-possessification.
@@ -3186,24 +3406,74 @@ proc annotateContinuations(
   ## arm reads it as a byte set, the lazy arm as a leaf to test, and
   ## [ContinuationReq] carries both.
   ##
-  ## ``mayRewrite`` is false below an inline ``(?i)`` and where the pattern has
-  ## a ``\g<...>``.  ``calls`` gives up both tracks at every group, which a
-  ## ``\g<...>`` can re-enter under a continuation this walk never sees.
+  ## Returns what ``node`` requires on its own, as [ownReq] does, built from
+  ## its children's answers: a concat folds each child into its tail without
+  ## walking the child again.  Only while ``wantOwn`` holds: a caller that
+  ## reads nothing back -- a look-behind, the pattern's root -- spares the
+  ## leaves below it the set they would state.  Otherwise no arm writes the
+  ## answer, and its zero step is ``fsUnknown``: a caller that reads it after
+  ## all gives up rather than rewrite on a claim no walk made.  (An explicit
+  ## ``result = UnknownOwn`` up front cost every node a store, +1.6% on this
+  ## walk.)
+  ##
+  ## ``mayRewrite`` is false below an inline ``(?i)``.  A group a ``\g<...>``
+  ## can run ([markCalledGroups]) ends in ``calls.after``; while
+  ## ``calls.collect`` holds, the walk only adds to those joins.
   if node == nil:
-    return
+    return UnknownOwn
   case node.kind
   of nkConcat:
     # Right to left: what follows child ``i`` is child ``i+1`` folded into the
     # tail already built for it.
     var tail = after
+    if wantOwn:
+      result = PassOwn
     for i in countdown(node.children.high, 0):
-      annotateContinuations(node.children[i], flags, tail, calls, mayRewrite)
-      tail = reqBefore(node.children[i], flags, tail)
+      # The first child's answer feeds no tail, only the concat's own.
+      let own = annotateContinuations(
+        node.children[i], flags, tail, wantOwn or i > 0, mayRewrite, calls
+      )
+      if i > 0:
+        tail = before(own, tail)
+      if wantOwn:
+        thenReq(own, result)
   of nkQuantifier:
-    # What follows the body is the next iteration, or what follows the repeat
-    # on the last one; neither is analysed, so the body walks under an
-    # unknown follower.
-    annotateContinuations(node.quantBody, flags, UnknownReq, calls, mayRewrite)
+    # What follows the body is the next iteration, or what follows the repeat.
+    # A possessive iteration is atomic, so its body's own continuation ends
+    # it; an ``X{0}`` never runs its body here at all, and an ``X?`` runs it
+    # once, so only what follows the repeat follows it.  A leaf reads no
+    # follower, so the walk does not work one out for it, nor does it walk
+    # the body for its first character where the join is unknown anyway.
+    var bodyAfter =
+      if node.quantMax == 0:
+        NothingReq
+      elif node.quantKind == qkPossessive or node.quantBody == nil or
+        node.quantBody.kind in LeafKinds:
+        UnknownReq
+      elif node.quantMax == 1:
+        after
+      elif not after.acceptKnown:
+        UnknownReq
+      else:
+        var r = dropLeaf(after)
+        discard joinReq(r, before(ownReq(node.quantBody, flags), after))
+        r
+    let bodyOwn = annotateContinuations(
+      node.quantBody,
+      flags,
+      bodyAfter,
+      wantOwn and node.quantMax != 0,
+      mayRewrite,
+      calls,
+    )
+    if wantOwn:
+      result =
+        if node.quantMax == 0:
+          PassOwn # ``{0,0}`` matches empty, so the node after it speaks
+        else:
+          OwnReq(req: bodyOwn.req, step: node.repeatStep(bodyOwn.step))
+    if calls.collect:
+      return
     case node.quantKind
     of qkGreedy:
       if mayRewrite and after.acceptKnown:
@@ -3227,36 +3497,139 @@ proc annotateContinuations(
     of qkPossessive:
       discard
   of nkAlternation:
+    if wantOwn:
+      result = OwnReq(req: ContinuationReq(acceptKnown: true), step: fsStop)
     for alt in node.alternatives.view:
-      annotateContinuations(alt, flags, after, calls, mayRewrite)
-  of nkCapture:
-    annotateContinuations(
-      node.captureBody, flags, (if calls: UnknownReq else: after), calls, mayRewrite
-    )
-  of nkNamedCapture:
-    annotateContinuations(
-      node.namedCaptureBody,
-      flags,
-      (if calls: UnknownReq else: after),
-      calls,
-      mayRewrite,
-    )
+      let own = annotateContinuations(alt, flags, after, wantOwn, mayRewrite, calls)
+      if wantOwn:
+        orReq(result, own)
+  of nkCapture, nkNamedCapture:
+    let body {.cursor.} =
+      if node.kind == nkCapture: node.captureBody else: node.namedCaptureBody
+    let called =
+      if node.kind == nkCapture: node.captureCalled else: node.namedCaptureCalled
+    if called:
+      let g = groupSlot(node) - 1
+      if calls.collect:
+        calls.widen(g, after)
+        calls.body[g] = body
+        calls.bodyFlags[g] = flags
+      # A copy: a call inside the body may widen the join while it is walked.
+      var bodyAfter = calls.after[g]
+      result = annotateContinuations(body, flags, bodyAfter, wantOwn, mayRewrite, calls)
+    else:
+      result = annotateContinuations(body, flags, after, wantOwn, mayRewrite, calls)
   of nkGroup:
-    annotateContinuations(
-      node.groupBody, flags, (if calls: UnknownReq else: after), calls, mayRewrite
-    )
+    result =
+      annotateContinuations(node.groupBody, flags, after, wantOwn, mayRewrite, calls)
+  of nkSubexpCall:
+    # The called body returns here.  ``\g<0>`` runs the whole pattern, whose
+    # end is unknown already.  The call itself states nothing.
+    if calls.collect:
+      let g = callTarget(node, calls.bodies, calls.namedCaptures)
+      if g >= 0 and g < calls.after.len:
+        calls.widen(g, after)
   of nkFlagGroup:
-    # An inline ``(?i)`` widens every leaf below it, and the sets here are
-    # written for folding off, so nothing below may be rewritten.  The walk
-    # still descends: a leaf claimed under it is dropped at match time, where
-    # the arm checks ``ctx.flags``.
-    for child in node.childNodes:
-      annotateContinuations(child, flags, UnknownReq, calls, false)
+    let inner = (flags + node.flagsOn) - node.flagsOff
+    if node.flagBody != nil and
+        (node.flagsOn * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0:
+      # A switch that folds nothing leaves the accept sets as they are
+      # ([flagBodyInto]); only the leaf, read under other flags, stays outside.
+      let body = annotateContinuations(
+        node.flagBody, inner, dropLeaf(after), wantOwn, mayRewrite, calls
+      )
+      if wantOwn:
+        result = PassOwn
+        result.step = result.req.flagBodyInto(body)
+    else:
+      # An inline ``(?i)`` widens every leaf below it.  The walk descends under
+      # the flags the body runs under, so a leaf there states no set
+      # ([leafAccept]) and a call there joins an unknown end into the group
+      # it runs.  A set written for folding off would leak: [CallAfters]
+      # carries the join out of the scope, to a repeat the walk does rewrite
+      # (``(?<n>B*){0}c(?i:\g<n>b)``).  Nothing below is rewritten either, and
+      # a leaf claimed under it is dropped at match time, where the arm checks
+      # ``ctx.flags``.
+      for child in node.childNodes:
+        discard annotateContinuations(child, inner, UnknownReq, false, false, calls)
+  of nkAtomicGroup:
+    # Atomic ends its body's continuation, which is not ``after``; its first
+    # character is its body's.
+    result = annotateContinuations(
+      node.atomicBody, flags, UnknownReq, wantOwn, mayRewrite, calls
+    )
+  of nkLookaround:
+    # A look-around body ends its own continuation too.
+    let ahead = node.lookKind == lkAhead
+    let body = annotateContinuations(
+      node.lookBody, flags, UnknownReq, wantOwn and ahead, mayRewrite, calls
+    )
+    if wantOwn:
+      result = PassOwn
+      if ahead:
+        result.step = result.req.lookAheadInto(body)
   else:
-    # An atomic group, a lookaround body, an absent expression: each ends its
-    # own continuation, which is not ``after``.
+    # An absent expression ends its own continuation as well.  A leaf, an
+    # anchor and every other kind [addReq] answers without a walk.
     for child in node.childNodes:
-      annotateContinuations(child, flags, UnknownReq, calls, mayRewrite)
+      discard annotateContinuations(child, flags, UnknownReq, false, mayRewrite, calls)
+    if wantOwn:
+      result = ownReq(node, flags)
+
+const MaxCallJoinRewalks = 16
+  ## Walks of each called group's body [annotateRepeats] spends working out
+  ## [CallAfters] before it gives every called group an unknown end.  Each
+  ## walk follows a join that widened, and a join only widens.
+
+proc annotateRepeats(
+    ast: Node,
+    flags: RegexFlags,
+    bodies: seq[Node],
+    namedCaptures: seq[(string, int)],
+    called: seq[bool],
+) =
+  ## [annotateContinuations] over the whole pattern, after working out what
+  ## follows each called group: from nothing, one collecting walk over the
+  ## pattern, then one over each called body whose join widened after it was
+  ## walked, until none did.
+  ##
+  ## The end of the pattern is unknown, not "nothing": a give-back can reach
+  ## it through zero-width nodes alone, and then holds whatever character it
+  ## gave back (``[0-9]*\b`` on ``5e``, where ``\b`` refuses the full run).
+  ##
+  ## ``called`` is by slot, slot 0 the whole pattern, whose end is unknown
+  ## already: a pattern whose calls all run it has no join to work out.
+  var calls: CallAfters
+  if called.len > 1 and true in called.toOpenArray(1, called.high):
+    calls = CallAfters(
+      after: newSeq[ContinuationReq](bodies.len),
+      collect: true,
+      body: newSeq[Node](bodies.len),
+      bodyFlags: newSeq[RegexFlags](bodies.len),
+      queued: newSeq[bool](bodies.len),
+      bodies: bodies,
+      namedCaptures: namedCaptures,
+    )
+    for a in calls.after.mitems:
+      a = NothingReq
+    discard annotateContinuations(ast, flags, UnknownReq, false, true, calls)
+    var budget = MaxCallJoinRewalks * bodies.len
+    while calls.stale.len > 0:
+      let g = calls.stale.pop()
+      calls.queued[g] = false
+      dec budget
+      if budget < 0:
+        for a in calls.after.mitems:
+          a = UnknownReq
+        break
+      # ``bodyFlags`` holds a body's own flags, folding included when it is
+      # written inside ``(?i)``; ``mayRewrite`` is moot while collecting.
+      var bodyAfter = calls.after[g]
+      discard annotateContinuations(
+        calls.body[g], calls.bodyFlags[g], bodyAfter, false, true, calls
+      )
+    calls.collect = false
+  discard annotateContinuations(ast, flags, UnknownReq, false, true, calls)
 
 proc leadSimpleRepeat(node: Node, flags: RegexFlags): Node =
   ## Unbounded greedy or possessive repeat over a one-way leaf every match
@@ -3469,20 +3842,20 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   let finalFlags =
     flags + (p.currentFlags * {rfFindLongest}) +
     (if scopedLongest: {rfFindLongest} else: {})
-  # Same rule: must see the final AST.  Annotate under ``finalFlags``, the
-  # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
-  # ``regex.flags``), since an annotation is used only while the two agree.
-  # Folding off, because both tracks are written for it.  ``\g<...>`` blocks
-  # the rewrite pattern-wide and gives up both tracks at every group besides.
-  let noFold = (finalFlags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0
-  let calls = hasSubexpCall(ast)
-  if noFold:
-    annotateContinuations(ast, finalFlags, UnknownReq, calls, not calls)
-  annotateLookaroundBounds(ast, finalFlags)
-  # Re-collect group bodies after AST transformation
+  # Re-collect group bodies after AST transformation, before the passes below
+  # read them; none of those replaces a node.
   bodies = @[]
   groupFlags = @[]
   collectGroupBodies(ast, bodies, groupFlags, flags)
+  # Same rule: must see the final AST.  Annotate under ``finalFlags``, the
+  # flags the matcher starts from (``resetForRegex`` seeds ``ctx.flags`` from
+  # ``regex.flags``), since an annotation is used only while the two agree.
+  # Folding off, because both tracks are written for it.  After
+  # ``markCalledGroups``, which names the groups whose end is a join.
+  let noFold = (finalFlags * {rfIgnoreCase, rfIgnoreCaseAscii}).card == 0
+  if noFold:
+    annotateRepeats(ast, finalFlags, bodies, namedCaptures, called)
+  annotateLookaroundBounds(ast, finalFlags)
   var firstCharCache: FirstCharCache = nil
   var levelBackrefs = false
   annotateTree(
