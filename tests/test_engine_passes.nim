@@ -380,16 +380,51 @@ suite "auto-possessification":
     check kinds("\\w+(?=\\()") == @[qkPossessive]
     check all("f(x) g y(", "\\w+(?=\\()") == @["f", "y"]
 
-  test "the last repeat of a repeated group keeps its greedy exits":
-    # ``(?:\w+\s+){3,}``: what follows ``\s+`` is the next iteration or
-    # whatever follows the group, neither of which this pass reads.
+  test "a repeated body is followed by its next iteration or the exit":
+    # ``(?:\w+\s+){3,}=``: ``\s+`` hands over to ``\w`` or ``=``.
+    check kinds("(?:\\w+\\s+){3,}=") == @[qkGreedy, qkPossessive, qkPossessive]
+    check all("aa bb cc =", "(?:\\w+\\s+){3,}=") == @["aa bb cc ="]
     check kinds("(?:\\w+\\s+){3,}") == @[qkGreedy, qkPossessive, qkGreedy]
     check all("aa bb cc dd ", "(?:\\w+\\s+){3,}") == @["aa bb cc dd "]
+    check kinds("(?:\\w+\\s+){3,}\\s") == @[qkGreedy, qkPossessive, qkGreedy]
+    check all("aa bb cc dd  x", "(?:\\w+\\s+){3,}\\s") == @["aa bb cc dd  "]
+    check kinds("(?:\\w+,?)+x") == @[qkGreedy, qkGreedy, qkPossessive]
+    check all("ab,cdx", "(?:\\w+,?)+x") == @["ab,cdx"]
+    # An ``X?`` runs its body once, so only what follows the repeat follows it.
+    check kinds("(?:x\\w+)?\\s") == @[qkGreedy, qkPossessive]
+    check all("xab c", "(?:x\\w+)?\\s") == @["xab "]
+    check kinds("(?:x\\w+)?x") == @[qkGreedy, qkGreedy]
+    check all("xabx", "(?:x\\w+)?x") == @["xabx"]
+    # A possessive iteration is atomic: its body's own end is all it has.
+    check kinds("(?:\\w+=)++") == @[qkPossessive, qkPossessive]
+    check kinds("(?:a\\w+)++") == @[qkPossessive, qkGreedy]
 
   test "nothing after the repeat proves nothing":
     check kinds("\\w+") == @[qkGreedy]
-    check kinds("\\w+$") == @[qkGreedy] # an anchor is zero-width, not a follower
+    check kinds("\\w+\\b") == @[qkGreedy] # zero-width, then nothing
     check kinds("(\\w+)\\s*") == @[qkGreedy, qkGreedy]
+    # A give-back can reach the end through zero-width nodes alone: here
+    # ``\b`` refuses the full run and passes after one give-back.
+    check kinds("[0-9]*(?:F|f)?\\b") == @[qkGreedy, qkGreedy]
+    check all("0.5em", "\\b[0-9]+\\.[0-9]*(F|f)?\\b") == @["0."]
+
+  test "an end anchor requires what it requires before a character":
+    # A give-back always leaves a character after it: there ``$`` and ``\\Z``
+    # hold only before ``\\n``, and ``\\z`` never.
+    check kinds("\\w+$") == @[qkPossessive]
+    check all("ab\ncd", "\\w+$") == @["ab", "cd"]
+    check kinds("\\w+\\Z") == @[qkPossessive]
+    check kinds("\\w+\\z") == @[qkPossessive]
+    check kinds("[^a]+\\z") == @[qkPossessive]
+    check all("ba\nbb", "[^a]+\\z") == @["\nbb"]
+    check kinds("\\s+$") == @[qkGreedy]
+    check all("a \n\nb \n", "\\s+$") == @[" \n", " \n"]
+    check kinds("\\w+(?=,|$)") == @[qkPossessive]
+    check all("ab,cd", "\\w+(?=,|$)") == @["ab", "cd"]
+    # The follow byte is read at give-backs, which ``\\n`` alone passes.
+    check re("[^a]+$").ast.children[0].quantFollowByte == int16('\n')
+    check all("b\nb\n", "[^a]+$") == @["b\nb\n"]
+    check all("b\nbaa", "[^a]+$") == @["b"]
 
   test "a follower that shares a character is refused":
     check kinds("\\w+x") == @[qkGreedy]
@@ -430,6 +465,7 @@ suite "auto-possessification":
     check kinds("\\w+\\K=") == @[qkPossessive]
     check all("aa=b", "\\w+\\K=") == @["="]
     check kinds("\\w+(?!x)") == @[qkGreedy] # zero-width, then nothing
+    check kinds("\\w+(?!x)\\w") == @[qkGreedy]
 
   test "an unstatable follower stops the walk":
     check kinds("(a)\\w+\\1") == @[qkGreedy] # a backreference names no set
@@ -438,22 +474,134 @@ suite "auto-possessification":
     check kinds("\\w+.") == @[qkGreedy] # ``.`` follows (?m) at match time
 
   test "case folding takes the pattern off the pass":
-    # The leaf sets are written for folding off, and an inline ``(?i)`` is a
-    # flag group, which nothing below is entered for.
+    # Folding widens every leaf, so no leaf under it states a set, and nothing
+    # below an inline ``(?i)`` is rewritten.
     check kinds("(?i)\\w+=") == @[qkGreedy]
     check kinds("\\w+=", {rfIgnoreCase}) == @[qkGreedy]
     check kinds("(?i:\\w+=)") == @[qkGreedy]
-    check kinds("(?m:\\w+=)") == @[qkGreedy]
+    check kinds("(?I:\\w+=)") == @[qkGreedy]
+    check kinds("(?i:a(?-i:\\w+=))") == @[qkGreedy]
 
-  test "a subexpression call takes the whole pattern off the pass":
-    # A called body runs under the continuation at the call, which this walk
-    # never sees.
-    check kinds("(\\w+=)\\g<1>") == @[qkGreedy]
+  test "a switch that folds nothing is walked through":
+    check kinds("(?m:\\w+=)") == @[qkPossessive]
+    check kinds("(?x) \\w+ =") == @[qkPossessive]
+    check kinds("(?x:\\w+)=") == @[qkPossessive]
+    check kinds("\\w+(?x:=)") == @[qkPossessive]
+    check kinds("\\w+(?W:\\s)") == @[qkPossessive]
+    check all("ab=cd =", "(?x) \\w+ =") == @["ab="]
+    check kinds("\\w+(?i:=)") == @[qkGreedy]
+    check kinds("\\w+(?i:x)") == @[qkGreedy]
+    check all("abX", "\\w+(?i:x)") == @["abX"]
+
+  test "a group a call can run ends in what follows each place it runs":
+    # A call returns to its own continuation, so the body's end holds what
+    # follows the group where it is written and what follows every call.
+    check kinds("(\\w+=)\\g<1>") == @[qkPossessive]
+    check all("ab=cd=", "(\\w+=)\\g<1>") == @["ab=cd="]
+    check kinds("(\\w+)=\\g<1>;") == @[qkPossessive]
+    check all("ab=cd;", "(\\w+)=\\g<1>;") == @["ab=cd;"]
+    check kinds("(\\w+)=\\g<1>x") == @[qkGreedy]
+    check all("ab=cdx", "(\\w+)=\\g<1>x") == @["ab=cdx"]
+    check kinds("(\\w+)x?=\\g<1>;") == @[qkGreedy, qkPossessive]
+    check all("ax=b;", "(\\w+)x?=\\g<1>;") == @["ax=b;"]
+    check kinds("(?<n>\\w+)=\\g<n>x") == @[qkGreedy]
+    check kinds("(?<n>\\w+=)\\g<n>") == @[qkPossessive]
+    # Neither an uncalled capture nor a ``(?:...)`` is a call's target.
+    check kinds("(\\w+)=\\g<2>(x)") == @[qkPossessive]
+    check kinds("(x)(?:\\w+)=\\g<1>") == @[qkPossessive]
+    # A group inside a called one ends where the called one ends.
+    check kinds("((?:\\w+))=\\g<1>x") == @[qkGreedy]
+    check kinds("((\\w+))=\\g<1>;") == @[qkPossessive]
+    # A call in a repeated body hands over to the next iteration or the exit.
+    check kinds("(?<n>\\w+)(?:\\.\\g<n>)*\\s") == @[qkPossessive, qkGreedy]
+    check all("a.b.c d", "(?<n>\\w+)(?:\\.\\g<n>)*\\s") == @["a.b.c "]
+    check kinds("(?<n>\\w+)(?:\\.\\g<n>)*x") == @[qkGreedy, qkGreedy]
+    check all("a.bx", "(?<n>\\w+)(?:\\.\\g<n>)*x") == @["a.bx"]
+    # A call written left of a group widens its end after the walk has been
+    # through its body, so the calls in the body are walked again.
+    const late = "(?<b>x\\g<a>){0}=\\g<b>b;(?<a>y\\g<c>){0}(?<c>[ab]+){0}\\g<a>!"
+    check kinds(late) == @[qkGreedy, qkGreedy, qkGreedy, qkGreedy]
+    check all("=xyabb;ya!", late) == @["=xyabb;ya!"]
+    # ``X{0}`` defines a group without running it where it is written.
+    check kinds("(?<n>\\w+){0}\\g<n>=") == @[qkGreedy, qkPossessive]
+    check all("ab=", "(?<n>\\w+){0}\\g<n>=") == @["ab="]
+    check kinds("(?<n>\\w+){0}\\g<n>x") == @[qkGreedy, qkGreedy]
+    # The whole pattern's end is unknown already, so ``\\g<0>`` adds nothing.
+    check kinds("\\w+=(?:x\\g<0>)?") == @[qkPossessive, qkGreedy]
+    check all("ab=xcd=", "\\w+=(?:x\\g<0>)?") == @["ab=xcd="]
+    # A recursive call returns into its own body's continuation.
+    check kinds("(<[a-z]+>|\\(\\g<1>\\))") == @[qkPossessive]
+    check all("((<ab>))", "(<[a-z]+>|\\(\\g<1>\\))") == @["((<ab>))"]
+    # A body runs under its own flags wherever it is called from, so a call
+    # from inside ``(?i)`` reads it as written.
+    check kinds("a+A|(?i:x\\g<0>)") == @[qkPossessive]
+    check all("xaaA xaaa", "a+A|(?i:x\\g<0>)") == @["xaaA"]
+    # But a call inside ``(?i)`` returns into a folding continuation, where
+    # ``b`` takes ``B`` too, and the join must not say otherwise.
+    check kinds("(?<n>B*){0}c(?i:\\g<n>b)") == @[qkGreedy, qkGreedy]
+    check all("cBB", "(?<n>B*){0}c(?i:\\g<n>b)") == @["cBB"]
+    check all("cBB", "(B*)c(?i:\\g<1>b)") == @["cBB"]
+    check all("cBB", "(B*)c(?i)\\g<1>b") == @["cBB"]
+    # A switch below ``(?i)`` that folds nothing leaves folding on.
+    check all("cBB", "(?<n>[A-Z]*){0}c(?i:\\g<n>(?m:b))") == @["cBB"]
+    check all("cxBB", "(?<n>B*){0}c(?i:x(?m:\\g<n>b))") == @["cxBB"]
+    # A body written inside ``(?i)`` is walked again under it when a call to
+    # its left widens its end.
+    const foldLate = "\\g<n>!(?i:(?<n>\\g<m>b){0})(?<m>B*){0}"
+    check kinds(foldLate) == @[qkGreedy, qkGreedy, qkGreedy]
+    check all("BB!", foldLate) == @["BB!"]
+    # Switching folding off again states the set once more.
+    check kinds("(?<n>B*){0}c(?i:\\g<n>(?-i:b))") == @[qkGreedy, qkPossessive]
+    check all("cBBb", "(?<n>B*){0}c(?i:\\g<n>(?-i:b))") == @["cBBb"]
+
+  test "a bracket class states its ASCII bytes, and a family above them":
+    check kinds("[_[:alnum:]]+\\s") == @[qkPossessive]
+    check kinds("[_[:alpha:]][_[:alnum:]]*=") == @[qkPossessive]
+    check kinds("[\\w$]+\\s") == @[qkPossessive]
+    check kinds("[[:alpha:]]+[[:space:]]") == @[qkPossessive]
+    check kinds("[[:digit:]]+\\s") == @[qkPossessive]
+    check kinds("[[:alpha:]]+\\s", {rfAsciiPosix}) == @[qkPossessive]
+    check all("héllo wörld\u3000x", "[[:alpha:]]+\\s") == @["héllo ", "wörld\u3000"]
+    # The families claim word against space and digit against space only.
+    check kinds("[[:alpha:]]+[[:digit:]]") == @[qkGreedy]
+    check kinds("[[:punct:]]+\\s") == @[qkGreedy]
+    check kinds("[é]+\\s") == @[qkGreedy]
+    check kinds("[a-é]+\\s") == @[qkGreedy]
+    check kinds("[[:alpha:]]+\\w") == @[qkGreedy]
+    check all("ab1 cd", "[[:alpha:]]+\\w") == @["ab1", "cd"]
+    # A negated class complements its exact ASCII bytes, and claims every
+    # family above them.
+    check kinds("\"[^\"]*\"") == @[qkPossessive]
+    check all("\"ab\" \"\"", "\"[^\"]*\"") == @["\"ab\"", "\"\""]
+    check kinds("[^a]+a") == @[qkPossessive]
+    check kinds("[^a]+b") == @[qkGreedy]
+    check all("bcb", "[^a]+b") == @["bcb"]
+    check kinds("[^a]+\\s") == @[qkGreedy]
+    check kinds("[^\\s]+\\s") == @[qkGreedy]
+    check kinds("[^a]+[^b]") == @[qkGreedy]
+
+  test "a POSIX class above U+007F stays in the family it is given":
+    # What ``posixNonAscii`` claims; ``naOther`` claims nothing.  Only the
+    # Unicode reading: the ASCII-only one takes nothing above U+007F.
+    for cls in PosixClassName:
+      let family = posixNonAscii(cls)
+      if naOther in family:
+        continue
+      var stray = -1
+      for cp in 0x80 .. 0x10FFFF:
+        let r = Rune(cp)
+        if matchPosixClass(r, cls, false) and
+            not ((naWord in family and isWordChar(r, false)) or
+              (naDigit in family and isDigitChar(r, false)) or
+              (naSpace in family and isSpaceChar(r, false))):
+          stray = cp
+          break
+      checkpoint($cls)
+      check stray == -1
 
   test "a body that is not one leaf is left alone":
     check kinds("(?:ab)+=") == @[qkGreedy]
     check kinds("(\\w)+=") == @[qkGreedy]
-    check kinds("[^a]+=") == @[qkGreedy] # a negated class states no exact set
     check kinds("\\p{L}+=") == @[qkGreedy]
     check kinds(".+=") == @[qkGreedy]
 
@@ -650,12 +798,19 @@ suite "required-byte region":
 
   test "a leaf the walk cannot state keeps the byte but not the region":
     # The presence test still runs; only the walk-back stands down.
-    for p in ["[^a]+=", ".+=", "\\p{L}+=", "(\\w+=)\\g<1>"]:
+    for p in [".+=", "\\p{L}+=", "(\\w+=)\\g<1>"]:
       let r = region(p)
       check r.valid
       check r.byte == uint8('=')
       check not r.regionOk
+
+  test "a negated class walks back over its complement and every high byte":
+    let r = region("[^a]+=")
+    check r.valid
+    check r.byte == uint8('=')
+    check r.regionOk
     check all("b=c", "[^a]+=") == @["b="]
+    check all("ab=c a\xC3\xA9==", "[^a]+=") == @["b=", "\xC3\xA9=="]
 
   test "case folding takes the byte itself off, region and all":
     check not region("(?i)\\w+=").valid

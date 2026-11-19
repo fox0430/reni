@@ -1758,6 +1758,16 @@ suite "a lazy repeat of a single-way leaf is a scan, not a choice per rep":
     check search("aab", re("a*?(?:)b")).boundaries[0] == 0 .. 3
     check lazyScanned("a*?b{0,0}c")
     check search("aac", re("a*?b{0,0}c")).boundaries[0] == 0 .. 3
+    # So is a switch whose body consumes nothing first.  One whose body can
+    # consume first is a second way in, even where it may match empty.
+    check lazyScanned("\\w*?(?m:\\b)x")
+    check search("ab x", re("\\w*?(?m:\\b)x")).boundaries[0] == 3 .. 4
+    check not lazyScanned("a*?(?m:b?)c")
+    check search("aabc", re("a*?(?m:b?)c")).boundaries[0] == 0 .. 4
+    # An ``X?`` runs its body once, so a lazy repeat inside it hands over to
+    # what follows the ``X?``.
+    check lazyScanned("(?:xa*?)?y")
+    check search("xaay", re("(?:xa*?)?y")).boundaries[0] == 0 .. 4
 
   test "a construct that cuts the backtracking keeps the general path":
     # Inside ``(?>...)`` a repeat that stopped later than it does today could
