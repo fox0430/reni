@@ -230,16 +230,17 @@ proc lastNewlineIn(s: string, lo, hi: int): int =
       return i
   -1
 
-proc nextLineRunePos*(s: string, p: int): int =
+proc nextLineRunePos*(s: string, p: int, crlf: bool): int =
   ## [nextRunePos] for a line-mode scan: the declared length, cut short at
-  ## a ``\n``.  A lead byte whose sequence the ``\n`` cuts is the last
-  ## character of its line, so the next start is the ``\n`` itself, the end
-  ## of that line; the byte after a ``\n`` always starts a line.
+  ## the end of the line.  A lead byte whose sequence the line's end cuts is
+  ## the last character of its line, so the next start is that end: the
+  ## ``\n``, or under ``rfCrlf`` (``crlf``) the ``\r`` that ends the line.
+  ## The byte after a ``\n`` always starts a line.
   if p >= s.len:
     return p + 1
   let stop = min(p + encLen(s[p].uint8), s.len)
   for i in p + 1 ..< stop:
-    if s[i] == '\n':
+    if s[i] == '\n' or crlf and s[i] == '\r' and (i + 1 == s.len or s[i + 1] == '\n'):
       return i
   stop
 
@@ -266,6 +267,20 @@ proc lineEndAt(s: string, p: int): int {.inline.} =
   ## Line mode: the ``\n`` that ends the line holding ``p``, or ``s.len``.
   let q = indexOfByte(s, p, uint8('\n'))
   if q < 0: s.len else: q
+
+proc contentEnd(s: string, nl: int, crlf: static bool): int {.inline.} =
+  ## Line mode: where the line ended by ``nl`` (its ``\n``, or ``s.len``)
+  ## ends.  That is ``nl`` itself, except under ``rfCrlf`` (``crlf``), where
+  ## a ``\r`` before ``nl`` lies outside the line.  A line's start follows a
+  ## ``\n``, so a ``\r`` at ``nl - 1`` always belongs to the line.  A
+  ## position past the result and up to ``nl`` holds no line.
+  when crlf:
+    if nl > 0 and s[nl - 1] == '\r':
+      nl - 1
+    else:
+      nl
+  else:
+    nl
 
 proc bindLine(ctx: MatchContext, s: string, ls, le, regionEnd: int): Subject =
   ## Line mode: point the matcher at the line ``[ls, le)`` of ``s``, with the
@@ -362,16 +377,17 @@ proc scanLineBackward(
   var startPos = start
   searchBackwardScan()
 
-proc searchLinesInto*(
+proc searchLinesIn(
     ctx: MatchContext,
     subject: string,
     regex: Regex,
     m: var Match,
-    start: int = 0,
-    stepLimit: int = DefaultStepLimit,
-    maxRecursionDepth: int = DefaultMaxRecursionDepth,
-    sameSubject: bool = false,
-    options: MatchOptions = {},
+    start: int,
+    stepLimit: int,
+    maxRecursionDepth: int,
+    sameSubject: bool,
+    options: MatchOptions,
+    crlf: static bool,
 ) =
   ## ``searchImplInto`` under ``rfLineMode``: each line, without its ``\n``,
   ## is a subject of its own.  The line holding ``start`` is searched from
@@ -382,6 +398,9 @@ proc searchLinesInto*(
   ## lack a byte every match holds; the scan runs over each other line's
   ## view.  The steps are counted over the whole call, as one search's are:
   ## a budget per line would let a call run ``lines * limit`` steps.
+  ##
+  ## Under ``rfCrlf`` a ``start`` that holds no line, the ``\n`` of a
+  ## ``\r\n`` or the end after a final ``\r``, begins with the next line.
   defer:
     releaseBorrowed(ctx)
   let findLongest = rfFindLongest in regex.flags
@@ -432,11 +451,21 @@ proc searchLinesInto*(
         ctx.lineMemoEnd
       else:
         lineEndAt(subject, c)
+    let ce = contentEnd(subject, le, crlf)
+    when crlf:
+      if fromPos > ce:
+        # ``start`` lies past the line's end and holds no line.
+        if le >= subject.len:
+          break
+        ls = le + 1
+        fromPos = ls
+        first = false
+        continue
     let view = bindLine(
       ctx,
       subject,
       ls,
-      le,
+      ce,
       if first and sameSubject and regionData == cast[pointer](unsafeAddr subject[ls]):
         regionEnd
       else:
@@ -469,20 +498,49 @@ proc searchLinesInto*(
     fromPos = ls
     first = false
 
-proc searchBackwardLinesInto*(
+proc searchLinesInto*(
     ctx: MatchContext,
     subject: string,
     regex: Regex,
     m: var Match,
-    start: int = -1,
+    start: int = 0,
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    sameSubject: bool = false,
     options: MatchOptions = {},
+) =
+  ## [searchLinesIn], with ``rfCrlf`` fixed.  Tested in the loop, the flag
+  ## cost a pattern without it about 13 instructions a line (``\w+$``,
+  ## +0.24% of the GREP corpus's); this call costs about 9 a search.  Both
+  ## forms in line here cost 16 a search: gcc spills more in the merged
+  ## loop.
+  if rfCrlf in regex.flags:
+    searchLinesIn(
+      ctx, subject, regex, m, start, stepLimit, maxRecursionDepth, sameSubject, options,
+      true,
+    )
+  else:
+    searchLinesIn(
+      ctx, subject, regex, m, start, stepLimit, maxRecursionDepth, sameSubject, options,
+      false,
+    )
+
+proc searchBackwardLinesIn(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int,
+    stepLimit: int,
+    maxRecursionDepth: int,
+    options: MatchOptions,
+    crlf: static bool,
 ) =
   ## ``searchBackwardImplInto`` under ``rfLineMode``: the line holding
   ## ``start``, back from there, then each earlier line back from its end.
   ## A ``start`` that holds no line, past a final ``\n``, begins with the
-  ## last line.
+  ## last line.  Under ``rfCrlf`` one on the ``\n`` of a ``\r\n``, or
+  ## after a final ``\r``, begins at the end of the line before it.
   defer:
     releaseBorrowed(ctx)
   writeNotFound(m)
@@ -512,11 +570,20 @@ proc searchBackwardLinesInto*(
     ls = lineStartAt(ctx, subject, fromPos, false)
   var first = true
   while true:
-    let le = lineEndAt(subject, fromPos)
-    let view = bindLine(ctx, subject, ls, le, -1)
+    let ce = contentEnd(subject, lineEndAt(subject, fromPos), crlf)
+    let view = bindLine(ctx, subject, ls, ce, -1)
     ctx.matchOptions = lineOptions(options, ls, first)
     ctx.budgetOrigin = origin - ls
-    scanLineBackward(ctx, view, regex, m, fromPos - ls)
+    scanLineBackward(
+      ctx,
+      view,
+      regex,
+      m,
+      when crlf:
+        min(fromPos, ce) - ls
+      else:
+        fromPos - ls,
+    )
     if m.found:
       shiftMatch(m, ls)
       return
@@ -525,6 +592,27 @@ proc searchBackwardLinesInto*(
     first = false
     fromPos = ls - 1
     ls = lineStartAt(ctx, subject, fromPos, false)
+
+proc searchBackwardLinesInto*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = -1,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    options: MatchOptions = {},
+) =
+  ## [searchBackwardLinesIn], with ``rfCrlf`` fixed, as [searchLinesInto]
+  ## fixes it.
+  if rfCrlf in regex.flags:
+    searchBackwardLinesIn(
+      ctx, subject, regex, m, start, stepLimit, maxRecursionDepth, options, true
+    )
+  else:
+    searchBackwardLinesIn(
+      ctx, subject, regex, m, start, stepLimit, maxRecursionDepth, options, false
+    )
 
 proc matchAtLinesInto*(
     ctx: MatchContext,
@@ -538,7 +626,8 @@ proc matchAtLinesInto*(
 ) =
   ## ``matchAtImplInto`` under ``rfLineMode``: one attempt at ``pos`` in the
   ## line holding it.  A ``pos`` on a ``\n`` is the end of the line it ends;
-  ## one past a final ``\n`` holds no line and never matches.
+  ## one past a final ``\n`` holds no line and never matches, nor, under
+  ## ``rfCrlf``, one on the ``\n`` of a ``\r\n`` or after a final ``\r``.
   defer:
     releaseBorrowed(ctx)
   writeNotFound(m)
@@ -550,8 +639,17 @@ proc matchAtLinesInto*(
   if ls >= subject.len:
     noteScratchUsage(ctx)
     return
+  let le = lineEndAt(subject, pos)
+  let ce =
+    if rfCrlf in regex.flags:
+      contentEnd(subject, le, true)
+    else:
+      le
+  if pos > ce:
+    noteScratchUsage(ctx)
+    return
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
-  discard bindLine(ctx, subject, ls, lineEndAt(subject, pos), -1)
+  discard bindLine(ctx, subject, ls, ce, -1)
   ctx.matchOptions = lineOptions(options, ls, true)
   let rel = pos - ls
   resetForPosition(ctx, rel, rel)

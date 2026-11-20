@@ -63,6 +63,14 @@ suite "the public API is what the README documents":
     expect RegexError:
       discard re(r"a\nb", {rfLineMode})
 
+  test "rfCrlf leaves a line's last CR out of it":
+    let crlf = re(r"\w+$", {rfLineMode, rfCrlf})
+    check search("ab\r\ncd\r\n", crlf).matchSpan == 0 .. 2
+    expect RegexError:
+      discard re(r"a\rb", {rfLineMode, rfCrlf})
+    expect RegexError:
+      discard re(r"a", {rfCrlf})
+
   test "a step limit is reported as RegexLimitError":
     expect RegexLimitError:
       discard search("aaaaaaaaaaaaaaaaaaaaaaaaab", re("(a+)+$"), stepLimit = 1000)
@@ -168,6 +176,7 @@ suite "the README's export list is the whole export list":
     mustExport RegexFlags
     mustExport rfCaptureGroup
     mustExport rfLineMode
+    mustExport rfCrlf
     mustExport pattern
     mustExport flags
     mustExport captureCount

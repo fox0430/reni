@@ -121,6 +121,17 @@ quadratic time. Such a loop also cannot step past an empty match with
 `nextRunePos`: the step runs on over a `\n` that cuts a sequence short and
 skips the start of the next line.
 
+Add `rfCrlf` for files with `\r\n` line ends. A `\r` that is the last byte
+of a line, before its `\n` or at the end of the buffer, is then left out of
+the line. So `foo$` matches `foo\r\n`, and `a.` does not. A `\r` inside a
+line is an ordinary character. The pattern may not spell a `\r`, such as
+`\r` or `[\r]`. `rfCrlf` without `rfLineMode` raises `RegexError`.
+
+```nim
+let crlf = re(r"\w+$", {rfLineMode, rfCrlf})
+assert search("ab\r\ncd\r\n", crlf).matchSpan == 0 .. 2
+```
+
 ### Match at position
 
 ```nim

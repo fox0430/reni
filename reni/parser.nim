@@ -1269,57 +1269,93 @@ proc recordStart(p: Parser, node: Node, start: int) =
   if start <= high(int32):
     node.patternPos = int32(start)
 
-func newlineOnly(a: CcAtom): bool =
-  ## Whether the class atom ``a`` stands for ``\n`` and nothing else.
+func lineEndOnly(a: CcAtom, cr: bool): bool =
+  ## Whether the class atom ``a`` stands for nothing but ``\n``, or, when
+  ## ``cr``, nothing but ``\n`` and ``\r``.
   case a.kind
   of ccLiteral:
-    a.rune == Rune(0x0A)
+    a.rune == Rune(0x0A) or cr and a.rune == Rune(0x0D)
   of ccRange:
-    a.rangeFrom == Rune(0x0A) and a.rangeTo == Rune(0x0A)
+    a.rangeFrom == a.rangeTo and
+      (a.rangeFrom == Rune(0x0A) or cr and a.rangeFrom == Rune(0x0D))
   of ccNestedClass:
     if a.nestedNegated or a.nestedAtoms.len == 0:
       return false
     for b in a.nestedAtoms:
-      if not newlineOnly(b):
+      if not lineEndOnly(b, cr):
         return false
     true
   else:
     false
 
-func spellsNewline(node: Node): bool =
+func spellsLineEnd(node: Node, cr: bool): bool =
   ## Whether ``node``, an atom as [parseAtom] returns it, is a ``\n``
   ## written out: a literal in any spelling, a run of escaped code points
   ## holding one (``\x{61 0A}``), or a bracket class of nothing but ``\n``.
-  ## A class with other members is not: it is a class that never meets a
-  ## ``\n`` in line mode.  That is rg's rule, which empties a class by
-  ## taking ``\n`` out and refuses only what is left with nothing; this one
-  ## reads the syntax, so a class that comes to ``\n`` alone only through
-  ## negation or an intersection never matches instead.
+  ## When ``cr``, a ``\r`` counts as a ``\n``.  A class with other members
+  ## is not: it is a class that never meets a ``\n`` in line mode.  That is
+  ## rg's rule, which empties a class by taking ``\n`` out and refuses only
+  ## what is left with nothing; this one reads the syntax, so a class that
+  ## comes to ``\n`` alone only through negation or an intersection never
+  ## matches instead.
   case node.kind
   of nkLiteral:
-    node.rune == Rune(0x0A)
+    node.rune == Rune(0x0A) or cr and node.rune == Rune(0x0D)
   of nkEscapedLiteral:
-    node.escapedRune == Rune(0x0A)
+    node.escapedRune == Rune(0x0A) or cr and node.escapedRune == Rune(0x0D)
   of nkConcat:
     for c in node.children:
-      if spellsNewline(c):
+      if spellsLineEnd(c, cr):
         return true
     false
   of nkCharClass:
     if not node.bracketClass or node.negated or node.atoms.len == 0:
       return false
     for a in node.atoms:
-      if not newlineOnly(a):
+      if not lineEndOnly(a, cr):
         return false
     true
+  else:
+    false
+
+func mentionsCr(node: Node): bool =
+  ## Whether the atom ``node``, which [spellsLineEnd] has refused, writes a
+  ## ``\r`` anywhere in it, so the error names the ``\r`` and not the
+  ## ``\n``: ``\x{d a}`` and ``[\r\n]`` are refused for their ``\r``.
+  case node.kind
+  of nkLiteral:
+    node.rune == Rune(0x0D)
+  of nkEscapedLiteral:
+    node.escapedRune == Rune(0x0D)
+  of nkConcat:
+    for c in node.children:
+      if mentionsCr(c):
+        return true
+    false
+  of nkCharClass:
+    # Refused, so every atom is a \n or a \r; it holds a \r unless all of
+    # them pass as a \n alone.
+    for a in node.atoms:
+      if not lineEndOnly(a, false):
+        return true
+    false
   else:
     false
 
 proc refuseNewline(p: Parser, node: Node, at: int) {.inline.} =
   ## Under ``rfLineMode`` no line holds a ``\n``, so a pattern that spells
   ## one out is refused, as rg refuses it, rather than left never to match.
-  if rfLineMode in p.flags and spellsNewline(node):
-    p.error("newline not allowed in line mode", at)
+  ## Under ``rfCrlf`` a ``\r`` is refused too, as rg's ``--crlf`` refuses
+  ## it: one written into the pattern means the line end, which it never
+  ## matches there.
+  if rfLineMode in p.flags:
+    let crlf = rfCrlf in p.flags
+    if spellsLineEnd(node, crlf):
+      # One walk on the way through; the message is picked only on the way
+      # out, where a second look costs nothing.
+      if crlf and mentionsCr(node):
+        p.error("carriage return not allowed under rfCrlf", at)
+      p.error("newline not allowed in line mode", at)
 
 proc parseAtom(p: var Parser): Node =
   if p.atEnd:
