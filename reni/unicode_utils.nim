@@ -701,6 +701,11 @@ proc unicodeTypes(r: Rune): int {.inline.} =
   else:
     0
 
+proc isUppercaseChar*(r: Rune): bool {.inline.} =
+  ## The derived ``Uppercase`` property: Lu plus Other_Uppercase, as
+  ## ``\p{Upper}`` and Rust's ``char::is_uppercase`` read it.
+  utmUppercase in unicodeTypes(r)
+
 proc wordBreakProp(r: Rune): SgWord {.inline.} =
   if r.isCodePoint:
     segmentation.wordBreakProp(r)
@@ -1003,8 +1008,7 @@ proc matchPosixClass*(r: Rune, cls: PosixClassName, asciiOnly: bool): bool =
     if asciiOnly:
       c >= ord('A') and c <= ord('Z')
     else:
-      # Same derived-property set as \p{Upper}: Lu plus Other_Uppercase.
-      utmUppercase in unicodeTypes(r)
+      isUppercaseChar(r)
   of pcXdigit:
     isHexDigitChar(r)
   of pcWord:

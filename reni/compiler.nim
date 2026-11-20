@@ -3768,6 +3768,79 @@ proc hasTopLevelFindLongest(node: Node): bool =
       return false
   false
 
+type SmartCaseScan = object ## What [scanSmartCase] has seen so far.
+  literal: bool
+  upper: bool
+
+proc noteLiteral(s: var SmartCaseScan, r: Rune) {.inline.} =
+  s.literal = true
+  if isUppercaseChar(r):
+    s.upper = true
+
+proc scanSmartCaseAtoms(atoms: seq[CcAtom], s: var SmartCaseScan) =
+  ## A class's literals and both ends of its ranges, nested classes and
+  ## both sides of an intersection included, as rg's ``AstAnalysis`` reads a
+  ## bracket class.  Named classes and properties name no literal, nor does
+  ## a ``\M`` (``meta``).
+  for a in atoms:
+    case a.kind
+    of ccLiteral:
+      if not a.meta:
+        s.noteLiteral(a.rune)
+    of ccRange:
+      if not a.fromMeta:
+        s.noteLiteral(a.rangeFrom)
+      if not a.toMeta:
+        s.noteLiteral(a.rangeTo)
+    of ccNestedClass:
+      scanSmartCaseAtoms(a.nestedAtoms, s)
+    of ccIntersection:
+      scanSmartCaseAtoms(a.interLeft, s)
+      scanSmartCaseAtoms(a.interRight, s)
+    of ccPosix, ccNegPosix, ccCharType, ccUnicodeProp, ccNegUnicodeProp:
+      discard
+
+proc scanSmartCase(node: Node, s: var SmartCaseScan) =
+  ## The literals of ``node``, a tree as the parser returns it with its
+  ## bare-name conditions resolved, for ``rfSmartCase``.  A character written
+  ## as a code (``\x41``) is a literal, as it is to rg; a class escape, a
+  ## property outside brackets (a ``nkCharClass`` of a property alone), a
+  ## group name, a callout or the ``\M`` of ``\M-x`` (``escapedMeta``) is
+  ## not.
+  ## A byte sequence such as ``\xC3\xA9`` is the one character it encodes.
+  if node == nil or s.upper:
+    return
+  case node.kind
+  of nkLiteral:
+    s.noteLiteral(node.rune)
+  of nkEscapedLiteral:
+    if not node.escapedMeta:
+      s.noteLiteral(node.escapedRune)
+  of nkString:
+    for i in 0 ..< node.runes.len:
+      s.noteLiteral(node.runes[i])
+  of nkCharClass:
+    scanSmartCaseAtoms(node.atoms, s)
+  else:
+    for c in node.childNodes:
+      scanSmartCase(c, s)
+
+proc smartCaseFolds(p: var Parser, ast: Node): bool =
+  ## Whether ``rfSmartCase`` turns folding on for ``ast``, which ``p`` parsed
+  ## without ``rfIgnoreCase``: it holds a literal, and no uppercase one.
+  ## When it folds, [re] throws the tree away and parses again, since the
+  ## parser reads the flag (the shape of an absent operator's expression);
+  ## when it does not, [re] compiles this tree.  Bare-name conditions are
+  ## resolved here, so a ``(?(Name)...)`` naming a group reads no literal,
+  ## and ``p.sawGroupRead`` records one that became a reference, as [re]'s
+  ## own pass would.
+  if p.sawBareNameCondition and p.namedCaptures.len > 0:
+    if resolveBareNameConditions(ast, p.namedCaptures):
+      p.sawGroupRead = true
+  var s: SmartCaseScan
+  scanSmartCase(ast, s)
+  s.literal and not s.upper
+
 proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   ## Compile a reusable pattern. With ``rfCaptureGroup``, ordinary groups keep
   ## their numbers even when named groups exist, and numbered references stay
@@ -3776,8 +3849,13 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   if rfCrlf in flags and rfLineMode notin flags:
     raise newException(RegexError, "rfCrlf requires rfLineMode")
   validateUtf8(pattern)
+  var flags = flags
   var p = initParser(pattern, flags)
   var ast = p.parseRegex()
+  if rfSmartCase in flags and rfIgnoreCase notin flags and smartCaseFolds(p, ast):
+    flags.incl rfIgnoreCase
+    p = initParser(pattern, flags)
+    ast = p.parseRegex()
   if not p.atEnd:
     raise newException(RegexError, "unexpected character at position " & $p.position)
   p.validateLeadingOnlyPosition(ast)

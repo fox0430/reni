@@ -58,6 +58,33 @@ type
       ## pattern may not spell a ``\r`` either, nor a bracket class of
       ## nothing but ``\r`` and ``\n``.  Without ``rfLineMode`` it is a
       ## ``RegexError``.
+    rfWordBeginEnd
+      ## Read ``\<`` as the start of a word and ``\>`` as its end, as GNU
+      ## grep and rg do (compile option).  ``\<`` holds where a word
+      ## character follows and none precedes, ``\>`` where one precedes and
+      ## none follows; "word" is ``\w`` and ``\b``'s, so ``(?W)`` or
+      ## ``(?P)`` makes both ASCII-only.
+      ## Oniguruma's ``ONIG_SYN_OP_ESC_LTGT_WORD_BEGIN_END``.  Without it
+      ## both are a literal ``<`` and ``>``.  Inside a bracket class they are
+      ## literals either way.
+    rfSmartCase
+      ## Fold case when the pattern holds a literal and no uppercase one, as
+      ## rg's ``--smart-case`` does (compile option): ``foo`` folds, ``Foo``
+      ## does not.  A literal is a character the pattern writes out, plainly
+      ## or as an escape (``\x41``), in a bracket class too (``[A-Z]``,
+      ## both ends of a range).  A class escape or property names no
+      ## literal: ``\p{Lu}foo`` and ``[[:upper:]]foo`` fold.  A pattern with
+      ## no literal at all does not fold (``^\p{Ll}+$``).  "Uppercase" is
+      ## the Unicode ``Uppercase`` property, as ``\p{Upper}`` reads it.  A
+      ## UTF-8 byte sequence (``\xC3\xA9``) is the one character it encodes,
+      ## ``é``, where rg reads ``\xC3`` as ``Ã``; the ``\M`` of ``\M-x`` is
+      ## no literal.  Without ``rfWordBeginEnd``, ``\<`` and ``\>`` are the
+      ## literals ``<`` and ``>``, where rg always reads them as word edges,
+      ## so a grep front end gives both options.  It reads the pattern as
+      ## written: an inline ``(?-i)`` still turns folding off, and
+      ## ``rfIgnoreCase`` given as well folds regardless.
+      ## When it folds, ``flags`` on the compiled ``Regex`` holds
+      ## ``rfIgnoreCase``.
 
   RegexFlags* = set[RegexFlag]
 
@@ -85,6 +112,8 @@ type
     akKeep ## \K
     akGraphemeBoundary ## \y
     akNotGraphemeBoundary ## \Y
+    akWordBegin ## \< under ``rfWordBeginEnd``
+    akWordEnd ## \> under ``rfWordBeginEnd``
 
   CharTypeKind* = enum
     ctWord ## \w
@@ -189,8 +218,10 @@ type
     case kind*: CcAtomKind
     of ccLiteral:
       rune*: Rune
+      meta*: bool ## A ``\M`` read as M, as ``Node.escapedMeta``.
     of ccRange:
       rangeFrom*, rangeTo*: Rune
+      fromMeta*, toMeta*: bool ## Either end a ``\M``, as ``meta``.
     of ccPosix, ccNegPosix:
       posixClass*: PosixClassName
     of ccCharType:
@@ -325,6 +356,9 @@ type
     of nkEscapedLiteral:
       escapedRune*: Rune
       escapedBehind*: bool ## See ``runBehind``.
+      escapedMeta*: bool
+        ## The ``\M`` of Oniguruma's ``\M-x``, which reni reads as the
+        ## letter M: no literal to ``rfSmartCase``.
     of nkConcat:
       children*: seq[Node]
     of nkAlternation:
