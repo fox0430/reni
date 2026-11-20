@@ -1014,7 +1014,15 @@ proc parseEscape(p: var Parser): Node =
     # Oniguruma's ``\M-x`` is a code, ``x`` with the high bit set, which reni
     # reads as the letter M: a code still parts the characters around it.
     p.advance()
-    result = Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('M')))
+    result =
+      Node(kind: nkEscapedLiteral, escapedRune: Rune(ord('M')), escapedMeta: true)
+  of '<', '>':
+    p.advance()
+    if rfWordBeginEnd in p.flags:
+      let a = if ch == '<': akWordBegin else: akWordEnd
+      result = Node(kind: nkAnchor, anchor: a)
+    else:
+      result = Node(kind: nkLiteral, rune: Rune(ord(ch)))
   else:
     let r = p.advanceRune()
     result = Node(kind: nkLiteral, rune: r)

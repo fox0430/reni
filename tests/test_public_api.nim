@@ -71,6 +71,14 @@ suite "the public API is what the README documents":
     expect RegexError:
       discard re(r"a", {rfCrlf})
 
+  test "rfWordBeginEnd reads \\< and \\> as word edges":
+    check search("a foo", re(r"\<foo\>", {rfWordBeginEnd})).matchSpan == 2 .. 5
+    check not search("a foo", re(r"\<foo")).found
+
+  test "rfSmartCase folds a pattern with no uppercase literal":
+    check search("FOO", re("foo", {rfSmartCase})).found
+    check not search("FOO", re("Foo", {rfSmartCase})).found
+
   test "a step limit is reported as RegexLimitError":
     expect RegexLimitError:
       discard search("aaaaaaaaaaaaaaaaaaaaaaaaab", re("(a+)+$"), stepLimit = 1000)
@@ -177,6 +185,8 @@ suite "the README's export list is the whole export list":
     mustExport rfCaptureGroup
     mustExport rfLineMode
     mustExport rfCrlf
+    mustExport rfWordBeginEnd
+    mustExport rfSmartCase
     mustExport pattern
     mustExport flags
     mustExport captureCount

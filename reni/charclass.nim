@@ -408,6 +408,10 @@ proc parseCcEscape(p: var CcParser): CcAtom =
       let name = $p.peek
       p.advance()
       CcAtom(kind: ccNegUnicodeProp, prop: p.propertyNamed(name, at, inClass = true))
+  of 'M':
+    # As outside a class: the letter M, marked as the ``\M`` of ``\M-x``.
+    p.advance()
+    CcAtom(kind: ccLiteral, rune: Rune(ord('M')), meta: true)
   else:
     # Literal escape: \], \-, \\, \[, etc.
     let r = p.advanceRune()
@@ -636,7 +640,15 @@ proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) =
         if endAtom.kind == ccLiteral:
           if int32(atom.rune) > int32(endAtom.rune):
             p.error("invalid range in character class")
-          atoms.add(CcAtom(kind: ccRange, rangeFrom: atom.rune, rangeTo: endAtom.rune))
+          atoms.add(
+            CcAtom(
+              kind: ccRange,
+              rangeFrom: atom.rune,
+              rangeTo: endAtom.rune,
+              fromMeta: atom.meta,
+              toMeta: endAtom.meta,
+            )
+          )
           # Drain any pending atoms from multi-hex range end
           if p.pendingAtoms.len > 0:
             atoms.add(p.pendingAtoms)

@@ -132,6 +132,43 @@ let crlf = re(r"\w+$", {rfLineMode, rfCrlf})
 assert search("ab\r\ncd\r\n", crlf).matchSpan == 0 .. 2
 ```
 
+### Word edges and smart case
+
+Two more compile options read a pattern the way grep users type it.
+
+`rfWordBeginEnd` reads `\<` as the start of a word and `\>` as its end, as
+GNU grep and rg do. `\<` holds where a word character follows and none
+precedes. `\>` holds where one precedes and none follows. A word character
+is what `\w` matches, and `(?W)` or `(?P)` makes both ASCII-only. Without the option, `\<`
+and `\>` are a literal `<` and `>`, as in Oniguruma's own syntax. Inside a
+bracket class they are literals either way. This is Oniguruma's
+`ONIG_SYN_OP_ESC_LTGT_WORD_BEGIN_END`.
+
+```nim
+assert search("a foo", re(r"\<foo\>", {rfWordBeginEnd})).matchSpan == 2 .. 5
+```
+
+`rfSmartCase` folds case when the pattern holds a literal and no uppercase
+one, as rg's `--smart-case` does. A literal is a character the pattern
+writes out, either plainly or as an escape such as `\x41`. Inside a bracket
+class, characters and both ends of a range count too. Class escapes, Unicode
+properties and POSIX classes are not literals, so `\p{Lu}foo` folds. A
+pattern with no literal at all, such as `^\p{Ll}+$`, does not fold.
+Uppercase means the Unicode `Uppercase` property. A UTF-8 byte sequence
+such as `\xC3\xA9` counts as the one character it encodes, here the
+lowercase `é`, so it folds; rg reads `\xC3` as `Ã` and does not. The `\M`
+of Oniguruma's `\M-x` is no literal either. Without `rfWordBeginEnd`,
+`\<` and `\>` are the literals `<` and `>` and count as such, while rg
+always reads them as word edges, so a grep front end should pass both
+options. An inline `(?-i)` still
+turns folding off where it applies. When the option folds, the compiled
+`Regex` has `rfIgnoreCase` in its `flags`.
+
+```nim
+assert search("FOO", re("foo", {rfSmartCase})).found
+assert not search("FOO", re("Foo", {rfSmartCase})).found
+```
+
 ### Match at position
 
 ```nim

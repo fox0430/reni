@@ -7,7 +7,7 @@ import std/[unicode, tables, macros, bitops]
 from std/strutils import find
 from std/typetraits import supportsCopyMem
 
-import types, unicode_utils, stackguard, leafgate, fold_unravel
+import types, unicode_utils, stackguard, leafgate, fold_unravel, word_edge
 
 # Re-exported so callers can read the compiled-in budget (used by tests).
 export stackguard.MaxStackBytes
@@ -1715,6 +1715,14 @@ proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
     true
   of akWordBoundary, akNotWordBoundary:
     false # handled in matchWithCont dispatch before reaching here
+  of akWordBegin, akWordEnd:
+    wordEdgeAt(
+      ctx.subject.oa,
+      ctx.pos,
+      ctx.subjectEnd,
+      kind == akWordBegin,
+      rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags,
+    )
   of akGraphemeBoundary:
     if ctx.graphemeMode == gmWord:
       isWordBoundaryUax29(ctx.subject.oa, ctx.pos)
