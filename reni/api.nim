@@ -20,7 +20,7 @@
 
 import std/options
 
-import types, engine
+import types, engine, line_mode
 
 export MatchContext, newMatchContext
 
@@ -41,16 +41,28 @@ proc searchIntoCtx*(
   ## Returns ``m.found`` for ``if searchIntoCtx(...): ...`` usage.
   if start < 0 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
-  searchImplInto(
-    ctx,
-    subject,
-    regex,
-    m,
-    start = start,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    searchLinesInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    searchImplInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
   m.found
 
 proc searchBackwardIntoCtx*(
@@ -70,16 +82,28 @@ proc searchBackwardIntoCtx*(
   ## negative value or ``start > subject.len`` raises ``ValueError``.
   if start < -1 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
-  searchBackwardImplInto(
-    ctx,
-    subject,
-    regex,
-    m,
-    start = start,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    searchBackwardLinesInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    searchBackwardImplInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
   m.found
 
 proc matchAtIntoCtx*(
@@ -96,16 +120,28 @@ proc matchAtIntoCtx*(
   ## allocation-reuse contract.
   if pos < 0 or pos > subject.len:
     raise newException(ValueError, "pos index out of range: " & $pos)
-  matchAtImplInto(
-    ctx,
-    subject,
-    regex,
-    m,
-    pos = pos,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    matchAtLinesInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      pos = pos,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    matchAtImplInto(
+      ctx,
+      subject,
+      regex,
+      m,
+      pos = pos,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
   m.found
 
 proc search*(
@@ -118,14 +154,26 @@ proc search*(
 ): Match =
   if start < 0 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
-  searchImpl(
-    subject,
-    regex,
-    start = start,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    searchLinesInto(
+      newMatchContext(regex.captureCount),
+      subject,
+      regex,
+      result,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    result = searchImpl(
+      subject,
+      regex,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
 
 proc searchBackward*(
     subject: string,
@@ -141,14 +189,26 @@ proc searchBackward*(
   ## negative value or ``start > subject.len`` raises ``ValueError``.
   if start < -1 or start > subject.len:
     raise newException(ValueError, "start index out of range: " & $start)
-  searchBackwardImpl(
-    subject,
-    regex,
-    start = start,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    searchBackwardLinesInto(
+      newMatchContext(regex.captureCount),
+      subject,
+      regex,
+      result,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    result = searchBackwardImpl(
+      subject,
+      regex,
+      start = start,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
 
 proc matchAt*(
     subject: string,
@@ -161,14 +221,26 @@ proc matchAt*(
   ## Try to match only at the given position (no forward scanning).
   if pos < 0 or pos > subject.len:
     raise newException(ValueError, "pos index out of range: " & $pos)
-  matchAtImpl(
-    subject,
-    regex,
-    pos = pos,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
+  if rfLineMode in regex.flags:
+    matchAtLinesInto(
+      newMatchContext(regex.captureCount),
+      subject,
+      regex,
+      result,
+      pos = pos,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
+  else:
+    result = matchAtImpl(
+      subject,
+      regex,
+      pos = pos,
+      stepLimit = stepLimit,
+      maxRecursionDepth = maxRecursionDepth,
+      options = options,
+    )
 
 proc matchSpan*(m: Match): Span {.inline.} =
   ## Get the overall match span [a, b).
@@ -235,7 +307,10 @@ proc nextRunePos*(subject: string, pos: int): int =
   ##
   ## Uses the same length rule as the scan loops, so the positions
   ## ``findAll`` / ``replace`` / ``split`` step to after a zero-width match
-  ## are exactly the positions ``search`` starts an attempt at.
+  ## are exactly the positions ``search`` starts an attempt at.  Not under
+  ## ``rfLineMode``, whose scan stops a step at a ``\n``: a lead byte the
+  ## ``\n`` cuts short ends its line, so the next start is the ``\n``
+  ## itself.  Drive such a scan with ``MatchScanner``.
   ##
   ## The step never leaves the subject: a sequence truncated by the end
   ## declares more bytes than are there, and stepping past ``subject.len``
@@ -261,6 +336,10 @@ proc advanceAfterMatch*(
   ## progress and repetition need separate spans, and a ``\K`` inside a
   ## lookbehind reports a span this loop resumes inside and never ends.
   ## Drive a ``reni`` scan with ``MatchScanner`` instead.
+  ##
+  ## Nor does it fit ``rfLineMode``: it steps past an empty match with
+  ## ``nextRunePos``, which runs on over a ``\n`` that cuts a sequence short
+  ## and skips the start of the line after it.
   ##
   ## The span is taken whole rather than as two ``int`` parameters so that a
   ## caller written against an older argument order fails to compile instead
@@ -318,6 +397,11 @@ type MatchScanner* = object
   ## subject's length and raises on a string of a different one; it does not
   ## keep the subject itself, so another string of the same length is not told
   ## apart.  The check is a guard against the mistake, not a proof.
+  ##
+  ## Under ``rfLineMode`` the scan also keeps where the line of its last
+  ## match begins and ends, so that a scan through one long line does not
+  ## read to its ends on every match.  A subject rewritten in place between
+  ## two calls must keep that line's ``\n`` where it was and add none inside.
   subjectLen: int ## Length of the subject the cursors point into.
   scanPos: int ## Where the next attempt starts.
   outPos: int ## Where the subject text not yet written out begins.
@@ -360,12 +444,17 @@ proc scanPos*(sc: MatchScanner): int {.inline.} =
   sc.scanPos
 
 proc advancePast(
-    sc: var MatchScanner, subject: string, consumed: Span, stepOver: bool
+    sc: var MatchScanner,
+    subject: string,
+    consumed: Span,
+    stepOver: bool,
+    lineMode: static bool,
 ): bool {.inline.} =
   ## Move ``scanPos`` past an attempt that ran over ``consumed``.
   ## ``stepOver`` forces the one-character step an attempt consuming nothing
   ## needs anyway; a suppressed repeat asks for it, since its end is where the
   ## scan already stands.  Returns false when the scan has run off the subject.
+  ## Under ``rfLineMode`` the step stops at a ``\n`` (``nextLineRunePos``).
   ##
   ## The span is passed in rather than kept on the scanner, so there is no
   ## second copy of it to get out of step with ``scanPos``.
@@ -375,7 +464,11 @@ proc advancePast(
       # where this attempt began, which is already answered from.
       sc.scanPos = subject.len
       return false
-    sc.scanPos = nextRunePos(subject, consumed.b)
+    sc.scanPos =
+      when lineMode:
+        nextLineRunePos(subject, consumed.b)
+      else:
+        nextRunePos(subject, consumed.b)
   else:
     sc.scanPos = consumed.b
   sc.scanPos <= subject.len
@@ -387,6 +480,73 @@ proc checkSubject(sc: MatchScanner, subject: string) {.inline.} =
       "scanner is bound to a subject of " & $sc.subjectLen & " bytes, not " &
         $subject.len,
     )
+
+proc scanNextIn(
+    sc: var MatchScanner,
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    lineMode: static bool,
+): bool {.inline.} =
+  ## [scanNext], with the search and the step fixed for ``rfLineMode`` or not.
+  sc.checkSubject(subject)
+  while not sc.finished and sc.scanPos <= subject.len:
+    when lineMode:
+      searchLinesInto(
+        ctx,
+        subject,
+        regex,
+        m,
+        start = sc.scanPos,
+        stepLimit = sc.stepLimit,
+        maxRecursionDepth = sc.maxRecursionDepth,
+        # Keep the region memo; the matcher still checks the buffer pointer.
+        sameSubject = sc.started,
+      )
+    else:
+      searchImplInto(
+        ctx,
+        subject,
+        regex,
+        m,
+        start = sc.scanPos,
+        stepLimit = sc.stepLimit,
+        maxRecursionDepth = sc.maxRecursionDepth,
+        # Keep the region memo; the matcher still checks the buffer pointer.
+        sameSubject = sc.started,
+      )
+    sc.started = true
+    if not m.found:
+      sc.finished = true
+      return false
+    let consumed = consumedSpan(m)
+    # One step of memory is enough: reported ends never decrease over a scan,
+    # so an answer left behind cannot come back.  The span alone is the key --
+    # telling two attempts over it apart by their captures would yield it
+    # twice, which is two replacements at one position.
+    if m.boundaries[0] == sc.prevReported:
+      if not sc.advancePast(subject, consumed, stepOver = true, lineMode):
+        sc.finished = true
+        return false
+      continue
+    sc.prevReported = m.boundaries[0]
+    # Step past this match now rather than at the top of the next call, so
+    # ``scanPos`` is true while the caller still holds the match.  Running off
+    # the subject here ends the scan; this match is still handed over.
+    if not sc.advancePast(subject, consumed, stepOver = false, lineMode):
+      sc.finished = true
+    return true
+  false
+
+proc scanNextLines(
+    sc: var MatchScanner, ctx: MatchContext, subject: string, regex: Regex, m: var Match
+): bool {.noinline.} =
+  ## [scanNext] for an ``rfLineMode`` pattern.  Out of line, so that the
+  ## scan of a whole subject pays one flag test for it and nothing else: with
+  ## the test inside its loop, ``scanNext`` cost the benchmark +0.6% of its
+  ## instructions.
+  scanNextIn(sc, ctx, subject, regex, m, true)
 
 proc scanNext*(
     sc: var MatchScanner, ctx: MatchContext, subject: string, regex: Regex, m: var Match
@@ -401,41 +561,9 @@ proc scanNext*(
   ## ``subject`` must be the string the scanner was initialized over: one of a
   ## different length raises ``ValueError``, one of the same length is not told
   ## apart -- see ``MatchScanner``.
-  sc.checkSubject(subject)
-  while not sc.finished and sc.scanPos <= subject.len:
-    searchImplInto(
-      ctx,
-      subject,
-      regex,
-      m,
-      start = sc.scanPos,
-      stepLimit = sc.stepLimit,
-      maxRecursionDepth = sc.maxRecursionDepth,
-      # Keep the region memo; the matcher still checks the buffer pointer.
-      sameSubject = sc.started,
-    )
-    sc.started = true
-    if not m.found:
-      sc.finished = true
-      return false
-    let consumed = consumedSpan(m)
-    # One step of memory is enough: reported ends never decrease over a scan,
-    # so an answer left behind cannot come back.  The span alone is the key --
-    # telling two attempts over it apart by their captures would yield it
-    # twice, which is two replacements at one position.
-    if m.boundaries[0] == sc.prevReported:
-      if not sc.advancePast(subject, consumed, stepOver = true):
-        sc.finished = true
-        return false
-      continue
-    sc.prevReported = m.boundaries[0]
-    # Step past this match now rather than at the top of the next call, so
-    # ``scanPos`` is true while the caller still holds the match.  Running off
-    # the subject here ends the scan; this match is still handed over.
-    if not sc.advancePast(subject, consumed, stepOver = false):
-      sc.finished = true
-    return true
-  false
+  if rfLineMode in regex.flags:
+    return scanNextLines(sc, ctx, subject, regex, m)
+  scanNextIn(sc, ctx, subject, regex, m, false)
 
 proc takeGap*(sc: var MatchScanner, m: Match): Span =
   ## The run of subject text before ``m`` that no match covered; the output

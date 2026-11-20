@@ -344,6 +344,17 @@ type
       ## is a pointer, held by nothing.
     reqHitData: pointer
     reqHitFor: pointer
+    lineMemoData: pointer
+      ## Line mode: the line ``[lineMemoStart, lineMemoEnd]`` of the buffer at
+      ## ``lineMemoData``, ``lineMemoLen`` bytes long, where the last search
+      ## found its match.  ``lineMemoEnd`` is the line's ``\n``, or the
+      ## subject end.  A scan's next search starts in that line, and reading
+      ## to its ends on every call would cost a long line a pass per match.
+      ## Honoured only under ``sameSubject``, as the region memo is; at the
+      ## end so the fields before it keep their offsets.
+    lineMemoLen: int
+    lineMemoStart: int
+    lineMemoEnd: int
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -5719,54 +5730,19 @@ template runAttempt(ctx: MatchContext, startPos, searchStart: int, attempt: unty
         if not stepLimitLagged(ctx, attemptSteps, startPos):
           raise
 
-proc searchImplInto*(
-    ctx: MatchContext,
-    subject: string,
-    regex: Regex,
-    m: var Match,
-    start: int = 0,
-    stepLimit: int = DefaultStepLimit,
-    maxRecursionDepth: int = DefaultMaxRecursionDepth,
-    sameSubject: bool = false,
-    options: MatchOptions = {},
-) =
-  ## In-place variant of ``searchImpl``: writes into ``m``, reusing
-  ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
-  ## ``ctx`` must be caller-owned and single-threaded.  ``sameSubject`` is
-  ## for a scan whose next attempt runs over the same string; it is passed
-  ## on to ``resetForRegex``.
-  defer:
-    releaseBorrowed(ctx)
-  let findLongest = rfFindLongest in regex.flags
-  if findLongest:
-    ctx.flBestLen = -1
-    ctx.flBestMatch.found = false
-    ctx.flBestMatch.boundaries.setLen(0)
-  writeNotFound(m)
-  ctx.steps = 0
-  if callLimitRefuses(regex, maxRecursionDepth):
-    noteScratchUsage(ctx)
-    return
-  # Quick reject: if the pattern requires a specific byte, check its presence.
-  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
-  # literal, and such a literal is compared byte for byte, so the byte has to
-  # occur literally for any match to exist.
-  # Split scalars; the set is wide.
-  let rbValid = regex.requiredByte.valid
-  let rbByte = regex.requiredByte.byte
-  if rbValid and indexOfByte(subject, start, rbByte) < 0:
-    noteScratchUsage(ctx)
-    return
-  # The same for a string or a byte set from anywhere in the pattern, the
-  # case-folded included.  Every match holds it at or after ``start``.
-  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, start):
-    noteScratchUsage(ctx)
-    return
-  ctx.matchOptions = options
-  resetForRegex(
-    ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth, sameSubject
-  )
-  ctx.budgetOrigin = start
+template searchScan() {.dirty.} =
+  ## The scan over start positions behind ``searchImplInto``, from ``start``
+  ## over ``subject``: the whole string, or in line mode one line's view
+  ## (``line_mode``).  A match is written into ``m``, in ``subject``'s
+  ## offsets, and the caller returns; a ``(?L)`` scan leaves its best in
+  ## ``ctx.flBestMatch``.  The caller has bound ``ctx`` to ``subject``, set
+  ## ``budgetOrigin``, and read ``findLongest``, ``rbValid`` and ``rbByte``.
+  ##
+  ## A dirty template, so that ``searchImplInto`` is the loop it was, text for
+  ## text, and the byte helpers it calls are the ones for ``subject``'s type
+  ## where it is expanded: this module's over a ``string``, ``line_mode``'s
+  ## over a view.  Helpers made generic over both moved gcc's inlining in
+  ## ``runMachine``, +0.46% of the grammars' instructions.
   let fc = regex.firstCharInfo
   # A case-sensitive literal prefix is looked for as raw bytes, the way
   # Oniguruma's exact-string optimization does, so every byte offset is a
@@ -6063,71 +6039,14 @@ proc searchImplInto*(
         else:
           nextScanPos(subject, startPos)
 
-  if findLongest and ctx.flBestMatch.found:
-    # ctx.flBestMatch lives on the reusable context.  Copy its
-    # boundaries into ``m`` so the next call may overwrite the slot.
-    writeFoundCopy(
-      m, ctx.flBestMatch.boundaries, ctx.flBestMatch.boundaries.len,
-      ctx.flBestMatch.startChar,
-    )
-
-proc searchImpl*(
-    subject: string,
-    regex: Regex,
-    start: int = 0,
-    stepLimit: int = DefaultStepLimit,
-    maxRecursionDepth: int = DefaultMaxRecursionDepth,
-    options: MatchOptions = {},
-): Match =
-  let ctx = newMatchContext(regex.captureCount)
-  searchImplInto(
-    ctx,
-    subject,
-    regex,
-    result,
-    start = start,
-    stepLimit = stepLimit,
-    maxRecursionDepth = maxRecursionDepth,
-    options = options,
-  )
-
-proc searchBackwardImplInto*(
-    ctx: MatchContext,
-    subject: string,
-    regex: Regex,
-    m: var Match,
-    start: int = -1,
-    stepLimit: int = DefaultStepLimit,
-    maxRecursionDepth: int = DefaultMaxRecursionDepth,
-    options: MatchOptions = {},
-) =
-  ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.
-  defer:
-    releaseBorrowed(ctx)
-  writeNotFound(m)
-  ctx.steps = 0
-  if callLimitRefuses(regex, maxRecursionDepth):
-    noteScratchUsage(ctx)
-    return
-  # Quick reject: if the pattern requires a specific byte, check its presence.
-  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
-  # literal, and such a literal is compared byte for byte, so the byte has to
-  # occur literally for any match to exist.
-  if regex.requiredByte.valid and indexOfByte(subject, 0, regex.requiredByte.byte) < 0:
-    noteScratchUsage(ctx)
-    return
-  # A match may run past ``start`` to the end, so the whole subject counts.
-  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, 0):
-    noteScratchUsage(ctx)
-    return
-  ctx.matchOptions = options
-  var startPos =
-    if start >= 0:
-      min(start, subject.len)
-    else:
-      subject.len
-  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
-  ctx.budgetOrigin = startPos
+template searchBackwardScan() {.dirty.} =
+  ## The scan behind ``searchBackwardImplInto``, back from ``startPos`` over
+  ## ``subject``: the whole string, or in line mode one line's view
+  ## (``line_mode``).  A match is written into ``m``, in ``subject``'s
+  ## offsets, and the caller returns.  The caller has bound ``ctx`` to
+  ## ``subject`` and set ``budgetOrigin``.  A dirty template for the reason
+  ## [searchScan] gives, and so that the byte helpers it calls are the ones
+  ## for ``subject``'s type where it is expanded.
   let fc = regex.firstCharInfo
   # The backward scan steps with ``prevCharHead`` — Oniguruma's
   # ``ONIGENC_STEP_BACK(.., 1)``, the rule ``onig_search`` itself walks back
@@ -6196,6 +6115,133 @@ proc searchBackwardImplInto*(
       else:
         prevCharHead(subject, startPos)
 
+proc searchImplInto*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = 0,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    sameSubject: bool = false,
+    options: MatchOptions = {},
+) =
+  ## In-place variant of ``searchImpl``: writes into ``m``, reusing
+  ## ``ctx``'s buffers and ``m.boundaries``' capacity across calls.
+  ## ``ctx`` must be caller-owned and single-threaded.  ``sameSubject`` is
+  ## for a scan whose next attempt runs over the same string; it is passed
+  ## on to ``resetForRegex``.
+  ##
+  ## The whole subject is one subject here: an ``rfLineMode`` pattern goes to
+  ## [searchLinesInto] instead, and the caller picks.  Routing it from here
+  ## would put a returning call at the top of this proc, which costs the
+  ## benchmark +0.45% of its instructions.
+  when not defined(release):
+    assert rfLineMode notin regex.flags, "searchLinesInto takes a line-mode pattern"
+  defer:
+    releaseBorrowed(ctx)
+  let findLongest = rfFindLongest in regex.flags
+  if findLongest:
+    ctx.flBestLen = -1
+    ctx.flBestMatch.found = false
+    ctx.flBestMatch.boundaries.setLen(0)
+  writeNotFound(m)
+  ctx.steps = 0
+  if callLimitRefuses(regex, maxRecursionDepth):
+    noteScratchUsage(ctx)
+    return
+  # Quick reject: if the pattern requires a specific byte, check its presence.
+  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
+  # literal, and such a literal is compared byte for byte, so the byte has to
+  # occur literally for any match to exist.
+  # Split scalars; the set is wide.
+  let rbValid = regex.requiredByte.valid
+  let rbByte = regex.requiredByte.byte
+  if rbValid and indexOfByte(subject, start, rbByte) < 0:
+    noteScratchUsage(ctx)
+    return
+  # The same for a string or a byte set from anywhere in the pattern, the
+  # case-folded included.  Every match holds it at or after ``start``.
+  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, start):
+    noteScratchUsage(ctx)
+    return
+  ctx.matchOptions = options
+  resetForRegex(
+    ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth, sameSubject
+  )
+  ctx.budgetOrigin = start
+  searchScan()
+  if findLongest and ctx.flBestMatch.found:
+    # ctx.flBestMatch lives on the reusable context.  Copy its
+    # boundaries into ``m`` so the next call may overwrite the slot.
+    writeFoundCopy(
+      m, ctx.flBestMatch.boundaries, ctx.flBestMatch.boundaries.len,
+      ctx.flBestMatch.startChar,
+    )
+
+proc searchImpl*(
+    subject: string,
+    regex: Regex,
+    start: int = 0,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    options: MatchOptions = {},
+): Match =
+  let ctx = newMatchContext(regex.captureCount)
+  searchImplInto(
+    ctx,
+    subject,
+    regex,
+    result,
+    start = start,
+    stepLimit = stepLimit,
+    maxRecursionDepth = maxRecursionDepth,
+    options = options,
+  )
+
+proc searchBackwardImplInto*(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    start: int = -1,
+    stepLimit: int = DefaultStepLimit,
+    maxRecursionDepth: int = DefaultMaxRecursionDepth,
+    options: MatchOptions = {},
+) =
+  ## In-place variant of ``searchBackwardImpl``.  Reuses ``ctx``.  An
+  ## ``rfLineMode`` pattern goes to [searchBackwardLinesInto] instead.
+  when not defined(release):
+    assert rfLineMode notin regex.flags,
+      "searchBackwardLinesInto takes a line-mode pattern"
+  defer:
+    releaseBorrowed(ctx)
+  writeNotFound(m)
+  ctx.steps = 0
+  if callLimitRefuses(regex, maxRecursionDepth):
+    noteScratchUsage(ctx)
+    return
+  # Quick reject: if the pattern requires a specific byte, check its presence.
+  # ``extractRequiredByte`` only ever yields an ASCII byte of a case-sensitive
+  # literal, and such a literal is compared byte for byte, so the byte has to
+  # occur literally for any match to exist.
+  if regex.requiredByte.valid and indexOfByte(subject, 0, regex.requiredByte.byte) < 0:
+    noteScratchUsage(ctx)
+    return
+  # A match may run past ``start`` to the end, so the whole subject counts.
+  if regex.requiredLit.kind != rlNone and requiredLitAbsent(ctx, subject, regex, 0):
+    noteScratchUsage(ctx)
+    return
+  ctx.matchOptions = options
+  var startPos =
+    if start >= 0:
+      min(start, subject.len)
+    else:
+      subject.len
+  resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
+  ctx.budgetOrigin = startPos
+  searchBackwardScan()
+
 proc searchBackwardImpl*(
     subject: string,
     regex: Regex,
@@ -6229,7 +6275,10 @@ proc matchAtImplInto*(
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
     options: MatchOptions = {},
 ) =
-  ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.
+  ## In-place variant of ``matchAtImpl``.  Reuses ``ctx``.  An ``rfLineMode``
+  ## pattern goes to [matchAtLinesInto] instead.
+  when not defined(release):
+    assert rfLineMode notin regex.flags, "matchAtLinesInto takes a line-mode pattern"
   defer:
     releaseBorrowed(ctx)
   writeNotFound(m)

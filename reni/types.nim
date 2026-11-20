@@ -29,6 +29,24 @@ type
     rfIgnoreCaseAscii ## (?I) - case-insensitive matching for ASCII only
     rfFindLongest ## (?L) - find longest match
     rfCaptureGroup ## Keep numbered captures alongside named ones (compile option).
+    rfLineMode
+      ## Search each line, without its ``\n``, as a subject of its own
+      ## (compile option).  A match never holds a ``\n``; ``\A`` and ``^``
+      ## hold at a line's start, ``\z``, ``\Z`` and ``$`` at its end; a
+      ## look-around stops at both; a character never runs past the end of its
+      ## line.  A final ``\n`` ends the last line rather than beginning an
+      ## empty one, so the empty subject has no line.  The pattern may not
+      ## spell a ``\n``: a literal one, or a bracket class of nothing else,
+      ## is a ``RegexError``.
+      ##
+      ## ``moNotBeginString`` takes ``\A`` from the line at offset 0 only,
+      ## the one whose start is the buffer's; ``moNotBeginPosition`` takes
+      ## ``\G`` from the line holding ``start``.  A scan (``findAll``,
+      ## ``MatchScanner``) keeps the line it is in; a loop of
+      ## ``searchIntoCtx``, ``searchBackwardIntoCtx`` or ``matchAtIntoCtx``
+      ## reads to both ends of the line holding its position on every call.
+      ## Only a forward search skips the lines that lack a byte every match
+      ## needs; a backward one searches each line it passes.
 
   RegexFlags* = set[RegexFlag]
 
@@ -1154,6 +1172,11 @@ type
       ## One entry per ``NodeId``, filled for each class the pattern reads
       ## under ``(?i)``; see [ClassFold].  Empty when there is none.  Last,
       ## for the reason ``requiredLit`` gives.
+    lineLit: RequiredLiteral
+      ## Under ``rfLineMode``: what every match holds in its line, which
+      ## ``line_mode`` looks for over the whole subject to find the lines worth
+      ## searching.  ``rlNone`` without the flag.  Last, for the reason
+      ## ``requiredLit`` gives.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1360,6 +1383,10 @@ proc requiredByte*(r: Regex): lent RequiredByteInfo {.inline.} =
 proc requiredLit*(r: Regex): lent RequiredLiteral {.inline.} =
   ## Borrowed, like [requiredByte].
   r.requiredLit
+
+proc lineLit*(r: Regex): lent RequiredLiteral {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.lineLit
 
 proc literalScan*(r: Regex): bool {.inline.} =
   r.literalScan
@@ -1610,6 +1637,7 @@ proc initRegex*(
     literalScan: bool = false,
     requiredByte: RequiredByteInfo = RequiredByteInfo(valid: false),
     requiredLit: RequiredLiteral = RequiredLiteral(),
+    lineLit: RequiredLiteral = RequiredLiteral(),
     semiEndAnchored: bool = false,
     semiEndDMax: int = -1,
     levelBackrefs: bool = true,
@@ -1642,6 +1670,7 @@ proc initRegex*(
     literalScan: literalScan,
     requiredByte: requiredByte,
     requiredLit: requiredLit,
+    lineLit: lineLit,
     semiEndAnchored: semiEndAnchored,
     semiEndDMax: semiEndDMax,
     levelBackrefs: levelBackrefs,
