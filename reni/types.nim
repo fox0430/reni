@@ -47,6 +47,17 @@ type
       ## reads to both ends of the line holding its position on every call.
       ## Only a forward search skips the lines that lack a byte every match
       ## needs; a backward one searches each line it passes.
+    rfCrlf
+      ## Under ``rfLineMode``: a ``\r`` that is a line's last byte, before
+      ## its ``\n`` or at the subject end, is not part of the line (compile
+      ## option).  So ``foo$`` matches ``foo\r\n``, and ``a.`` does not.  A
+      ## ``\r`` inside a line is an ordinary character.  The ``\n`` of a
+      ## ``\r\n``, and the subject end after a final ``\r``, hold no line: a
+      ## search from there begins with the next line, a backward one at the
+      ## end of the line before, and ``matchAt`` there finds nothing.  The
+      ## pattern may not spell a ``\r`` either, nor a bracket class of
+      ## nothing but ``\r`` and ``\n``.  Without ``rfLineMode`` it is a
+      ## ``RegexError``.
 
   RegexFlags* = set[RegexFlag]
 

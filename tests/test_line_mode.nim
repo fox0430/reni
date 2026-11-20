@@ -174,3 +174,118 @@ suite "rfLineMode: a pattern may not spell a newline":
     except RegexError as e:
       check "line mode" in e.msg
       check e.msg.endsWith("at position 2")
+
+proc cr(pattern: string): Regex =
+  re(pattern, {rfLineMode, rfCrlf})
+
+proc crSpans(s: string, r: Regex): seq[Span] =
+  for m in findAll(s, r):
+    result.add m.matchSpan
+
+suite "rfCrlf: a CR that ends a line lies outside it":
+  test "the line ends before the CR of a CR LF":
+    check spanOf(search("foo\r\n", cr("foo$"))) == 0 .. 3
+    check spanOf(search("foo\r\n", cr("foo\\z"))) == 0 .. 3
+    check spanOf(search("foo\r\n", cr("foo\\Z"))) == 0 .. 3
+    for p in ["a.", "a\\s", "a[^x]", "a\\W", "a\\p{Cc}", "(?m)a.", "a\\R", "a\\X"]:
+      checkpoint p.escape
+      check not search("a\r\nb", cr(p)).found
+    check spanOf(search("a\r\n\r\nb\r\n", cr("^$"))) == 3 .. 3
+    check spanOf(search("x\r\nab\r\n", cr("(?<=a)b$"))) == 4 .. 5
+    # Without the flag the CR stays in the line.
+    check not search("foo\r\n", lm("foo$")).found
+    check spanOf(search("a\r\nb", lm("a."))) == 0 .. 2
+
+  test "a final CR with no newline after it lies outside the line too":
+    check spanOf(search("x\na\r", cr("a$"))) == 2 .. 3
+    check not search("a\r", cr("a.")).found
+    check spanOf(search("\r", cr("^$"))) == 0 .. 0
+
+  test "a CR inside a line is an ordinary character":
+    check spanOf(search("b\rc\r\n", cr("b.c"))) == 0 .. 3
+    check spanOf(search("b\rc\r\n", cr("b\\sc$"))) == 0 .. 3
+    check not search("a\rb\r\n", cr("a$")).found
+    check not search("a\rb\r\n", cr("^b")).found
+    check spanOf(search("a\r\r\n", cr("a\\s$"))) == 0 .. 2
+
+  test "the newline of a CR LF, and the end after a final CR, hold no line":
+    let s = "a\r\nb\r"
+    # A search from there begins with the next line; there is none after
+    # the final CR.
+    check spanOf(search(s, cr("$"), start = 2)) == 4 .. 4
+    check spanOf(search(s, cr("^"), start = 2)) == 3 .. 3
+    check not search(s, cr(""), start = 5).found
+    # A backward search begins at the end of the line before.
+    check spanOf(searchBackward(s, cr("$"), start = 2)) == 1 .. 1
+    check spanOf(searchBackward(s, cr("$"), start = 5)) == 4 .. 4
+    check spanOf(searchBackward(s, cr("\\w$"))) == 3 .. 4
+    # matchAt finds nothing there, and the line's end before the CR is the
+    # end it has.
+    check not matchAt(s, cr(""), pos = 2).found
+    check not matchAt(s, cr(""), pos = 5).found
+    check spanOf(matchAt(s, cr("$"), pos = 1)) == 1 .. 1
+    check spanOf(matchAt(s, cr("$"), pos = 4)) == 4 .. 4
+
+  test "a scan steps from a line's end over the CR LF to the next line":
+    check crSpans("a\r\n\r\nb\r\nc\r", cr("")) ==
+      @[0, 1, 3, 5, 6, 8, 9].mapIt(span(it, it))
+    # A lead byte cut short by the CR is the last character of its line, so
+    # the step from it stops at the CR, where the line ends.
+    check crSpans("\xE9\r\nx", cr("")) == @[0, 1, 3, 4].mapIt(span(it, it))
+    check crSpans("a b\r\nc d\r\n", cr("\\w\\s*\\w")) == @[span(0, 3), span(5, 8)]
+    check replace("a\r\nb\r\n", cr("$"), ";") == "a;\r\nb;\r\n"
+    check split("a b\r\nc", cr("\\s+")) == @["a", "b\r\nc"]
+
+suite "rfCrlf: a pattern may not spell a CR":
+  test "every spelling of a literal CR is refused":
+    for p in [
+      "\\r", "a\\rb", "a\\r?", "\\x0d", "\\x0D", "\\x{d}", "\\x{61 0d}", "\\015",
+      "\\o{15}", "\\cM", "\\C-m", "\\u000d", "a\rb", "[\\r]", "[\\r\\r]", "[\\r-\\r]",
+      "[[\\r]]", "[\\r\\n]", "[\\n\\r]", "[[\\r][\\n]]", "\\Q\r\\E", "(?:a|\\r)",
+      "(?=\\r)", "(?~\\r)",
+    ]:
+      checkpoint p.escape
+      expect RegexError:
+        discard cr(p)
+      # Under rfLineMode alone each one compiles.
+      discard lm(p)
+
+  test "a class or escape with other members is taken":
+    for p in [
+      "[\\ra]", "[\\r\\na]", "[^a]", "\\s", "\\R", "\\p{Cc}", "(?m).", "\\O", "(?x)a\rb"
+    ]:
+      checkpoint p.escape
+      discard cr(p)
+
+  test "the error names the flag, and a newline keeps its own":
+    try:
+      discard cr("ab\\r")
+      fail()
+    except RegexError as e:
+      check "rfCrlf" in e.msg
+      check e.msg.endsWith("at position 2")
+    try:
+      discard cr("ab\\n")
+      fail()
+    except RegexError as e:
+      check "line mode" in e.msg
+
+  test "a spelling of both a CR and a newline names the CR":
+    for p in ["\\x{d a}", "\\x{a d}", "[\\r\\n]", "[\\n\\r]", "[[\\n][\\r]]"]:
+      checkpoint p.escape
+      try:
+        discard cr(p)
+        fail()
+      except RegexError as e:
+        check "rfCrlf" in e.msg
+    for p in ["\\n", "\\x{61 a}", "[\\n]", "[[\\n]]"]:
+      checkpoint p.escape
+      try:
+        discard cr(p)
+        fail()
+      except RegexError as e:
+        check "line mode" in e.msg
+
+  test "rfCrlf without rfLineMode is refused":
+    expect RegexError:
+      discard re("a", {rfCrlf})

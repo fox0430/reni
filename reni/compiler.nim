@@ -3773,6 +3773,8 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   ## their numbers even when named groups exist, and numbered references stay
   ## available. This corresponds to Oniguruma's ``ONIG_OPTION_CAPTURE_GROUP``;
   ## without it, named groups retain Oniguruma's default capture behavior.
+  if rfCrlf in flags and rfLineMode notin flags:
+    raise newException(RegexError, "rfCrlf requires rfLineMode")
   validateUtf8(pattern)
   var p = initParser(pattern, flags)
   var ast = p.parseRegex()
