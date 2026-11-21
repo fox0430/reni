@@ -13,6 +13,7 @@
 ## ``reni`` instead.
 
 import std/[hashes, tables, unicode]
+import byte_scan
 
 type
   RegexError* = object of CatchableError
@@ -1222,6 +1223,17 @@ type
       ## ``line_mode`` looks for over the whole subject to find the lines worth
       ## searching.  ``rlNone`` without the flag.  Last, for the reason
       ## ``requiredLit`` gives.
+    leadScan: ByteSetScan
+      ## ``firstCharInfo.bytes`` laid out for the block scan, under
+      ## ``fcByteSet`` when the set is rare enough that its members lie apart
+      ## (``runs`` 0 otherwise, and the scan reads a byte at a time).  Last,
+      ## for the reason ``requiredLit`` gives.
+    requiredScan: ByteSetScan
+      ## ``requiredLit.set`` laid out for the block scan, under ``rlSet``.
+      ## Here rather than in ``RequiredLiteral``, whose two copies then moved
+      ## ``classFolds`` and ``lineLit`` by 258 bytes each: the bench's matcher
+      ## read 0.15% more instructions over every item.
+    lineScan: ByteSetScan ## ``lineLit.set`` laid out, as ``requiredScan``.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1432,6 +1444,18 @@ proc requiredLit*(r: Regex): lent RequiredLiteral {.inline.} =
 proc lineLit*(r: Regex): lent RequiredLiteral {.inline.} =
   ## Borrowed, like [requiredByte].
   r.lineLit
+
+proc leadScan*(r: Regex): lent ByteSetScan {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.leadScan
+
+proc requiredScan*(r: Regex): lent ByteSetScan {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.requiredScan
+
+proc lineScan*(r: Regex): lent ByteSetScan {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.lineScan
 
 proc literalScan*(r: Regex): bool {.inline.} =
   r.literalScan
@@ -1692,6 +1716,7 @@ proc initRegex*(
     leadAnchors: set[AnchorKind] = {},
     leadRepeat: Node = nil,
     leadBehind: LeadBehindInfo = LeadBehindInfo(valid: false),
+    leadScan: ByteSetScan = ByteSetScan(),
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1701,6 +1726,21 @@ proc initRegex*(
   # Resolved before the constructor so `nodes: nodeTable` below is the table's
   # last use and moves; reading it inside the constructor would `=dup` it.
   let refs = resolveNameRefs(nodeTable, namedCaptures)
+  # Every set, however common its bytes, unlike the scan's lead set
+  # (``LeadScanWeight``): each search or line looks for these once, not once a
+  # candidate, and a heavy one read a byte at a time cost more, not less:
+  # ``\w+[a-z]`` under ``rfLineMode`` +1.46% instructions over the GREP corpus
+  # (notes/GREP_WORKLOAD.md §3.8).
+  let requiredScan =
+    if requiredLit.kind == rlSet:
+      initByteSetScan(requiredLit.set)
+    else:
+      ByteSetScan()
+  let lineScan =
+    if lineLit.kind == rlSet:
+      initByteSetScan(lineLit.set)
+    else:
+      ByteSetScan()
   Regex(
     pattern: pattern,
     ast: ast,
@@ -1725,6 +1765,9 @@ proc initRegex*(
     leadAnchors: leadAnchors,
     leadRepeat: leadRepeat,
     leadBehind: leadBehind,
+    leadScan: leadScan,
+    requiredScan: requiredScan,
+    lineScan: lineScan,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =

@@ -7,7 +7,7 @@ import std/[unicode, tables, macros, bitops]
 from std/strutils import find
 from std/typetraits import supportsCopyMem
 
-import types, unicode_utils, stackguard, leafgate, fold_unravel, word_edge
+import types, unicode_utils, stackguard, leafgate, fold_unravel, word_edge, byte_scan
 
 # Re-exported so callers can read the compiled-in budget (used by tests).
 export stackguard.MaxStackBytes
@@ -560,19 +560,24 @@ proc indexOfByte(s: string, start: int, b: uint8): int {.inline.} =
   else:
     find(s, char(b), start)
 
-proc indexOfAnyByte(s: string, start: int, bs: set[uint8]): int =
-  ## Index of the first byte of ``bs`` at or after ``start``, or -1.
-  for i in start ..< s.len:
-    if uint8(s[i]) in bs:
-      return i
-  -1
+proc indexOfAnyByte(
+    s: string, start: int, bs: set[uint8], sc: ByteSetScan
+): int {.inline.} =
+  ## Index of the first byte of ``bs`` at or after ``start``, or -1.  ``sc``
+  ## is ``bs`` laid out for the block scan ([initByteSetScan]).
+  if start >= s.len:
+    -1
+  else:
+    findAnyByte(cast[ptr UncheckedArray[char]](unsafeAddr s[0]), start, s.len, bs, sc)
 
-proc lastIndexOfAnyByte(s: string, start: int, bs: set[uint8]): int =
+proc lastIndexOfAnyByte(
+    s: string, start: int, bs: set[uint8], sc: ByteSetScan
+): int {.inline.} =
   ## Index of the last byte of ``bs`` at or after ``start``, or -1.
-  for i in countdown(s.high, start):
-    if uint8(s[i]) in bs:
-      return i
-  -1
+  if start >= s.len:
+    -1
+  else:
+    rfindAnyByte(cast[ptr UncheckedArray[char]](unsafeAddr s[0]), start, s.len, bs, sc)
 
 const ReqCandidates = 4
   ## Places [findString] compares before it hands the rest to ``memmem``.
@@ -597,12 +602,15 @@ proc findString(s: string, lit: RequiredLiteral, start: int): int =
     inc c
   find(s, lit.str, c)
 
-proc findRequired(s: string, lit: RequiredLiteral, start: int): int {.inline.} =
+proc findRequired(
+    s: string, lit: RequiredLiteral, scan: ByteSetScan, start: int
+): int {.inline.} =
   ## Index of the first occurrence of ``lit`` at or after ``start``, or -1.
+  ## ``scan`` is ``lit.set`` laid out ([Regex.requiredScan]).
   if lit.kind == rlString:
     findString(s, lit, start)
   else:
-    indexOfAnyByte(s, start, lit.set)
+    indexOfAnyByte(s, start, lit.set, scan)
 
 proc requiredAt(s: string, lit: RequiredLiteral, p: int): bool {.inline.} =
   ## Whether ``lit`` occurs at ``p``.
@@ -625,9 +633,9 @@ proc requiredLitRead(
     # stretch once: ``rfind`` compares the whole string at every position,
     # and tails read from the end would read a tail that lacks it again on
     # every step through occurrences close together.
-    q = lastIndexOfAnyByte(subject, start, regex.requiredLit.set)
+    q = lastIndexOfAnyByte(subject, start, regex.requiredLit.set, regex.requiredScan)
   else:
-    q = findRequired(subject, regex.requiredLit, start)
+    q = findRequired(subject, regex.requiredLit, regex.requiredScan, start)
   if q < 0:
     return true
   ctx.reqHit = q
@@ -5757,6 +5765,13 @@ template searchScan() {.dirty.} =
   # candidate start — including one inside a character the character walk
   # steps over.  Anything else walks characters.
   let byteScan = regex.literalScan
+  # Hoisted: the lead set is looked for a block at a time ([indexOfAnyByte]).
+  # Without the block test, the character walk's loop below reads it faster.
+  let leadBlocks =
+    when BlockScan:
+      regex.leadScan.runs > 0
+    else:
+      false
   var startPos = start
   if regex.semiEndAnchored and subject.len > 0 and fc.kind != fcAnchorStart:
     # ``onig_search`` resolves the anchors in one if/else chain, and ``\A``
@@ -5922,19 +5937,40 @@ template searchScan() {.dirty.} =
               found = true
               break
         else:
-          # One load per byte: the lead byte decides both whether the position
-          # is a candidate and how far the next one is.
-          while startPos < subject.len:
-            let b = subject[startPos].uint8
-            if b in fc.bytes:
-              found = true
-              break
-            let step =
-              if byteScan or b < 0x80'u8:
-                1
-              else:
-                encLen(b)
-            startPos += step
+          if not leadBlocks:
+            # One load per byte: the lead byte decides both whether the
+            # position is a candidate and how far the next one is.  For a set
+            # of common bytes, such as ``\w``'s, which the next few bytes
+            # hold, and for one of many runs.
+            while startPos < subject.len:
+              let b = subject[startPos].uint8
+              if b in fc.bytes:
+                found = true
+                break
+              let step =
+                if byteScan or b < 0x80'u8:
+                  1
+                else:
+                  encLen(b)
+              startPos += step
+          else:
+            # Over bytes, a block at a time ([indexOfAnyByte]).  A hit inside
+            # a character is no start position, as under the pair above.
+            while startPos < subject.len:
+              let hit = indexOfAnyByte(subject, startPos, fc.bytes, regex.leadScan)
+              if hit < 0:
+                startPos = subject.len
+                break
+              if byteScan or hit == startPos or charHeadAt(subject, hit):
+                startPos = hit
+                found = true
+                break
+              startPos = advanceChainTo(subject, startPos, hit, false)
+              if startPos >= subject.len:
+                break
+              if subject[startPos].uint8 in fc.bytes:
+                found = true
+                break
         if startPos > subject.len:
           startPos = subject.len
         if not found:
