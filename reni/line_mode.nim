@@ -9,7 +9,7 @@
 ## resolves where they are expanded, here to the copies below.
 
 import std/[bitops, importutils]
-import types
+import types, byte_scan
 import engine {.all.}
 
 privateAccess(MatchContext)
@@ -28,6 +28,12 @@ proc indexOfByte(s: Subject, start: int, b: uint8): int {.inline.} =
     -1
   else:
     cast[int](q) -% cast[int](s.data)
+
+proc indexOfAnyByte(
+    s: Subject, start: int, bs: set[uint8], sc: ByteSetScan
+): int {.inline.} =
+  ## [indexOfAnyByte] over a view.
+  findAnyByte(s.data, start, s.size, bs, sc)
 
 # The scan's byte helpers over a view.  ``engine`` keeps its own over a
 # ``string``, text for text as they were: made generic there, the change of
@@ -333,7 +339,7 @@ proc lineCandidate(s: string, regex: Regex, p: int): int =
   ## match: everything the matcher reads lies in its line, so a line without
   ## it has no match.  ``p`` itself when the pattern names nothing.
   if regex.lineLit.kind != rlNone:
-    return findRequired(s, regex.lineLit, p)
+    return findRequired(s, regex.lineLit, regex.lineScan, p)
   if regex.requiredByte.valid:
     return indexOfByte(s, p, regex.requiredByte.byte)
   let fc = regex.firstCharInfo
@@ -351,7 +357,7 @@ proc lineCandidate(s: string, regex: Regex, p: int): int =
       else:
         min(a, b)
     else:
-      indexOfAnyByte(s, p, fc.bytes)
+      indexOfAnyByte(s, p, fc.bytes, regex.leadScan)
   of fcNone, fcAnchorStart, fcLineStart:
     p
 

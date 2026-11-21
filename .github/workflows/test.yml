@@ -158,6 +158,40 @@ jobs:
         # suite under setjmp costs ~10x a goto build.
         run: nim c -r --exceptions:setjmp --stacktrace:off tests/test_stack_budget.nim
 
+  tests-no-block-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache nimble
+        id: cache-nimble
+        uses: actions/cache@v5
+        with:
+          path: ~/.nimble
+          key: ${{ runner.os }}-nimble-v2-${{ hashFiles('*.nimble') }}
+          restore-keys: |
+            ${{ runner.os }}-nimble-v2-
+
+      - name: Setup Nim (stable/release)
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: nimble install -y --depsOnly
+
+      - name: Setup paths
+        run: nimble setup -y
+
+      - name: Run the byte-set scan tests a byte at a time
+        # Every other job builds the SSE2 block scan (reni/byte_scan.nim), so
+        # a set laid out for it never reaches the byte loop there.  Targets
+        # without SSE2 (arm64, tcc) read every set that way: this build keeps
+        # the loop, layouts and all, under the same tests.
+        run: nim c -r -d:reniNoBlockScan tests/test_byte_scan.nim
+
   differential-fuzz:
     # Pinned, not ``ubuntu-latest``: this is the only job whose result depends
     # on a system library's behaviour rather than just its presence, and an

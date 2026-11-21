@@ -1,6 +1,6 @@
 import std/[algorithm, tables, sets, unicode]
 
-import types, unicode_utils, parser, leafgate, lookbehind_tune, stackguard
+import types, unicode_utils, parser, leafgate, lookbehind_tune, stackguard, byte_scan
 
 proc demoteUnnamedCaptures(node: Node, indexMap: Table[int, int]): Node =
   ## When named captures exist, convert unnamed nkCapture to nkGroup
@@ -2674,6 +2674,21 @@ const FoldedWeight = block:
     t[c] = setWeight(FoldedLeadBytes[c])
   t
 
+const LeadScanWeight = 120
+  ## The heaviest lead set ([setWeight]) the scan looks for a block at a
+  ## time.  A heavier one, such as ``[a-z]`` (192) or ``\w``'s, is met within
+  ## a few bytes of most positions, where a byte at a time is cheaper than a
+  ## call: the block scan cost ``(\w+\s+){3}\w+\(`` 5.1% more instructions
+  ## over the GREP corpus (notes/GREP_WORKLOAD.md §3.8).
+  ## ``[A-Z]`` weighs 66 and ``{b, c, f, g, q, z}`` 30.
+
+proc leadSetScan(fc: FirstCharInfo): ByteSetScan =
+  ## The scan's lead set laid out for the block scan, or ``runs`` 0 where it
+  ## reads a byte at a time: a heavy set, and a pair, which the scan looks
+  ## for with a ``memchr`` cursor per byte.
+  if fc.kind == fcByteSet and not fc.pairOk and setWeight(fc.bytes) <= LeadScanWeight:
+    result = initByteSetScan(fc.bytes)
+
 func folds(flags: RegexFlags): bool {.inline.} =
   (flags * {rfIgnoreCase, rfIgnoreCaseAscii}).card != 0
 
@@ -4040,6 +4055,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     leadAnchors = leadAnchors,
     leadRepeat = leadRepeat,
     leadBehind = leadBehindLiteral(ast, finalFlags),
+    leadScan = leadSetScan(firstChar),
   )
   # After the constructor, which numbers the tree the table indexes.  Derived
   # under ``result.flags`` rather than ``finalFlags`` because the runtime
