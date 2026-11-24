@@ -8,8 +8,8 @@
 ## shares its scan loops as dirty templates, and a helper name in them
 ## resolves where they are expanded, here to the copies below.
 
-import std/[bitops, importutils]
-import types, byte_scan
+import std/[bitops, importutils, unicode]
+import types, byte_scan, unicode_utils
 import engine {.all.}
 
 privateAccess(MatchContext)
@@ -209,11 +209,16 @@ proc semiEndScanStart(s: Subject, regex: Regex, start: int): int =
   if result < s.len:
     result = rightAdjustCharHead(s, result)
 
-proc lastNewlineIn(s: string, lo, hi: int): int =
-  ## Index of the last ``\n`` in ``[lo, hi)``, or -1.  A word at a time from
-  ## the top: line mode reads back to a line's start once per line, and a
-  ## minified file's lines run to megabytes.
+proc lastNewlineIn(s: string, lo, hi: int, high: var bool): int =
+  ## Index of the last ``\n`` in ``[lo, hi)``, or -1, and in ``high``
+  ## whether the bytes after it, up to ``hi``, hold one past ASCII.  A word at
+  ## a time from the top: line mode reads back to a line's start once per
+  ## line, and a minified file's lines run to megabytes.  The candidate
+  ## line's malformed-byte check ([searchLinesIn]) rides along: the loop runs
+  ## anyway.
+  const Highs = 0x8080808080808080'u64
   var i = hi
+  var seen = 0'u64 # Bytes read, ORed; bit 7 of each byte is what counts.
   when cpuEndian == littleEndian:
     # Exact per byte, unlike the borrow trick [nextRepeatPairPos] uses:
     # ``(x and 0x7F) + 0x7F`` cannot carry out of its byte, so bit 7 of a
@@ -221,34 +226,229 @@ proc lastNewlineIn(s: string, lo, hi: int): int =
     # highest zero byte is the last newline.
     const Newlines = 0x0A0A0A0A0A0A0A0A'u64
     const Lows = 0x7F7F7F7F7F7F7F7F'u64
-    const Highs = 0x8080808080808080'u64
     while i - 8 >= lo:
       var w: uint64
       copyMem(addr w, unsafeAddr s[i - 8], 8)
       let x = w xor Newlines
       let zero = not (((x and Lows) + Lows) or x) and Highs
       if zero != 0:
+        # Only the bytes above the newline are the line's.  ``top shl 1``
+        # wraps to 0 for the word's last byte, which leaves none.
+        let top = 1'u64 shl (63 - countLeadingZeroBits(zero))
+        high = ((seen or (w and not ((top shl 1) - 1))) and Highs) != 0
         return i - 8 + ((63 - countLeadingZeroBits(zero)) shr 3)
+      seen = seen or w
       i -= 8
   while i > lo:
     dec i
     if s[i] == '\n':
+      high = (seen and Highs) != 0
       return i
+    seen = seen or uint64(s[i].uint8)
+  high = (seen and Highs) != 0
   -1
 
-proc nextLineRunePos*(s: string, p: int, crlf: bool): int =
-  ## [nextRunePos] for a line-mode scan: the declared length, cut short at
-  ## the end of the line.  A lead byte whose sequence the line's end cuts is
-  ## the last character of its line, so the next start is that end: the
-  ## ``\n``, or under ``rfCrlf`` (``crlf``) the ``\r`` that ends the line.
-  ## The byte after a ``\n`` always starts a line.
+proc lastNewlineIn(s: string, lo, hi: int): int {.inline.} =
+  ## Index of the last ``\n`` in ``[lo, hi)``, or -1.
+  var high: bool
+  lastNewlineIn(s, lo, hi, high)
+
+proc wellFormedLen(s: string, i, last: int): int {.inline.} =
+  ## Line mode: the length of the well-formed UTF-8 sequence at ``i`` that
+  ## ends by ``last``, or 0 when none starts there.  Well-formed is RFC
+  ## 3629's: no overlong form, no surrogate, nothing past U+10FFFF.
+  let b = s[i].uint8
+  template cont(k: int, lo = 0x80'u8, hi = 0xBF'u8): bool =
+    i + k < last and s[i + k].uint8 >= lo and s[i + k].uint8 <= hi
+
+  case b
+  of 0x00'u8 .. 0x7F'u8:
+    1
+  of 0xC2'u8 .. 0xDF'u8:
+    if cont(1): 2 else: 0
+  of 0xE0'u8 .. 0xEF'u8:
+    let lo = if b == 0xE0'u8: 0xA0'u8 else: 0x80'u8
+    let hi = if b == 0xED'u8: 0x9F'u8 else: 0xBF'u8
+    if cont(1, lo, hi) and cont(2): 3 else: 0
+  of 0xF0'u8 .. 0xF4'u8:
+    let lo = if b == 0xF0'u8: 0x90'u8 else: 0x80'u8
+    let hi = if b == 0xF4'u8: 0x8F'u8 else: 0xBF'u8
+    if cont(1, lo, hi) and cont(2) and cont(3): 4 else: 0
+  else:
+    0
+
+const
+  HighBytes = {0x80'u8 .. 0xFF'u8}
+  HighScan = initByteSetScan(HighBytes)
+    ## The bytes past ASCII, laid out for [findAnyByte].
+
+proc hasHighByte(s: string, first, last: int): bool {.inline.} =
+  ## Line mode: whether ``[first, last)`` holds a byte past ASCII, for the
+  ## parts of a line that the scans to its ends ([lineEndAt], [lastNewlineIn])
+  ## do not read.  A word at a time, the last word overlapping the one before:
+  ## lines are short, and [findAnyByte] cost them more than the bytes do.
+  const Highs = 0x8080808080808080'u64
+  var i = first
+  if last - first >= 8:
+    while i + 8 <= last:
+      var w: uint64
+      copyMem(addr w, unsafeAddr s[i], 8)
+      if (w and Highs) != 0'u64:
+        return true
+      i += 8
+    if i < last:
+      var w: uint64
+      copyMem(addr w, unsafeAddr s[last - 8], 8)
+      return (w and Highs) != 0'u64
+    return false
+  while i < last:
+    if s[i].uint8 >= 0x80'u8:
+      return true
+    inc i
+  false
+
+# [wellFormedLen]'s sequences as a DFA, one row per byte: state ``q``'s next
+# state is the six bits at ``6 * q`` of the byte's row, kept as its own
+# shift, so a step is a load and a shift (Per Vognsen's shift-based DFA).  0
+# accepts; the rest wait for continuation bytes; 8 is the sticky error.
+const Utf8Dfa = block:
+  const
+    Acc = 0
+    Need1 = 1 # Any one continuation byte.
+    Need2 = 2
+    Need3 = 3
+    AfterE0 = 4 # A0..BF, then one more: no overlong form.
+    AfterED = 5 # 80..9F, then one more: no surrogate.
+    AfterF0 = 6 # 90..BF, then two more: no overlong form.
+    AfterF4 = 7 # 80..8F, then two more: nothing past U+10FFFF.
+    Err = 8
+  var t: array[256, uint64]
+  for b in 0 .. 255:
+    let cont = b in 0x80 .. 0xBF
+    for q in Acc .. Err:
+      let next =
+        case q
+        of Acc:
+          case b
+          of 0x00 .. 0x7F: Acc
+          of 0xC2 .. 0xDF: Need1
+          of 0xE0: AfterE0
+          of 0xED: AfterED
+          of 0xE1 .. 0xEC, 0xEE .. 0xEF: Need2
+          of 0xF0: AfterF0
+          of 0xF1 .. 0xF3: Need3
+          of 0xF4: AfterF4
+          else: Err
+        of Need1:
+          if cont: Acc else: Err
+        of Need2:
+          if cont: Need1 else: Err
+        of Need3:
+          if cont: Need2 else: Err
+        of AfterE0:
+          if b in 0xA0 .. 0xBF: Need1 else: Err
+        of AfterED:
+          if b in 0x80 .. 0x9F: Need1 else: Err
+        of AfterF0:
+          if b in 0x90 .. 0xBF: Need2 else: Err
+        of AfterF4:
+          if b in 0x80 .. 0x8F: Need2 else: Err
+        else:
+          Err
+      t[b] = t[b] or (uint64(6 * next) shl (6 * q))
+  t
+
+proc wellFormed(s: string, first, last: int): bool =
+  ## Line mode: whether ``[first, last)`` is well-formed UTF-8 throughout,
+  ## what ``nextMalformed(s, first, last) >= last`` says, for the check of a
+  ## candidate line that holds a byte past ASCII.  Such lines run long
+  ## (minified files), and [nextMalformed] takes a branch per character on
+  ## them: here a word of ASCII is skipped and any other word steps [Utf8Dfa]
+  ## through its bytes, which branch on nothing.
+  const Highs = 0x8080808080808080'u64
+  const ErrShift = 6 * 8
+  var st = 0'u64 # The state's shift, in the low six bits.
+  var i = first
+  when cpuEndian == littleEndian:
+    while i + 8 <= last:
+      var w: uint64
+      copyMem(addr w, unsafeAddr s[i], 8)
+      i += 8
+      if (st and 63) == 0 and (w and Highs) == 0:
+        continue
+      for k in 0 .. 7:
+        st = Utf8Dfa[(w shr (8 * k)) and 0xFF] shr (st and 63)
+      if (st and 63) == ErrShift:
+        return false
+  while i < last:
+    st = Utf8Dfa[s[i].uint8] shr (st and 63)
+    inc i
+  (st and 63) == 0
+
+proc nextMalformed(s: string, first, last: int): int =
+  ## Line mode: the first byte in ``[first, last)`` that is no part of a
+  ## well-formed UTF-8 sequence ([wellFormedLen]), or ``last`` when there is
+  ## none; a sequence ``last`` cuts short is malformed.  A malformed
+  ## sequence reports its first byte only; the walk resumes after it, so
+  ## each of its bytes is malformed in turn unless a well-formed sequence
+  ## starts there.  ``first`` must not be inside a well-formed sequence.
+  ## ASCII is skipped by [findAnyByte].  This finds where a line's stretches
+  ## end; whether it holds a malformed byte at all is [wellFormed]'s answer.
+  var i = first
+  while i < last:
+    if s[i].uint8 < 0x80'u8:
+      let h = findAnyByte(
+        cast[ptr UncheckedArray[char]](unsafeAddr s[0]), i, last, HighBytes, HighScan
+      )
+      if h < 0:
+        return last
+      i = h
+    let n = wellFormedLen(s, i, last)
+    if n == 0:
+      return i
+    i += n
+  last
+
+proc prevMalformed(s: string, first, p, last: int): int =
+  ## Line mode: the last byte before ``p`` that [nextMalformed] reports, or
+  ## ``first - 1`` when there is none.  No walk from the start is needed: a
+  ## well-formed sequence begins with a byte no other sequence holds, so a
+  ## byte past ASCII belongs to one exactly when the nearest byte at or
+  ## before it that is no continuation byte, at most three back, begins a
+  ## sequence that reaches it.  ``p`` may be inside a sequence.  ASCII is
+  ## skipped a word at a time.
+  const Highs = 0x8080808080808080'u64
+  var i = p - 1
+  while i >= first:
+    if s[i].uint8 < 0x80'u8:
+      dec i
+      while i - 7 >= first:
+        var w: uint64
+        copyMem(addr w, unsafeAddr s[i - 7], 8)
+        if (w and Highs) != 0'u64:
+          break
+        i -= 8
+      continue
+    var k = i
+    let limit = max(first, i - 3)
+    while k > limit and (s[k].uint8 and 0xC0'u8) == 0x80'u8:
+      dec k
+    if k + wellFormedLen(s, k, last) <= i:
+      return i
+    i = k - 1
+  first - 1
+
+proc nextLineRunePos*(s: string, p: int): int =
+  ## [nextRunePos] for a line-mode scan: past the well-formed character at
+  ## ``p``, or past the one byte at ``p`` when none starts there.  A
+  ## malformed byte is matched by nothing and every place beside it is a
+  ## start ([scanStretches]), so the step goes one byte past it rather than
+  ## its declared length, which would skip the starts inside.  A well-formed
+  ## character holds no ``\n`` or ``\r``, so the step never passes a line's
+  ## end: that ``\n``, or under ``rfCrlf`` the ``\r``, is reached as a start.
   if p >= s.len:
     return p + 1
-  let stop = min(p + encLen(s[p].uint8), s.len)
-  for i in p + 1 ..< stop:
-    if s[i] == '\n' or crlf and s[i] == '\r' and (i + 1 == s.len or s[i + 1] == '\n'):
-      return i
-  stop
+  p + max(wellFormedLen(s, p, s.len), 1)
 
 proc lineMemoFor(ctx: MatchContext, s: string, sameSubject: bool): bool {.inline.} =
   ## Line mode: whether the line memo describes ``s``, the buffer a scan's
@@ -269,10 +469,40 @@ proc lineStartAt(ctx: MatchContext, s: string, p: int, memo: bool): int =
     return ctx.lineMemoStart
   lastNewlineIn(s, 0, p) + 1
 
+proc lineStartAt(s: string, p: int, high: var bool): int =
+  ## Line mode: [lineStartAt] without a memo, and in ``high`` whether
+  ## ``[result, p)`` holds a byte past ASCII.
+  high = false
+  if p == 0 or s[p - 1] == '\n':
+    return p
+  lastNewlineIn(s, 0, p, high) + 1
+
 proc lineEndAt(s: string, p: int): int {.inline.} =
   ## Line mode: the ``\n`` that ends the line holding ``p``, or ``s.len``.
   let q = indexOfByte(s, p, uint8('\n'))
   if q < 0: s.len else: q
+
+proc lineEndAt(s: string, p: int, high: var bool): int {.inline.} =
+  ## Line mode: [lineEndAt], and in ``high`` whether ``[p, result)`` holds a
+  ## byte past ASCII.  With the block scan, one pass finds either; without
+  ## it, ``memchr`` then [hasHighByte].
+  when BlockScan:
+    if p >= s.len:
+      high = false
+      return s.len
+    let q = findNewlineOrHigh(cast[ptr UncheckedArray[char]](unsafeAddr s[0]), p, s.len)
+    if q < 0:
+      high = false
+      s.len
+    elif s[q] == '\n':
+      high = false
+      q
+    else:
+      high = true
+      lineEndAt(s, q)
+  else:
+    result = lineEndAt(s, p)
+    high = hasHighByte(s, p, result)
 
 proc contentEnd(s: string, nl: int, crlf: static bool): int {.inline.} =
   ## Line mode: where the line ended by ``nl`` (its ``\n``, or ``s.len``)
@@ -294,9 +524,12 @@ proc bindLine(ctx: MatchContext, s: string, ls, le, regionEnd: int): Subject =
   ## subject the matcher sees, so a look-around, an anchor or a character
   ## never reaches past the line.  ``regionEnd`` is the region memo's end
   ## to keep, -1 for none: a scan keeps it when the view is the one it was
-  ## walked on.
-  result =
-    Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[ls]), size: le - ls)
+  ## walked on.  The view's data is reached by offset, since an empty
+  ## stretch ([bindStretch]) may sit at the end of ``s``.
+  result = Subject(
+    data: cast[ptr UncheckedArray[char]](cast[uint](unsafeAddr s[0]) + uint(ls)),
+    size: le - ls,
+  )
   ctx.subject = result
   ctx.lookLimit = NoLookLimit
   ctx.absentEnd = result.size
@@ -312,12 +545,19 @@ proc shiftMatch(m: var Match, base: int) =
       m.boundaries[i].a += base
       m.boundaries[i].b += base
 
-proc noteLine(ctx: MatchContext, s: string, ls, le: int) {.inline.} =
-  ## Line mode: remember the line a match was found in, for [lineStartAt].
+proc noteLine(
+    ctx: MatchContext, s: string, ls, le: int, clean: bool, stretch, stretchEnd: int
+) {.inline.} =
+  ## Line mode: remember the line a match was found in, for [lineStartAt],
+  ## whether it holds no malformed byte (``clean``), and else the stretch
+  ## the match is in.
   ctx.lineMemoData = cast[pointer](unsafeAddr s[0])
   ctx.lineMemoLen = s.len
   ctx.lineMemoStart = ls
   ctx.lineMemoEnd = le
+  ctx.lineMemoClean = clean
+  ctx.lineMemoStretch = stretch
+  ctx.lineMemoStretchEnd = stretchEnd
 
 proc lineOptions(options: MatchOptions, ls: int, holdsStart: bool): MatchOptions =
   ## Line mode: the options that hold in the line beginning at ``ls``, which
@@ -383,6 +623,270 @@ proc scanLineBackward(
   var startPos = start
   searchBackwardScan()
 
+proc clearCuts(ctx: MatchContext) {.inline.} =
+  ctx.cut = false
+  ctx.cutStart = false
+  ctx.cutEnd = false
+  ctx.cutPrevValid = false
+  ctx.cutPrevWord = false
+
+proc readCutPrev(ctx: MatchContext, s: string, ls, a: int) =
+  ## Line mode: how rg reads the character before the stretch at ``a``,
+  ## which a malformed byte begins (``MatchContext.cutPrevValid``): back
+  ## from ``a - 1`` over up to three continuation bytes, not past the line's
+  ## start ``ls``, and the character that starts there and ends by ``a``, if
+  ## one does -- regex-automata's ``decode_last``.  Only a malformed
+  ## continuation byte before ``a`` leads anywhere; before any other
+  ## malformed byte rg reads nothing.  rg reads past the line there when no
+  ## literal prefilters the pattern; here, as in its prefiltered search, the
+  ## walk stops at the line's start.
+  ctx.cutPrevValid = false
+  ctx.cutPrevWord = false
+  if (s[a - 1].uint8 and 0xC0'u8) != 0x80'u8:
+    return
+  var k = a - 1
+  let limit = max(ls, a - 4)
+  while k > limit and (s[k].uint8 and 0xC0'u8) == 0x80'u8:
+    dec k
+  if nextMalformed(s, k, a) > k:
+    var code: int32
+    var next: int
+    discard decodeAt(s, k, code, next)
+    ctx.cutPrevValid = true
+    ctx.cutPrevWord = isWordChar(Rune(code), false)
+
+proc bindStretch(
+    ctx: MatchContext, s: string, ls, ce, a, b, regionEnd: int, opts: MatchOptions
+): Subject =
+  ## Line mode: point the matcher at the stretch ``[a, b)`` of the line
+  ## ``[ls, ce)``, between malformed bytes or the line's ends, and set the
+  ## cut flags and what precedes a cut start ([readCutPrev]).  A cut is no
+  ## line edge (``engine.anchorHolds``, ``engine.atCut``).  ``regionEnd`` is
+  ## as [bindLine]'s.
+  result = bindLine(ctx, s, a, b, regionEnd)
+  ctx.cutStart = a > ls
+  ctx.cutEnd = b < ce
+  ctx.cut = ctx.cutStart or ctx.cutEnd
+  if ctx.cutStart:
+    readCutPrev(ctx, s, ls, a)
+  else:
+    ctx.cutPrevValid = false
+    ctx.cutPrevWord = false
+  ctx.matchOptions = opts
+
+proc lineStartOnly(regex: Regex): bool =
+  ## Line mode: whether every match begins where ``^`` or ``\A`` holds, which
+  ## in a line is its start alone: a line holds no ``\n``, and a cut is no
+  ## edge.  ``^a`` has its byte for a hint and its anchor among the leading
+  ## assertions; ``(?:^a|^b)`` may have the hint alone.
+  regex.firstCharInfo.kind in {fcAnchorStart, fcLineStart} or
+    regex.leadAnchors * {akLineBegin, akStringBegin} != {}
+
+proc lineEndOnly(regex: Regex): bool =
+  ## Line mode: whether every match begins where ``$``, ``\z`` or ``\Z``
+  ## holds, which in a line is its end alone, for the reason [lineStartOnly]
+  ## gives.
+  regex.leadAnchors * {akLineEnd, akStringEnd, akStringEndOrNewline} != {}
+
+const NoHit = high(int)
+
+proc stretchCandidate(s: string, regex: Regex, p, last: int, hitA, hitB: var int): int =
+  ## Line mode: [lineCandidate] inside one line, whose content ends at
+  ## ``last``, for the walk over its stretches: no match lies in a stretch of
+  ## ``[p, last)`` that ends before the result, nor in any when it is -1.
+  ## Nothing past ``last`` is read, or a line would cost the way to the next
+  ## occurrence again.  Of a string only its least likely byte is looked for.
+  ## ``hitA`` and ``hitB`` hold the next hit of each byte of a pair (-1 at
+  ## first, ``NoHit`` for none) and ``p`` never goes back, so a byte the line
+  ## lacks is looked for once.
+  let view = Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[0]), size: last)
+  case regex.lineLit.kind
+  of rlString:
+    return indexOfByte(view, p, uint8(regex.lineLit.str[regex.lineLit.at]))
+  of rlSet:
+    return
+      if p >= last:
+        -1
+      else:
+        indexOfAnyByte(view, p, regex.lineLit.set, regex.lineScan)
+  of rlNone:
+    discard
+  if regex.requiredByte.valid:
+    return indexOfByte(view, p, regex.requiredByte.byte)
+  let fc = regex.firstCharInfo
+  case fc.kind
+  of fcByte:
+    indexOfByte(view, p, fc.byte)
+  of fcByteSet:
+    if fc.pairOk:
+      if hitA < p:
+        let q = indexOfByte(view, p, fc.pair[0])
+        hitA = if q < 0: NoHit else: q
+      if hitB < p:
+        let q = indexOfByte(view, p, fc.pair[1])
+        hitB = if q < 0: NoHit else: q
+      let hit = min(hitA, hitB)
+      if hit == NoHit: -1 else: hit
+    elif p >= last:
+      -1
+    else:
+      indexOfAnyByte(view, p, fc.bytes, regex.leadScan)
+  of fcNone, fcAnchorStart, fcLineStart:
+    p
+
+proc scanStretches(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    ls, walkFrom, walkEnd, ce, fromPos, start, candidate: int,
+    regionData: pointer,
+    regionEnd: int,
+    opts: MatchOptions,
+    findLongest: bool,
+    found: var Span,
+): bool {.noinline.} =
+  ## Line mode: the forward scan of a line ``[ls, ce)`` that holds a
+  ## malformed byte.  Since no match spans one, each stretch between them,
+  ## empty ones included, is searched as a view of its own ([bindStretch]),
+  ## from the one that holds ``fromPos`` on.  Returns whether a match was
+  ## found; it comes back in the subject's offsets, and ``found`` is its
+  ## stretch.  ``\G`` holds only in the stretch that holds ``fromPos``.
+  ##
+  ## The walk begins at ``walkFrom``: ``ls``, or a memoized stretch start at
+  ## or before ``fromPos``; ``walkEnd`` is then that stretch's end, and
+  ## otherwise -1.  The region memo, ``regionEnd`` walked on the view at
+  ## ``regionData``, is kept in that stretch alone: only its view is known to
+  ## end where it did.  Out of line, as the rare path.
+  ##
+  ## Under ``findLongest`` every stretch of the line is searched, and the
+  ## longest match of them all is the answer, the first of those as long
+  ## (``ctx.flBestLen`` carries the best from stretch to stretch).
+  ##
+  ## Under [lineStartOnly] only the line's first stretch can match, under a
+  ## leading ``\G`` only the one that holds ``fromPos``; the walk goes no
+  ## further.  A stretch that ends before the next place of what every match
+  ## holds -- ``candidate`` at first, [lineCandidate] from ``fromPos``, then
+  ## [stretchCandidate] -- has no match, for the reason a line without it has
+  ## none: a stretch is all its matcher sees.  The walk goes straight to the
+  ## stretch of that place, and under [lineEndOnly] to the line's last.
+  defer:
+    clearCuts(ctx)
+  let startOnly = lineStartOnly(regex)
+  let searchBeginOnly = akSearchBegin in regex.leadAnchors
+  var a = walkFrom
+  var known = walkEnd
+  var best = -1
+  var cand =
+    if lineEndOnly(regex):
+      ce
+    else:
+      min(candidate, ce)
+  var hitA, hitB = -1
+  # Inside the kept stretch there is nothing to look back for: a scan would
+  # read back to its start once per match.
+  if cand > a and (known < 0 or cand > known):
+    let to = prevMalformed(subject, a, cand, ce) + 1
+    if to > a:
+      a = to
+      known = -1
+  while not (startOnly and (a > ls or fromPos > ls)):
+    let b =
+      if known >= 0:
+        known
+      else:
+        nextMalformed(subject, a, ce)
+    if b >= fromPos:
+      var o = opts
+      if a > fromPos:
+        o.incl moNotBeginPosition
+      let data = cast[pointer](cast[uint](unsafeAddr subject[0]) + uint(a))
+      let keep = if known >= 0 and regionData == data: regionEnd else: -1
+      let bestLen = ctx.flBestLen
+      let view = bindStretch(ctx, subject, ls, ce, a, b, keep, o)
+      ctx.budgetOrigin = start - a
+      scanLine(
+        ctx,
+        view,
+        regex,
+        m,
+        max(fromPos, a) - a,
+        findLongest,
+        regex.requiredByte.valid,
+        regex.requiredByte.byte,
+      )
+      if m.found:
+        shiftMatch(m, a)
+        found = Span(a: a, b: b)
+        return true
+      if findLongest and ctx.flBestLen > bestLen:
+        best = a
+        found = Span(a: a, b: b)
+      if searchBeginOnly:
+        break
+    if b >= ce:
+      break
+    a = b + 1
+    known = -1
+    if cand < a:
+      cand = stretchCandidate(subject, regex, a, ce, hitA, hitB)
+      if cand < 0:
+        break
+    if cand > a:
+      a = prevMalformed(subject, a, cand, ce) + 1
+  if best < 0:
+    return false
+  writeFoundCopy(
+    m, ctx.flBestMatch.boundaries, ctx.flBestMatch.boundaries.len,
+    ctx.flBestMatch.startChar,
+  )
+  shiftMatch(m, best)
+  true
+
+proc scanStretchesBackward(
+    ctx: MatchContext,
+    subject: string,
+    regex: Regex,
+    m: var Match,
+    ls, ce, fromPos, origin: int,
+    opts: MatchOptions,
+): bool {.noinline.} =
+  ## Line mode: [scanStretches] for the backward scan.  The stretches are
+  ## searched back from the one that holds ``fromPos``, each later one back
+  ## from its end.  The backward scan's ``\G`` is the line's end, so it
+  ## holds in the line's last stretch alone; under [lineEndOnly] only that
+  ## one is searched, and under [lineStartOnly] only the line's first.
+  ##
+  ## Each stretch's start is found back from its end ([prevMalformed]), so
+  ## the walk reads no further back than the match and keeps no list.
+  defer:
+    clearCuts(ctx)
+  # The stretch that holds ``fromPos`` ends at the first cut at or past it,
+  # or at the line's end.
+  var a =
+    if lineStartOnly(regex):
+      ls
+    else:
+      prevMalformed(subject, ls, fromPos, ce) + 1
+  var b = nextMalformed(subject, a, ce)
+  let lastOnly = akSearchBegin in regex.leadAnchors or lineEndOnly(regex)
+  if lastOnly and b < ce:
+    return false
+  while true:
+    var o = opts
+    if b < ce:
+      o.incl moNotBeginPosition
+    let view = bindStretch(ctx, subject, ls, ce, a, b, -1, o)
+    ctx.budgetOrigin = origin - a
+    scanLineBackward(ctx, view, regex, m, min(fromPos, b) - a)
+    if m.found:
+      shiftMatch(m, a)
+      return true
+    if a == ls or lastOnly:
+      return false
+    b = a - 1
+    a = prevMalformed(subject, ls, b, ce) + 1
+
 proc searchLinesIn(
     ctx: MatchContext,
     subject: string,
@@ -444,19 +948,28 @@ proc searchLinesIn(
     let c = lineCandidate(subject, regex, fromPos)
     if c < 0:
       break
+    # Whether the line holds a byte past ASCII, which only such a line need
+    # be checked for malformed bytes, is read on the way by the scans that
+    # find its start and end: ``[headFrom, c)`` by the one back from ``c``,
+    # and ``[c, le)`` by the one forward.  Read apart, every candidate line
+    # ran a loop of its own length.
+    var headHigh, tailHigh = false
+    var headFrom = c
     if c > fromPos:
-      let nl = lastNewlineIn(subject, fromPos, c)
+      let nl = lastNewlineIn(subject, fromPos, c, headHigh)
       if nl >= 0:
         ls = nl + 1
         fromPos = ls
         first = false
-    # The memo's line ends where it did: a scan through one long line would
-    # read to its end once per match.
+      headFrom = fromPos
+    # The memo's line ends where it did, and its check stands, so a scan
+    # through one long line need not read to its end again.
+    let memoLine = memo and ctx.lineMemoStart <= c and c <= ctx.lineMemoEnd
     let le =
-      if memo and ctx.lineMemoStart <= c and c <= ctx.lineMemoEnd:
+      if memoLine:
         ctx.lineMemoEnd
       else:
-        lineEndAt(subject, c)
+        lineEndAt(subject, c, tailHigh)
     let ce = contentEnd(subject, le, crlf)
     when crlf:
       if fromPos > ce:
@@ -467,6 +980,53 @@ proc searchLinesIn(
         fromPos = ls
         first = false
         continue
+    let clean =
+      if memoLine:
+        ctx.lineMemoClean
+      else:
+        # Neither scan read ``[ls, headFrom)``, the part before ``start`` of
+        # the line it lies in.
+        let high =
+          headHigh or tailHigh or (headFrom > ls and hasHighByte(subject, ls, headFrom))
+        not high or wellFormed(subject, ls, ce)
+    if not clean:
+      var walkFrom = ls
+      var walkEnd = -1
+      if memoLine and ctx.lineMemoStretch <= fromPos:
+        walkFrom = ctx.lineMemoStretch
+        # A caller may put a ``\r`` before the line's ``\n`` or take it away
+        # between two calls, which moves ``ce``: the end stands only where it
+        # is still the line's or at a byte past ASCII, as a malformed one is.
+        let e = ctx.lineMemoStretchEnd
+        if e == ce or e < ce and subject[e].uint8 >= 0x80'u8:
+          walkEnd = e
+      var stretch: Span
+      if scanStretches(
+        ctx,
+        subject,
+        regex,
+        m,
+        ls,
+        walkFrom,
+        walkEnd,
+        ce,
+        fromPos,
+        start,
+        c,
+        regionData,
+        if sameSubject: regionEnd else: -1,
+        lineOptions(options, ls, first),
+        findLongest,
+        stretch,
+      ):
+        noteLine(ctx, subject, ls, le, false, stretch.a, stretch.b)
+        return
+      if le >= subject.len:
+        break
+      ls = le + 1
+      fromPos = ls
+      first = false
+      continue
     let view = bindLine(
       ctx,
       subject,
@@ -496,7 +1056,7 @@ proc searchLinesIn(
       )
     if m.found:
       shiftMatch(m, ls)
-      noteLine(ctx, subject, ls, le)
+      noteLine(ctx, subject, ls, le, true, ls, ce)
       return
     if le >= subject.len:
       break
@@ -577,22 +1137,36 @@ proc searchBackwardLinesIn(
   var first = true
   while true:
     let ce = contentEnd(subject, lineEndAt(subject, fromPos), crlf)
-    let view = bindLine(ctx, subject, ls, ce, -1)
-    ctx.matchOptions = lineOptions(options, ls, first)
-    ctx.budgetOrigin = origin - ls
-    scanLineBackward(
-      ctx,
-      view,
-      regex,
-      m,
-      when crlf:
-        min(fromPos, ce) - ls
-      else:
-        fromPos - ls,
-    )
-    if m.found:
-      shiftMatch(m, ls)
-      return
+    if hasHighByte(subject, ls, ce) and not wellFormed(subject, ls, ce):
+      if scanStretchesBackward(
+        ctx,
+        subject,
+        regex,
+        m,
+        ls,
+        ce,
+        min(fromPos, ce),
+        origin,
+        lineOptions(options, ls, first),
+      ):
+        return
+    else:
+      let view = bindLine(ctx, subject, ls, ce, -1)
+      ctx.matchOptions = lineOptions(options, ls, first)
+      ctx.budgetOrigin = origin - ls
+      scanLineBackward(
+        ctx,
+        view,
+        regex,
+        m,
+        when crlf:
+          min(fromPos, ce) - ls
+        else:
+          fromPos - ls,
+      )
+      if m.found:
+        shiftMatch(m, ls)
+        return
     if ls == 0:
       break
     first = false
@@ -636,16 +1210,20 @@ proc matchAtLinesInto*(
   ## ``rfCrlf``, one on the ``\n`` of a ``\r\n`` or after a final ``\r``.
   defer:
     releaseBorrowed(ctx)
+    clearCuts(ctx)
   writeNotFound(m)
   ctx.steps = 0
   if callLimitRefuses(regex, maxRecursionDepth):
     noteScratchUsage(ctx)
     return
-  let ls = lineStartAt(ctx, subject, pos, false)
+  # The scans to the line's ends also read whether it holds a byte past
+  # ASCII, as [searchLinesIn]'s do; only such a line is checked further.
+  var headHigh, tailHigh = false
+  let ls = lineStartAt(subject, pos, headHigh)
   if ls >= subject.len:
     noteScratchUsage(ctx)
     return
-  let le = lineEndAt(subject, pos)
+  let le = lineEndAt(subject, pos, tailHigh)
   let ce =
     if rfCrlf in regex.flags:
       contentEnd(subject, le, true)
@@ -655,9 +1233,18 @@ proc matchAtLinesInto*(
     noteScratchUsage(ctx)
     return
   resetForRegex(ctx, subject, unsafeAddr regex, stepLimit, maxRecursionDepth)
-  discard bindLine(ctx, subject, ls, ce, -1)
-  ctx.matchOptions = lineOptions(options, ls, true)
-  let rel = pos - ls
+  # The stretch holding ``pos`` when the line holds a malformed byte
+  # ([scanStretches]): a ``pos`` on a malformed byte ends the stretch before
+  # it, one just past it begins the next.
+  var a = ls
+  if (headHigh or tailHigh) and not wellFormed(subject, ls, ce):
+    a = prevMalformed(subject, ls, pos, ce) + 1
+    let b = nextMalformed(subject, a, ce)
+    discard bindStretch(ctx, subject, ls, ce, a, b, -1, lineOptions(options, ls, true))
+  else:
+    discard bindLine(ctx, subject, ls, ce, -1)
+    ctx.matchOptions = lineOptions(options, ls, true)
+  let rel = pos - a
   resetForPosition(ctx, rel, rel)
   if matchNode(ctx, regex.ast):
     ctx.capturesDirty = true
@@ -665,4 +1252,4 @@ proc matchAtLinesInto*(
     if ctx.keepStart != rel:
       ctx.captures[0].a = min(ctx.keepStart, ctx.pos)
     writeFoundCopy(m, ctx.captures, ctx.groupSlots, rel)
-    shiftMatch(m, ls)
+    shiftMatch(m, a)

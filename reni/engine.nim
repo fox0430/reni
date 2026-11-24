@@ -355,6 +355,34 @@ type
     lineMemoLen: int
     lineMemoStart: int
     lineMemoEnd: int
+    lineMemoClean: bool
+      ## Line mode: the memo's line holds no malformed byte, so a scan that
+      ## stays in it need not check its bytes again.
+    lineMemoStretch: int
+    lineMemoStretchEnd: int
+      ## Line mode: in a memo line that holds a malformed byte, the stretch
+      ## ``[lineMemoStretch, lineMemoStretchEnd)`` the match was found in.  A
+      ## scan's next search walks the stretches on from there, not from the
+      ## line's start, and does not look for the stretch's end again; either
+      ## would cost a long line a pass per match.
+    cut: bool
+      ## Line mode: the view is cut by a malformed byte at an edge
+      ## (``cutStart``, ``cutEnd``); ``\B`` declines there ([atCut]).
+    cutStart: bool
+      ## Line mode: the view begins just past a malformed byte, not at its
+      ## line's start, so ``^`` and ``\A`` do not hold at offset 0, nor ``\B``
+      ## unless ``line_mode.readCutPrev`` reads a character before the view,
+      ## or under ``(?W)`` or ``(?P)``.
+    cutEnd: bool
+      ## Line mode: the view ends at a malformed byte, not at its line's end,
+      ## so ``$``, ``\z`` and ``\Z`` do not hold there, nor ``\B``.
+    cutPrevValid: bool
+    cutPrevWord: bool
+      ## Line mode, under ``cutStart``: whether a character decodes just
+      ## before the view and whether it is a word one, as rg reads them for
+      ## ``\b``, ``\B``, ``\<`` and ``\>`` at offset 0.  See
+      ## ``line_mode.readCutPrev``.  Neither is read under ``(?W)`` or
+      ## ``(?P)``, where rg looks at the byte before, a malformed one.
 
   CapUndo = object
     ## One group's pre-image.  A nested machine leaves no ``chUndoCapture``
@@ -1703,19 +1731,23 @@ proc charTypeAdvance(ctx: MatchContext, ct: CharTypeKind): int =
 
 proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
   ## Whether zero-width ``kind`` holds at ``ctx.pos``. Pure; ``akKeep`` effect
-  ## belongs to the committing caller.
+  ## belongs to the committing caller.  A malformed byte's cut is no line
+  ## edge (``MatchContext.cutStart``, ``cutEnd``).
   case kind
   of akLineBegin:
-    ctx.pos == 0 or
+    ctx.pos == 0 and not ctx.cutStart or
       (ctx.pos > 0 and ctx.pos < ctx.subject.len and ctx.subject[ctx.pos - 1] == '\n')
   of akLineEnd:
-    ctx.pos >= ctx.subject.len or ctx.subject[ctx.pos] == '\n'
+    if ctx.pos >= ctx.subject.len:
+      not ctx.cutEnd
+    else:
+      ctx.subject[ctx.pos] == '\n'
   of akStringBegin:
-    moNotBeginString notin ctx.matchOptions and ctx.pos == 0
+    moNotBeginString notin ctx.matchOptions and ctx.pos == 0 and not ctx.cutStart
   of akStringEnd:
-    ctx.pos >= ctx.subject.len
+    ctx.pos >= ctx.subject.len and not ctx.cutEnd
   of akStringEndOrNewline:
-    ctx.pos >= ctx.subject.len or
+    (if ctx.pos >= ctx.subject.len: not ctx.cutEnd else: false) or
       (ctx.pos == ctx.subject.len - 1 and ctx.subject[ctx.pos] == '\n')
   of akSearchBegin:
     moNotBeginPosition notin ctx.matchOptions and ctx.pos == ctx.searchStart
@@ -1730,6 +1762,7 @@ proc anchorHolds(ctx: MatchContext, kind: AnchorKind): bool =
       ctx.subjectEnd,
       kind == akWordBegin,
       rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags,
+      ctx.cutPrevWord,
     )
   of akGraphemeBoundary:
     if ctx.graphemeMode == gmWord:
@@ -2371,8 +2404,9 @@ proc matchWordBoundary(ctx: MatchContext): bool =
   # subject is the exception, as in Oniguruma (``DATA_ENSURE(1)`` in
   # ``WORD_BOUNDARY``): an empty range there is an empty string, which has no
   # boundary.  Fixed-length look-behind bodies take no window (see
-  # tuneLookBehinds) and still hold at 0.
-  if ctx.pos == 0 and ctx.subjectEnd == 0:
+  # tuneLookBehinds) and still hold at 0.  A start that a malformed byte cuts
+  # is not the subject's; a cut end alone leaves the start what it is.
+  if ctx.pos == 0 and ctx.subjectEnd == 0 and not ctx.cutStart:
     return false
   let prevIsWord =
     if ctx.pos > 0:
@@ -2385,7 +2419,8 @@ proc matchWordBoundary(ctx: MatchContext): bool =
       else:
         isWordChar(Rune(prevCharCode(ctx.subject.oa, ctx.pos)), asciiOnly)
     else:
-      false
+      # Nothing precedes the view, or in line mode what rg reads before a cut.
+      ctx.cutPrevWord and not asciiOnly
   let nextIsWord =
     if ctx.pos < ctx.subject.len:
       let lead = ctx.subject[ctx.pos].uint8
@@ -2402,6 +2437,20 @@ proc matchWordBoundary(ctx: MatchContext): bool =
     else:
       false
   prevIsWord xor nextIsWord
+
+proc atCut(ctx: MatchContext): bool {.noinline.} =
+  ## Line mode: whether ``ctx.pos`` is an edge of the view that a malformed
+  ## byte cuts (``MatchContext.cut``).  ``\B`` does not hold there, as rg's
+  ## does not beside a byte that is not UTF-8, unless at a cut start a
+  ## character decodes before the view (``cutPrevValid``).  Under ``(?W)``
+  ## or ``(?P)`` a cut is no exception, rg's ASCII ``\B`` being ``\b``
+  ## negated, a malformed byte being a non-word one.  The matcher's check:
+  ## the prefilter (``leadAnchorsHold``) does not make it, so it admits a
+  ## ``\B`` the matcher refuses, and refuses nothing more.
+  if rfAsciiWord in ctx.flags or rfAsciiPosix in ctx.flags:
+    return false
+  ctx.pos == 0 and ctx.cutStart and not ctx.cutPrevValid or
+    ctx.pos >= ctx.subject.len and ctx.cutEnd
 
 proc leadAnchorsHold(ctx: MatchContext): bool {.inline.} =
   ## Whether every leading assertion holds at ``ctx.pos``.
@@ -4184,7 +4233,7 @@ proc runMachine(
         of akWordBoundary:
           mode = if matchWordBoundary(ctx): mCont else: mFail
         of akNotWordBoundary:
-          mode = if matchWordBoundary(ctx): mFail else: mCont
+          mode = if matchWordBoundary(ctx) or ctx.cut and atCut(ctx): mFail else: mCont
         else:
           if anchorHolds(ctx, node.anchor):
             if node.anchor == akKeep:

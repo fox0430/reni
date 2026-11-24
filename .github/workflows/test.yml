@@ -192,6 +192,11 @@ jobs:
         # the loop, layouts and all, under the same tests.
         run: nim c -r -d:reniNoBlockScan tests/test_byte_scan.nim
 
+      - name: Run the line mode tests a byte at a time
+        # The same targets read whether a line must be checked for malformed
+        # UTF-8 by another branch (``lineEndAt`` in reni/line_mode.nim).
+        run: nim c -r -d:reniNoBlockScan tests/test_line_mode.nim
+
   differential-fuzz:
     # Pinned, not ``ubuntu-latest``: this is the only job whose result depends
     # on a system library's behaviour rather than just its presence, and an

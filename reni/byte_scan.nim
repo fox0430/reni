@@ -109,6 +109,7 @@ when BlockScan:
   func mmMinU(a, b: M128i): M128i {.importc: "_mm_min_epu8".}
   func mmOr(a, b: M128i): M128i {.importc: "_mm_or_si128".}
   func mmMoveMask(a: M128i): int32 {.importc: "_mm_movemask_epi8".}
+  func mmSet1(b: int8): M128i {.importc: "_mm_set1_epi8".}
   {.pop.}
 
   type Bytes = ptr UncheckedArray[char]
@@ -187,6 +188,33 @@ when BlockScan:
         return start + 31 - countLeadingZeroBits(m)
     -1
 
+  proc newlineOrHighBlocks(data: Bytes, start, size: int): int {.noinline.} =
+    ## [findNewlineOrHigh] over ``[start, size)``, at least sixteen bytes long.
+    ## A byte past ASCII has its sign bit set, and so does a ``\n`` once
+    ## ORed with its compare, so one move mask reads both.
+    let nl = mmSet1(int8('\n'))
+    template maskAt(q: int): uint32 =
+      let v = mmLoadu(cast[ptr M128i](addr data[q]))
+      cast[uint32](mmMoveMask(mmOr(v, mmCmpEq(v, nl))))
+
+    var i = start
+    while i + 32 <= size:
+      let m = maskAt(i) or (maskAt(i + 16) shl 16)
+      if m != 0:
+        return i + countTrailingZeroBits(m)
+      i += 32
+    if i + 16 <= size:
+      let m = maskAt(i)
+      if m != 0:
+        return i + countTrailingZeroBits(m)
+      i += 16
+    if i < size:
+      let q = size - 16
+      let m = maskAt(q) and not ((1'u32 shl (i - q)) - 1)
+      if m != 0:
+        return q + countTrailingZeroBits(m)
+    -1
+
   {.pop.}
 
 proc findAnyByte*(
@@ -228,4 +256,22 @@ proc rfindAnyByte*(
     dec e
     if uint8(data[e]) in bs:
       return e
+  -1
+
+proc findNewlineOrHigh*(
+    data: ptr UncheckedArray[char], start, size: int
+): int {.inline.} =
+  ## Index of the first ``\n`` or byte past ASCII in ``data[start ..< size]``,
+  ## or -1.  Line mode finds a candidate line's end with it, and learns on
+  ## the way whether the line holds a byte to check for malformed UTF-8.
+  ## Without the block scan, a byte at a time.
+  when BlockScan:
+    if size - start >= 16:
+      return newlineOrHighBlocks(data, start, size)
+  var i = start
+  while i < size:
+    let b = uint8(data[i])
+    if b == uint8('\n') or b >= 0x80'u8:
+      return i
+    inc i
   -1

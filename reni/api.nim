@@ -308,10 +308,10 @@ proc nextRunePos*(subject: string, pos: int): int =
   ## Uses the same length rule as the scan loops, so the positions
   ## ``findAll`` / ``replace`` / ``split`` step to after a zero-width match
   ## are exactly the positions ``search`` starts an attempt at.  Not under
-  ## ``rfLineMode``, whose scan stops a step at a ``\n``, and under
-  ## ``rfCrlf`` also at the ``\r`` that ends a line: a lead byte either cuts
-  ## short ends its line, so the next start is that ``\n`` or ``\r``
-  ## itself.  Drive such a scan with ``MatchScanner``.
+  ## ``rfLineMode``, whose scan steps past a malformed byte one byte at a
+  ## time, where this steps the length its lead declares and passes the
+  ## starts inside, a line's end among them.  Drive such a scan with
+  ## ``MatchScanner``.
   ##
   ## The step never leaves the subject: a sequence truncated by the end
   ## declares more bytes than are there, and stepping past ``subject.len``
@@ -339,9 +339,8 @@ proc advanceAfterMatch*(
   ## Drive a ``reni`` scan with ``MatchScanner`` instead.
   ##
   ## Nor does it fit ``rfLineMode``: it steps past an empty match with
-  ## ``nextRunePos``, which runs on over a ``\n`` that cuts a sequence short
-  ## and skips the start of the line after it, or under ``rfCrlf`` over the
-  ## ``\r`` that ends a line and the line end there.
+  ## ``nextRunePos``, which runs on over the bytes after a malformed lead byte,
+  ## a line's end among them, and skips the starts there.
   ##
   ## The span is taken whole rather than as two ``int`` parameters so that a
   ## caller written against an older argument order fails to compile instead
@@ -403,7 +402,10 @@ type MatchScanner* = object
   ## Under ``rfLineMode`` the scan also keeps where the line of its last
   ## match begins and ends, so that a scan through one long line does not
   ## read to its ends on every match.  A subject rewritten in place between
-  ## two calls must keep that line's ``\n`` where it was and add none inside.
+  ## two calls must keep that line's ``\n`` where it was and add none inside,
+  ## and must not change which of the line's bytes are well-formed UTF-8: the
+  ## scan keeps that too, and where the stretch between two malformed bytes
+  ## that its last match lies in begins and ends.
   ## Under ``rfCrlf`` nothing more is required: whether a ``\r`` stands
   ## before that ``\n`` is read again on every call.
   subjectLen: int ## Length of the subject the cursors point into.
@@ -453,14 +455,13 @@ proc advancePast(
     consumed: Span,
     stepOver: bool,
     lineMode: static bool,
-    crlf: bool,
 ): bool {.inline.} =
   ## Move ``scanPos`` past an attempt that ran over ``consumed``.
   ## ``stepOver`` forces the one-character step an attempt consuming nothing
   ## needs anyway; a suppressed repeat asks for it, since its end is where the
   ## scan already stands.  Returns false when the scan has run off the subject.
-  ## Under ``rfLineMode`` the step stops at the end of a line
-  ## (``nextLineRunePos``), which is a ``\r`` under ``rfCrlf`` (``crlf``).
+  ## Under ``rfLineMode`` the step is one byte past a malformed byte
+  ## (``nextLineRunePos``).
   ##
   ## The span is passed in rather than kept on the scanner, so there is no
   ## second copy of it to get out of step with ``scanPos``.
@@ -472,7 +473,7 @@ proc advancePast(
       return false
     sc.scanPos =
       when lineMode:
-        nextLineRunePos(subject, consumed.b, crlf)
+        nextLineRunePos(subject, consumed.b)
       else:
         nextRunePos(subject, consumed.b)
   else:
@@ -497,11 +498,6 @@ proc scanNextIn(
 ): bool {.inline.} =
   ## [scanNext], with the search and the step fixed for ``rfLineMode`` or not.
   sc.checkSubject(subject)
-  let crlf =
-    when lineMode:
-      rfCrlf in regex.flags
-    else:
-      false
   while not sc.finished and sc.scanPos <= subject.len:
     when lineMode:
       searchLinesInto(
@@ -537,7 +533,7 @@ proc scanNextIn(
     # telling two attempts over it apart by their captures would yield it
     # twice, which is two replacements at one position.
     if m.boundaries[0] == sc.prevReported:
-      if not sc.advancePast(subject, consumed, stepOver = true, lineMode, crlf):
+      if not sc.advancePast(subject, consumed, stepOver = true, lineMode):
         sc.finished = true
         return false
       continue
@@ -545,7 +541,7 @@ proc scanNextIn(
     # Step past this match now rather than at the top of the next call, so
     # ``scanPos`` is true while the caller still holds the match.  Running off
     # the subject here ends the scan; this match is still handed over.
-    if not sc.advancePast(subject, consumed, stepOver = false, lineMode, crlf):
+    if not sc.advancePast(subject, consumed, stepOver = false, lineMode):
       sc.finished = true
     return true
   false
