@@ -97,7 +97,21 @@ reported in the whole buffer.
 - No match holds a `\n`, so `\s` and `[^x]` stop at the end of the line.
 - `\A` and `^` hold at the start of a line, and `\z`, `\Z` and `$` at its
   end.
-- Look-arounds do not see past the line.
+- Look-arounds do not see past the line, nor past a byte that is not
+  well-formed UTF-8. So `(?!.)` holds before such a byte, where `$` does not.
+- A byte that is not well-formed UTF-8 is matched by nothing, as in rg, so
+  no match holds one. It is no edge of the line: `^`, `\A`, `$`, `\z` and
+  `\Z` hold beside one only at the line's own start or end. `\b` reads it
+  as a non-word side, and `\B` does not hold beside it. After stray
+  continuation bytes, as in rg, both read the character before those bytes
+  when it and they fit in four bytes: up to three such bytes after an ASCII
+  character, two after a 2-byte one, one after a 3-byte one and none after a
+  4-byte one.
+  Under `(?W)` or `(?P)` the byte is simply a non-word side, and `\B` holds
+  wherever `\b` does not. `\y` holds on both sides of it, where a
+  character or cluster ends or begins, and `\Y` on neither.
+- A position you pass (`start`, `pos`) must be a character boundary. From
+  inside a character, its remaining bytes may match.
 - A final `\n` ends the last line; it does not begin an empty one.
 - `moNotBeginString` disables `\A` only in the line at offset 0, the one
   that begins the buffer. `moNotBeginPosition` disables `\G` only in the
@@ -118,8 +132,8 @@ counts the whole call, not each line. Scan with `findAll` or a
 `searchBackwardIntoCtx` or `matchAtIntoCtx` reads to both ends of the line
 holding its position on every call, so walking one long line that way takes
 quadratic time. Such a loop also cannot step past an empty match with
-`nextRunePos`: the step runs on over a `\n` that cuts a sequence short and
-skips the start of the next line.
+`nextRunePos`: past a malformed lead byte it steps the length that byte
+declares, and skips the starts inside, the start of the next line among them.
 
 Add `rfCrlf` for files with `\r\n` line ends. A `\r` that is the last byte
 of a line, before its `\n` or at the end of the buffer, is then left out of

@@ -40,6 +40,26 @@ type
       ## spell a ``\n``: a literal one, or a bracket class of nothing else,
       ## is a ``RegexError``.
       ##
+      ## A byte that is no part of well-formed UTF-8 (RFC 3629: no overlong
+      ## form, no surrogate, nothing past U+10FFFF) is matched by nothing, as
+      ## in rg, where the Oniguruma reading would let a stray lead byte take
+      ## the bytes after it into one character.  So no match holds one: each
+      ## stretch between them is a subject of its own, but a cut is no line
+      ## edge, so ``^``, ``\A``, ``$``, ``\z`` and ``\Z`` hold only at the
+      ## line's own start or end, and ``\B`` not beside the malformed byte.
+      ## ``\b``, ``\<`` and ``\>`` read it as a non-word side, except that,
+      ## as rg does, they and ``\B`` read the character before stray
+      ## continuation bytes, in the same line, as the one before them, when it
+      ## and they fit in four bytes: up to three such bytes after an ASCII
+      ## character, none after a 4-byte one.  Under ``rfAsciiWord`` or
+      ## ``rfAsciiPosix`` the byte is a non-word side to all four, and ``\B``
+      ## is ``\b`` negated there too.  ``\y`` holds on both sides of it, as a
+      ## cluster never spans it, and ``\Y`` on neither.  A look-around stops
+      ## at the malformed byte, so ``(?!.)`` holds before one though ``$``
+      ## does not.  A position a caller gives (``start``, ``pos``) must be a
+      ## character's boundary: one inside a well-formed character is taken as
+      ## it is, and the character's remaining bytes may then match.
+      ##
       ## ``moNotBeginString`` takes ``\A`` from the line at offset 0 only,
       ## the one whose start is the buffer's; ``moNotBeginPosition`` takes
       ## ``\G`` from the line holding ``start``.  A scan (``findAll``,

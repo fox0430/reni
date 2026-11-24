@@ -108,6 +108,26 @@ suite "findAnyByte and rfindAnyByte":
           check rfindAnyByte(bytesOf(s), start, n, bs, sc) ==
             (if start <= at: at else: -1)
 
+suite "findNewlineOrHigh":
+  test "a newline or a byte past ASCII at each place in and around a block":
+    for n in [1, 15, 16, 17, 31, 32, 33, 47, 48, 64, 70]:
+      for at in 0 ..< n:
+        for hit in ['\n', '\x80', '\xFF', '\xC3']:
+          var s = newString(n)
+          for i in 0 ..< n:
+            s[i] = char(0x0B + i mod 0x70) # ASCII, never a newline
+          s[at] = hit
+          for start in 0 .. n:
+            check findNewlineOrHigh(bytesOf(s), start, n) ==
+              (if start <= at: at else: -1)
+
+  test "the first of several":
+    let s = "abcdefghijklmnopqrstuvwxyz\xE9abc\ndef\x80"
+    check findNewlineOrHigh(bytesOf(s), 0, s.len) == 26
+    check findNewlineOrHigh(bytesOf(s), 27, s.len) == 30
+    check findNewlineOrHigh(bytesOf(s), 31, s.len) == 34
+    check findNewlineOrHigh(bytesOf(s), 31, 34) == -1
+
 proc spans(s: string, r: Regex): seq[Span] =
   for m in s.findAll(r):
     result.add m.matchSpan

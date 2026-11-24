@@ -11,7 +11,7 @@ import std/unicode
 import types, unicode_utils
 
 proc wordEdgeAt*(
-    s: openArray[char], pos, rangeEnd: int, begin, asciiOnly: bool
+    s: openArray[char], pos, rangeEnd: int, begin, asciiOnly, wordBefore0: bool
 ): bool {.noinline.} =
   ## Whether ``\<`` (``begin``) or ``\>`` holds at ``pos`` in ``s``, the
   ## whole subject.  Each side is read as ``\b`` reads it, the real next
@@ -20,9 +20,11 @@ proc wordEdgeAt*(
   ## ``WORD_BEGIN`` opens with ``DATA_ENSURE_CHECK1`` (``s < right_range``)
   ## at every position.  ``WORD_END`` has no such check, so ``\>`` holds at
   ## the clip as anywhere.  ``asciiOnly`` is ``(?W)`` or ``(?P)``.
+  ## ``wordBefore0`` is what precedes ``pos`` 0: false but in a line mode
+  ## view a malformed byte cuts, where it is ``MatchContext.cutPrevWord``.
   if begin and pos >= rangeEnd:
     return false
-  var before = false
+  var before = wordBefore0 and not asciiOnly
   if pos > 0:
     let prev = s[pos - 1].uint8
     before =
