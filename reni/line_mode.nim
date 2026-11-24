@@ -35,6 +35,10 @@ proc indexOfAnyByte(
   ## [indexOfAnyByte] over a view.
   findAnyByte(s.data, start, s.size, bs, sc)
 
+proc indexOfPrefix(s: Subject, start: int, ps: PrefixScan): int {.inline.} =
+  ## [indexOfPrefix] over a view.
+  findPrefix(s.data, start, s.size, ps)
+
 # The scan's byte helpers over a view.  ``engine`` keeps its own over a
 # ``string``, text for text as they were: made generic there, the change of
 # instance moved gcc's inlining in ``runMachine`` (+0.46% of the grammars'
@@ -572,12 +576,34 @@ proc lineOptions(options: MatchOptions, ls: int, holdsStart: bool): MatchOptions
   if holdsStart and moNotBeginPosition in options:
     result.incl moNotBeginPosition
 
+proc prefixCandidate(s: string, regex: Regex, p: int): int =
+  ## [lineCandidate] under ``prefixLines``: the first offset at or after ``p``
+  ## where ``prefixScan`` holds and a byte of ``lineLit``'s set follows in the
+  ## line.  A match begins no earlier than the line's first hit, and holds such
+  ## a byte from there on.  The prefix alone would pick nearly every line for
+  ## ``(?:the|and) [qz]``: how rare words are is not told by their letters.
+  ## From a hit without one, the next such byte's line is the first that can
+  ## match, so either of the two, where rare, skips the lines between.
+  result = indexOfPrefix(s, p, regex.prefixScan)
+  while result >= 0:
+    let lit = findRequired(s, regex.lineLit, regex.lineScan, result)
+    if lit < 0:
+      return -1
+    let nl = lastNewlineIn(s, result, lit)
+    if nl < 0:
+      return
+    result = indexOfPrefix(s, nl + 1, regex.prefixScan)
+
 proc lineCandidate(s: string, regex: Regex, p: int): int =
   ## Line mode: the first offset at or after ``p`` where what every match
-  ## holds occurs (``Regex.lineLit``, else the required byte, else the first
-  ## byte), or -1 when it does not.  The line around it is the first that can
-  ## match: everything the matcher reads lies in its line, so a line without
-  ## it has no match.  ``p`` itself when the pattern names nothing.
+  ## holds occurs, or -1 when it does not: ``Regex.prefixScan`` and
+  ## ``Regex.lineLit`` in one line where ``Regex.prefixLines`` is set, which
+  ## the compiler decides ([prefixPicksLines]); without it ``Regex.lineLit``,
+  ## else the required byte, else the first byte.  The line around it is the
+  ## first that can match: everything the matcher reads lies in its line, so a
+  ## line without it has no match.  ``p`` itself when the pattern names nothing.
+  if regex.prefixLines:
+    return prefixCandidate(s, regex, p)
   if regex.lineLit.kind != rlNone:
     return findRequired(s, regex.lineLit, regex.lineScan, p)
   if regex.requiredByte.valid:
@@ -698,7 +724,9 @@ proc stretchCandidate(s: string, regex: Regex, p, last: int, hitA, hitB: var int
   ## occurrence again.  Of a string only its least likely byte is looked for.
   ## ``hitA`` and ``hitB`` hold the next hit of each byte of a pair (-1 at
   ## first, ``NoHit`` for none) and ``p`` never goes back, so a byte the line
-  ## lacks is looked for once.
+  ## lacks is looked for once.  ``prefixLines`` is not read here: the prefix
+  ## may be rarer, but a line of stretches holds malformed bytes and is seldom
+  ## met.
   let view = Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[0]), size: last)
   case regex.lineLit.kind
   of rlString:
@@ -730,6 +758,8 @@ proc stretchCandidate(s: string, regex: Regex, p, last: int, hitA, hitB: var int
     elif p >= last:
       -1
     else:
+      # No prefix here, which would leave a ``lineLit`` (``prefixPicksLines``),
+      # so ``leadScan`` is ``fc.bytes`` laid out.
       indexOfAnyByte(view, p, fc.bytes, regex.leadScan)
   of fcNone, fcAnchorStart, fcLineStart:
     p

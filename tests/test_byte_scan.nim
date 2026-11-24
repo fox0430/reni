@@ -4,7 +4,7 @@
 ## against a loop, and a search against the same ``Regex`` with its layouts
 ## cleared, which the search then reads a byte at a time.
 
-import std/[importutils, random, unittest]
+import std/[importutils, random, strutils, unittest]
 
 import reni
 import reni/byte_scan
@@ -128,6 +128,74 @@ suite "findNewlineOrHigh":
     check findNewlineOrHigh(bytesOf(s), 31, s.len) == 34
     check findNewlineOrHigh(bytesOf(s), 31, 34) == -1
 
+proc naivePrefix(s: string, start, size: int, ps: PrefixScan): int =
+  for i in start ..< size:
+    for k in 0 ..< ps.len:
+      if i + k >= size or uint8(s[i + k]) notin ps.sets[k]:
+        break
+      if k == ps.len - 1 or ps.early and s[i + k] >= '\x80':
+        return i
+  -1
+
+suite "findPrefix":
+  test "agrees with a byte at a time":
+    var r = initRand(20261124)
+    var hits = 0
+    for round in 0 ..< 400:
+      let ps = PrefixScan(len: 2 + r.rand(1), early: r.rand(1) == 0)
+      for k in 0 ..< ps.len:
+        while ps.scans[k].runs == 0:
+          ps.sets[k] = randomSet(r, 1 + r.rand(MaxScanRuns - 1))
+          ps.scans[k] = initByteSetScan(ps.sets[k])
+      let n = 1 + r.rand(89)
+      var s = newString(n)
+      for i in 0 ..< n:
+        s[i] = char(r.rand(255))
+      for _ in 0 .. r.rand(1):
+        let at = r.rand(n - 1)
+        for k in 0 ..< min(ps.len, n - at):
+          for b in ps.sets[k]:
+            s[at + k] = char(b)
+            if r.rand(3) == 0:
+              break
+      for start in 0 .. n:
+        for size in [n, max(start, n - 1), min(n, start + 17), min(n, start + 18)]:
+          let hit = naivePrefix(s, start, size, ps)
+          check findPrefix(bytesOf(s), start, size, ps) == hit
+          if hit >= 0:
+            inc hits
+    check hits > 1000
+
+  test "agrees over long stretches without a first byte":
+    # Long enough that the scan leaves its blocks for `memchr`, for a first
+    # set of one or two lone bytes, and for others stays.
+    var r = initRand(20261125)
+    var hits = 0
+    for round in 0 ..< 600:
+      let ps = PrefixScan(len: 2 + r.rand(1), early: r.rand(1) == 0)
+      for k in 0 ..< ps.len:
+        ps.sets[k] = {uint8('b'), uint8('y')}
+        if k == 0 and round mod 3 == 0:
+          ps.sets[k] = {uint8('b')}
+        elif r.rand(2) == 0:
+          ps.sets[k] = ps.sets[k] + {uint8('d') .. uint8('f'), 0xE9'u8}
+        ps.scans[k] = initByteSetScan(ps.sets[k])
+      let n = 1 + r.rand(4000)
+      var s = repeat('.', n)
+      for _ in 0 .. r.rand(6):
+        # A whole prefix, or bytes of one.
+        let at = r.rand(n - 1)
+        for k in 0 ..< min(1 + r.rand(2), n - at):
+          s[at + k] = "bydf\xE9"[r.rand(4)]
+      for _ in 0 ..< 8:
+        let start = r.rand(n)
+        let size = start + r.rand(n - start)
+        let hit = naivePrefix(s, start, size, ps)
+        check findPrefix(bytesOf(s), start, size, ps) == hit
+        if hit >= 0:
+          inc hits
+    check hits > 500
+
 proc spans(s: string, r: Regex): seq[Span] =
   for m in s.findAll(r):
     result.add m.matchSpan
@@ -137,16 +205,23 @@ proc byteAtATime(r: Regex): Regex =
   result.leadScan = ByteSetScan()
   result.requiredScan = ByteSetScan()
   result.lineScan = ByteSetScan()
+  result.prefixScan = nil
+  result.prefixLines = false
 
 suite "searches over the block scan":
   const patterns = [
     "foo|bar|baz|qux|quux|corge|grault|garply", "(?i)picker", "[A-Z]{2,}_[A-Z]",
     "[qz]x|é", "é|ü|q", "[b-d]+e", "(?i)x", "(?i)kx", "[éa]b", "(?:q|z)\\b",
-    "[^a-y\\s]", "(?i)ab", "\\w+[a-z]", "[a-zA-Z]{8}",
+    "[^a-y\\s]", "(?i)ab", "\\w+[a-z]", "[a-zA-Z]{8}", "(?i)foo|bar", "(?i)stq|zk",
+    "(?i)sq|[ß]q", "b(?:q|z)x|é", "(?=[zq])[b-z]x", "(?i)ssq|zzz", "(?i)ffiq",
+    "(?i)hax", "(?i)stop|halt", "(?i)while", "[A-Z][A-Z_]+b", "\\Rqz|zqb",
+    "[bq](?=o)o|(?<=f)oq", "(?:qu){2}x|zzb",
   ]
   const pieces = [
     "a", "b", "q", "z", "x", "K", "_", "AB", " ", "\n", "é", "ü", "\xE9", "\xF0",
-    "\x80", "foo", "bar", "picker", "PiCkEr", "quux", "\xE2\x84\xAA", "e", "de",
+    "\x80", "foo", "bar", "picker", "PiCkEr", "quux", "\xE2\x84\xAA", "e", "de", "ẞ",
+    "ﬃ", "ẖ", "ﬆ", "ﬀ", "ſ", "h", "H", "s", "t", "stop", "While", "ha", "op",
+    "\xC1\xB3", "\xE0\x81\xB3",
   ]
 
   test "a lead set is laid out where it is rare":
@@ -155,6 +230,28 @@ suite "searches over the block scan":
     check re(r"\w+_\w+\(").leadScan.runs == 0
     check re("[a-z]+_").leadScan.runs == 0
     check re(r"\d{6,}").leadScan.runs > 0
+
+  test "a prefix is laid out where it is rarer than the first byte":
+    when BlockScan:
+      check re("foo|bar|baz|qux|quux|corge|grault|garply").prefixScan.len == 3
+      check re("(?i)foo|bar").prefixScan.early
+      check re("[A-Z]{3,}_[A-Z]+").prefixScan == nil
+      check re(r"\w+_\w+\(").prefixScan == nil
+      check re("foo").prefixScan == nil
+      # A branch of one character leaves nothing to test after the first.
+      check re("foo|b|qux").prefixScan == nil
+      check re("foo|bar|qux", {rfLineMode}).prefixLines
+      # A rare pair keeps its cursors, and a rare line set picks its lines.
+      let todo = re("TODO|FIXME", {rfLineMode})
+      check todo.leadScan.runs == 0 and not todo.prefixLines
+      check re("日本|中国").prefixScan == nil
+      # What is weighed is what the first byte alone looks for, less what a
+      # look-ahead takes from it.
+      check re("(?=[~@#])[!-/:-@~][0-9]").prefixScan == nil
+      # A set that holds an earlier one is not the runs of that one.
+      check re("[0-9][0-9a-f]{3}").prefixScan != nil
+    else:
+      check re("foo|bar|qux").prefixScan == nil
 
   test "a required or line set is laid out however common":
     # (?i)ab requires {B, b}.  [a-z] and [a-zA-Z] are heavier than any lead
@@ -178,6 +275,21 @@ suite "searches over the block scan":
             s.add pieces[r.rand(pieces.high)]
           check spans(s, fast) == spans(s, slow)
 
+  test "a line is picked by the prefix and the line set together":
+    let r = re("(?:the|and) .*[qz]", {rfLineMode})
+    when BlockScan:
+      check r.prefixLines
+    let slow = byteAtATime(r)
+    var rnd = initRand(11)
+    const words = ["the ", "and ", "\n", "q", "z", "cat ", "then ", "\xE9", "\r\n"]
+    for _ in 0 ..< 3000:
+      var s = ""
+      for _ in 0 ..< rnd.rand(40):
+        s.add words[rnd.rand(words.high)]
+      check spans(s, r) == spans(s, slow)
+    check spans("z the cat\nand\nthe z\nthe q", r) ==
+      @[Span(a: 14, b: 19), Span(a: 20, b: 25)]
+
   test "a hit inside a character is no start":
     # 0xE9 declares three bytes, so the character walk steps from it over the
     # two ``q`` after it, to the third, as a byte at a time does.
@@ -186,3 +298,22 @@ suite "searches over the block scan":
     let s = "aaaaaaaaaaaaaaaaaaaaaaaaa\xE9qqq"
     check spans(s, r) == @[Span(a: 28, b: 29)]
     check spans(s, byteAtATime(r)) == @[Span(a: 28, b: 29)]
+
+  test "a prefix inside a character is no start":
+    # 0xE9 declares three bytes, so the walk steps from it over "fo" to "o".
+    let r = re("foo|bar|qux")
+    when BlockScan:
+      check r.prefixScan != nil
+    for s in [
+      "aaaaaaaaaaaaaaaaaaaaaaaaa\xE9foo", "aaaaaaaaaaaaaaaaaaaaaaaaa\xE9foo bar foo"
+    ]:
+      check spans(s, r) == spans(s, byteAtATime(r))
+    check spans("aaaaaaaaaaaaaaaaaaaaaaaaa\xE9foo", r).len == 0
+
+  test "a prefix begins with no byte the first byte alone rules out":
+    for pattern in ["(?i)while", "(?i)hello", "(?i)stop|halt", "(?i)foo|bar"]:
+      let r = re(pattern)
+      when BlockScan:
+        check r.prefixScan != nil
+        check r.prefixScan.sets[0] <= r.firstCharInfo.bytes
+        check r.leadScan == initByteSetScan(r.prefixScan.sets[0])

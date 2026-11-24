@@ -598,6 +598,13 @@ proc indexOfAnyByte(
   else:
     findAnyByte(cast[ptr UncheckedArray[char]](unsafeAddr s[0]), start, s.len, bs, sc)
 
+proc indexOfPrefix(s: string, start: int, ps: PrefixScan): int {.inline.} =
+  ## First index at or after ``start`` where ``ps`` holds, or -1.
+  if start >= s.len:
+    -1
+  else:
+    findPrefix(cast[ptr UncheckedArray[char]](unsafeAddr s[0]), start, s.len, ps)
+
 proc lastIndexOfAnyByte(
     s: string, start: int, bs: set[uint8], sc: ByteSetScan
 ): int {.inline.} =
@@ -5957,7 +5964,7 @@ template searchScan() {.dirty.} =
           exhausted = true
       of fcByteSet:
         var found = false
-        if fc.pairOk:
+        if fc.pairOk and not leadBlocks:
           let a = fc.pair[0]
           let b = fc.pair[1]
           while startPos < subject.len:
@@ -6003,10 +6010,15 @@ template searchScan() {.dirty.} =
                   encLen(b)
               startPos += step
           else:
-            # Over bytes, a block at a time ([indexOfAnyByte]).  A hit inside
+            # Over bytes, a block at a time ([indexOfAnyByte]), or the first
+            # bytes of a match together ([indexOfPrefix]).  A hit inside
             # a character is no start position, as under the pair above.
             while startPos < subject.len:
-              let hit = indexOfAnyByte(subject, startPos, fc.bytes, regex.leadScan)
+              let hit =
+                if regex.prefixScan != nil:
+                  indexOfPrefix(subject, startPos, regex.prefixScan)
+                else:
+                  indexOfAnyByte(subject, startPos, fc.bytes, regex.leadScan)
               if hit < 0:
                 startPos = subject.len
                 break

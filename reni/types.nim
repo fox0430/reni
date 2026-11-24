@@ -1246,14 +1246,25 @@ type
     leadScan: ByteSetScan
       ## ``firstCharInfo.bytes`` laid out for the block scan, under
       ## ``fcByteSet`` when the set is rare enough that its members lie apart
-      ## (``runs`` 0 otherwise, and the scan reads a byte at a time).  Last,
-      ## for the reason ``requiredLit`` gives.
+      ## (``runs`` 0 otherwise, and the scan reads a byte at a time).  Under
+      ## ``prefixScan`` its first set instead, which may lack bytes of
+      ## ``firstCharInfo.bytes`` that begin no match; but ``runs`` 0 under a
+      ## rare pair, which keeps its ``memchr`` cursors (``leadSetScan``).
+      ## Last, for the reason ``requiredLit`` gives.
     requiredScan: ByteSetScan
       ## ``requiredLit.set`` laid out for the block scan, under ``rlSet``.
       ## Here rather than in ``RequiredLiteral``, whose two copies then moved
       ## ``classFolds`` and ``lineLit`` by 258 bytes each: the bench's matcher
       ## read 0.15% more instructions over every item.
     lineScan: ByteSetScan ## ``lineLit.set`` laid out, as ``requiredScan``.
+    prefixScan: PrefixScan
+      ## The sets of the first bytes every match consumes, where testing them
+      ## together finds far fewer starts than ``firstCharInfo``; nil
+      ## otherwise.  The scan looks for starts by it unless ``leadScan.runs``
+      ## is 0, as under a rare pair; line mode may still pick lines by it.
+    prefixLines: bool
+      ## Under ``rfLineMode``: ``prefixScan`` is expected to turn away more
+      ## lines than ``lineLit`` does, and is looked for first.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1472,6 +1483,15 @@ proc leadScan*(r: Regex): lent ByteSetScan {.inline.} =
 proc requiredScan*(r: Regex): lent ByteSetScan {.inline.} =
   ## Borrowed, like [requiredByte].
   r.requiredScan
+
+proc prefixScan*(r: Regex): lent PrefixScan {.inline.} =
+  ## **Internal API.** The first bytes tested together, or nil; the scan looks
+  ## for starts by them where ``leadScan.runs`` is not 0.
+  r.prefixScan
+
+proc prefixLines*(r: Regex): bool {.inline.} =
+  ## **Internal API.** Whether ``prefixScan`` picks line mode's lines.
+  r.prefixLines
 
 proc lineScan*(r: Regex): lent ByteSetScan {.inline.} =
   ## Borrowed, like [requiredByte].
@@ -1737,6 +1757,8 @@ proc initRegex*(
     leadRepeat: Node = nil,
     leadBehind: LeadBehindInfo = LeadBehindInfo(valid: false),
     leadScan: ByteSetScan = ByteSetScan(),
+    prefixScan: PrefixScan = nil,
+    prefixLines: bool = false,
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1788,6 +1810,8 @@ proc initRegex*(
     leadScan: leadScan,
     requiredScan: requiredScan,
     lineScan: lineScan,
+    prefixScan: prefixScan,
+    prefixLines: prefixLines,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =
