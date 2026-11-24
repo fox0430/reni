@@ -2682,11 +2682,21 @@ const LeadScanWeight = 120
   ## over the GREP corpus (notes/GREP_WORKLOAD.md §3.8).
   ## ``[A-Z]`` weighs 66 and ``{b, c, f, g, q, z}`` 30.
 
-proc leadSetScan(fc: FirstCharInfo): ByteSetScan =
+const RarePairWeight = 6
+  ## A pair no heavier than this keeps its ``memchr`` cursors even where there
+  ## is a prefix: they look for both bytes by ``memchr`` from the start, where
+  ## [findPrefix] does only after a stretch without either.
+
+proc leadSetScan(fc: FirstCharInfo, prefix: PrefixScan): ByteSetScan =
   ## The scan's lead set laid out for the block scan, or ``runs`` 0 where it
   ## reads a byte at a time: a heavy set, and a pair, which the scan looks
-  ## for with a ``memchr`` cursor per byte.
-  if fc.kind == fcByteSet and not fc.pairOk and setWeight(fc.bytes) <= LeadScanWeight:
+  ## for with a ``memchr`` cursor per byte.  Under ``prefix`` the first
+  ## position's, some or all of ``fc.bytes``, so that ``runs`` sends the scan
+  ## to the block loop.
+  if prefix != nil:
+    if not fc.pairOk or setWeight(fc.bytes) > RarePairWeight:
+      result = prefix.scans[0]
+  elif fc.kind == fcByteSet and not fc.pairOk and setWeight(fc.bytes) <= LeadScanWeight:
     result = initByteSetScan(fc.bytes)
 
 func folds(flags: RegexFlags): bool {.inline.} =
@@ -3046,6 +3056,228 @@ proc lineLiteral(ast: Node, flags: RegexFlags): RequiredLiteral =
     else:
       result.kind = rlSet
       result.set = w.set.bs
+
+type MatchPrefix = object
+  ## The bytes a node's matches begin with, a set for each of the first
+  ## ``len``.  ``whole`` when every match consumes exactly those, so what
+  ## follows the node goes on from them.  ``early`` as [PrefixScan] has it:
+  ## a set may then hold bytes past ASCII and the prefix go on after it,
+  ## for the matches whose byte there is ASCII.
+  len: int
+  whole: bool
+  early: bool
+  sets: array[MaxPrefixLen, set[uint8]]
+
+proc add(p: var MatchPrefix, bs: set[uint8], goesOn: bool) =
+  ## One more character, which begins with a byte of ``bs``.  Only a byte
+  ## below 0x80 is known to be all of its character, and ``goesOn`` says
+  ## whether even that is.
+  if bs == {}:
+    p.whole = false
+    return
+  p.sets[p.len] = bs
+  inc p.len
+  if p.len == MaxPrefixLen or not goesOn or
+      not p.early and bs * {0x80'u8 .. 0xFF'u8} != {}:
+    p.whole = false
+
+proc addPrefix(p: var MatchPrefix, node: Node, flags: RegexFlags) =
+  ## Append what ``node`` consumes first to ``p``, which is ``whole``.
+  template addRune(cp: int32) =
+    if not flags.folds:
+      # Compared byte for byte, a non-ASCII character too.
+      var buf: array[4, char]
+      for i in 0 ..< utf8Encode(cp, buf):
+        if p.len < MaxPrefixLen:
+          p.sets[p.len] = {uint8(buf[i])}
+          inc p.len
+      if p.len == MaxPrefixLen:
+        p.whole = false
+    elif cp >= 0x80:
+      p.whole = false
+    else:
+      # No run of ASCII characters stands for one ASCII character.
+      p.add(FoldedLeadBytes[cp], true)
+
+  if node == nil:
+    p.whole = false
+    return
+  case node.kind
+  of nkLiteral:
+    addRune(int32(node.rune))
+  of nkEscapedLiteral:
+    addRune(int32(node.escapedRune))
+  of nkString:
+    for i in 0 ..< node.runes.len:
+      addRune(int32(node.runes[i]))
+      if not p.whole:
+        break
+  of nkCharClass:
+    # ``(?i)[ß]`` takes "ss", an ASCII byte and not all of it.
+    let bs = leafLeadBytes(node, flags)
+    p.add(bs, not flags.folds or bs * {0x80'u8 .. 0xFF'u8} == {})
+  of nkCharType:
+    # ``\R`` takes "\r\n", and ``\X`` a cluster.
+    p.add(
+      leafLeadBytes(node, flags), node.charType notin {ctNewlineSeq, ctGraphemeCluster}
+    )
+  of nkConcat:
+    var cur = flags
+    for child in node.children.view:
+      if child.kind == nkFlagGroup and child.flagBody == nil:
+        cur = cur + child.flagsOn - child.flagsOff
+        continue
+      p.addPrefix(child, cur)
+      if not p.whole:
+        break
+  of nkCapture:
+    p.addPrefix(node.captureBody, flags)
+  of nkNamedCapture:
+    p.addPrefix(node.namedCaptureBody, flags)
+  of nkGroup:
+    p.addPrefix(node.groupBody, flags)
+  of nkAtomicGroup:
+    p.addPrefix(node.atomicBody, flags)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      p.addPrefix(node.flagBody, flags + node.flagsOn - node.flagsOff)
+    else:
+      p.whole = false
+  of nkQuantifier:
+    for _ in 1 .. node.quantMin:
+      let before = p.len
+      p.addPrefix(node.quantBody, flags)
+      if not p.whole or p.len == before:
+        break
+    if node.quantMax != node.quantMin:
+      p.whole = false
+  of nkAlternation:
+    if node.alternatives.len == 0:
+      p.whole = false
+      return
+    var all: MatchPrefix
+    for i, alt in node.alternatives.view:
+      var b = p
+      b.addPrefix(alt, flags)
+      if i == 0:
+        all = b
+      else:
+        all.whole = all.whole and b.whole and all.len == b.len
+        all.len = min(all.len, b.len)
+        for k in 0 ..< all.len:
+          all.sets[k] = all.sets[k] + b.sets[k]
+      if all.len == p.len and not all.whole:
+        # No branch can make it longer again.
+        break
+    p = all
+  of nkAnchor, nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    discard # Zero-width: the match goes on from where it stands.
+  else:
+    p.whole = false
+
+const TotalWeight = block:
+  var t = 0
+  for w in ByteWeight:
+    t += w
+  t
+
+const
+  PrefixGain = 4
+    ## How many times fewer starts than the first byte alone the prefix is
+    ## to leave, by weight.
+  PrefixRarity = 50 ## It is to leave at most one start in this many.
+  PrefixMinWeight = 4
+    ## A set no heavier than this ([setWeight]) is rare enough by itself:
+    ## line mode took ``日本|中国`` (2) 85 ms over the GREP corpus by its set
+    ## and 163 by the prefix.
+
+func weightShare(bs: set[uint8]): float =
+  ## The share of bytes expected to be in ``bs``.
+  setWeight(bs).float / TotalWeight.float
+
+proc prefixRate(p: MatchPrefix | PrefixScan): float =
+  ## The share of positions ``p`` is expected to leave.  A set the prefix has
+  ## already counts for nothing: what is in it comes in runs (``[A-Z]{3}``).
+  ## A wider one counts in full: to count it for nothing too took
+  ## ``[0-9][0-9a-f]{3}`` from 250 ms to 897 over the GREP corpus, and
+  ## ``[A-Z][A-Z_]+_[A-Z]`` from 84 to 76.  So does one whose first is cut to
+  ## ``fc.bytes``: without its second set ``(?i)ss|zz`` took 4.0 ms over 2 MB
+  ## of words and 0.6 with it.
+  result = 1.0
+  for k in countdown(p.len - 1, 0):
+    let bs = p.sets[k]
+    if k == 0 or bs notin p.sets.toOpenArray(0, k - 1):
+      if p.early:
+        result =
+          result * weightShare(bs * {0'u8 .. 0x7F'u8}) +
+          weightShare(bs * {0x80'u8 .. 0xFF'u8})
+      else:
+        result = result * weightShare(bs)
+
+proc prefixServes(p: MatchPrefix | PrefixScan, fc: FirstCharInfo): bool =
+  ## Whether ``p`` leaves few enough starts next to ``fc.bytes`` alone.
+  let rate = prefixRate(p)
+  rate * PrefixGain <= weightShare(fc.bytes) and rate * PrefixRarity <= 1.0
+
+proc layOut(p: MatchPrefix, fc: FirstCharInfo): PrefixScan =
+  ## ``p`` laid out for the scan, or nil where the first byte serves as well.
+  ## Weighed before anything is laid out: most patterns end here.  Cutting it
+  ## short, as below, only leaves more starts.
+  if p.len < 2 or not prefixServes(p, fc):
+    return nil
+  result = PrefixScan(len: p.len, early: p.early, sets: p.sets)
+  for k in 0 ..< p.len:
+    result.scans[k] = initByteSetScan(p.sets[k])
+    if result.scans[k].runs == 0:
+      # Too many runs for the block test.
+      if k < 2:
+        return nil
+      result.len = k
+      if not prefixServes(result, fc):
+        return nil
+      break
+
+proc matchPrefix(ast: Node, flags: RegexFlags, fc: FirstCharInfo): PrefixScan =
+  ## The scan's [PrefixScan], or nil where the first byte serves as well.
+  ## Without ``early`` first: a case-sensitive ``日本`` is read on past its
+  ## lead byte, which is common where there is any such text.  And two
+  ## positions without it do: ``(?i)picker`` took 137 ms by them over the GREP
+  ## corpus and 170 by three with it, a letter's fold leads being many runs.
+  ##
+  ## ``fc.bytes`` is what the prefix is weighed against, and cuts its first
+  ## set: it leaves out what a look-ahead or a fold rules out, which the walk
+  ## does not see.
+  when BlockScan:
+    if fc.kind != fcByteSet or setWeight(fc.bytes) <= PrefixMinWeight:
+      return nil
+    for early in [false, true]:
+      var p = MatchPrefix(whole: true, early: early)
+      p.addPrefix(ast, flags)
+      var high = false
+      for k in 0 ..< p.len:
+        high = high or p.sets[k] * {0x80'u8 .. 0xFF'u8} != {}
+      if p.len > 0:
+        # Both hold every byte a match begins with.
+        p.sets[0] = p.sets[0] * fc.bytes
+      result = layOut(p, fc)
+      if result != nil or not high:
+        # ``early`` changes nothing where every set is ASCII.
+        return
+
+proc prefixPicksLines(
+    prefix: PrefixScan, lineLit: RequiredLiteral, flags: RegexFlags
+): bool =
+  ## Whether line mode looks for its lines by ``prefix`` before it looks for
+  ## ``lineLit``'s set in them.  Only ever a set, as ``memchr`` or ``memmem``
+  ## finds a string.
+  if rfLineMode notin flags:
+    return false
+  when not defined(release):
+    # The second position's set is laid out, so it lacks some byte, and
+    # [lineLiteral] walks the node it comes from and takes it or a lighter one.
+    doAssert lineLit.kind != rlNone
+  lineLit.kind == rlSet and setWeight(lineLit.set) > PrefixMinWeight and
+    prefixRate(prefix) < weightShare(lineLit.set)
 
 type LeadBehindStep = enum
   lbsNone ## Zero-width; the walk may look past it.
@@ -4009,6 +4241,12 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
   let firstConsumed = consumedFirst.kind in {fcByte, fcByteSet}
   let requiredByte =
     requiredByteRegion(ast, finalFlags, extractRequiredByte(ast, finalFlags))
+  let prefix = matchPrefix(ast, finalFlags, firstChar)
+  let lineLit =
+    if rfLineMode in finalFlags:
+      lineLiteral(ast, finalFlags)
+    else:
+      RequiredLiteral()
   let leadAnchors = leadAnchorSet(ast, finalFlags)
   let semiEnd = semiEndAnchored(ast)
   when not defined(release):
@@ -4030,11 +4268,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     requiredLit = requiredLiteral(
       ast, finalFlags, firstChar, firstConsumed, requiredByte, leadAnchors, semiEnd
     ),
-    lineLit =
-      if rfLineMode in finalFlags:
-        lineLiteral(ast, finalFlags)
-      else:
-        RequiredLiteral(),
+    lineLit = lineLit,
     semiEndAnchored = semiEnd,
     # [anchorDMax] parts from [maxByteLen] only over an absent operator.
     semiEndDMax =
@@ -4055,7 +4289,9 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     leadAnchors = leadAnchors,
     leadRepeat = leadRepeat,
     leadBehind = leadBehindLiteral(ast, finalFlags),
-    leadScan = leadSetScan(firstChar),
+    leadScan = leadSetScan(firstChar, prefix),
+    prefixScan = prefix,
+    prefixLines = prefix != nil and prefixPicksLines(prefix, lineLit, finalFlags),
   )
   # After the constructor, which numbers the tree the table indexes.  Derived
   # under ``result.flags`` rather than ``finalFlags`` because the runtime
