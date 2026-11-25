@@ -688,3 +688,118 @@ suite "rfCrlf: a pattern may not spell a CR":
   test "rfCrlf without rfLineMode is refused":
     expect RegexError:
       discard re("a", {rfCrlf})
+
+privateAccess(Regex)
+
+proc tailOf(pattern: string, flags: RegexFlags = {}): set[uint8] =
+  re(pattern, flags + {rfLineMode}).lineTail
+
+suite "rfLineMode: a line that ends as no match does is not searched":
+  const high = {0x80'u8 .. 0xFF'u8}
+
+  test "the bytes a match ends its line with":
+    check tailOf("\\t$") == {9'u8}
+    check tailOf("foo\\z") == {uint8('o')}
+    check tailOf("foo\\Z") == {uint8('o')}
+    check tailOf("(?:a|b)(?=.|$)\\b$") == {uint8('a'), uint8('b')}
+    check tailOf("[ab]c?$") == {uint8('a'), uint8('b'), uint8('c')}
+    check tailOf("(?:ab$)+") == {uint8('b')}
+    check tailOf("a(?:b$|c*$)") == {uint8('a'), uint8('b'), uint8('c')}
+    check tailOf("日本$") == high
+    check tailOf("a(?i)b$") * {0'u8 .. 0x7F'u8} == {uint8('B'), uint8('b')}
+    check tailOf("(?i)s$") == {uint8('S'), uint8('s')} + high
+    check tailOf("(?i)[0-9]+$") * {0'u8 .. 0x7F'u8} ==
+      {uint8('0') .. uint8('9')} + {uint8('S'), uint8('s'), uint8('K'), uint8('k')}
+    check tailOf("(?i)[a-c]$") >= {uint8('A') .. uint8('C'), uint8('a') .. uint8('c')}
+    check uint8('x') notin tailOf("(?i)[a-c]$")
+    check tailOf("(?i)[a-z]+$") >= high
+    check tailOf("\\s+$") * {0'u8 .. 0x7F'u8} == {9'u8 .. 13'u8, 32'u8}
+
+  test "none where a match may end elsewhere, be empty, or end with anything":
+    for p in [
+      "a", "a$|b", "a(?:$|b)", "a(?:b$)?", "a(?:$|\\b)", "$", "\\s*$", "^$", "a$b?",
+      "a(?=$)", ".$", "\\R$", "\\X$", "(a)\\1$", "(?<n>a)\\g<n>$", "(?~a)$", "(?i)ß$",
+      "(?i)[ß]$", "(?i)[aß]$", "(?i)[^a]$", "(a)?(?(1)b|c)$",
+    ]:
+      checkpoint p
+      check tailOf(p) == {}
+    check re("a$").lineTail == {}
+
+  test "no attempt is made in such a line":
+    # Each attempt would run into the step limit.
+    let r = lm("(a+)+$")
+    let s = repeat('a', 40) & "b"
+    check not search(s, r).found
+    check not searchBackward(s, r).found
+    check spanOf(search(s & "\na", r)) == 42 .. 43
+    check spanOf(searchBackward("a\n" & s, r)) == 0 .. 1
+    # ``matchAt`` makes the one attempt it is asked for.
+    expect RegexLimitError:
+      discard matchAt(s, r, 0)
+
+  test "only the last stretch of a line is searched":
+    let r = lm("(a+)+$")
+    let s = "\xE9" & repeat('a', 40) & "b\xE9"
+    check spanOf(search(s & "a", r)) == 43 .. 44
+    check spanOf(searchBackward(s & "a", r)) == 43 .. 44
+    check not searchBackward(s & "a", r, 41).found
+
+  test "the answers are those of a search of every line":
+    const
+      atoms = [
+        "a", "b", "s", "S", "\\s", "\\w", "\\S", "\\d", "[ab]", "[^a]", "[ßs]", "ß",
+        "[s]", "[a-z]", "[0-9]", "[[ab]s]", "[a-z&&[^b]]", "(?iI:[as])", "(?I:[as])",
+        "é", "日", "ﬆ", "st", "ss", ".", "\\R", "\\X", "\\h", "(?:a|é)",
+        "(?:ss|ß|b)", "(a|b)", "(?i:s)", "(?-i:s)", "(?i)", "(?=a)", "(?!b)", "(?<=a)",
+        "\\b", "\\B", "\\K", "^", "(?>a+)", "(?:a$|b)", "(?:b$|\\s$)", "(?:$)", "\\xE9",
+        "K", "\\1",
+      ]
+      quants = ["", "", "", "?", "*", "+", "{2}", "+?", "*+", "{0}", "{0,2}", "??"]
+      ends =
+        ["$", "$", "$", "\\z", "\\Z", "$\\b", "(?:$|b$)", "$(?!a)", "$?", "($)", ""]
+      pieces = [
+        "a", "b", "s", "S", " ", "\t", "ß", "é", "日", "ﬆ", "ſ", "K", "1", "\r",
+        "\n", "\n", "\r\n", "\xE9", "\x80", "\xC3", "ss", "st", "\f",
+      ]
+    var rng = initRand(20261125)
+    var tested, hits = 0
+    for _ in 0 ..< 6000:
+      var p = ""
+      for _ in 0 .. rng.rand(3):
+        let atom = rng.sample(atoms)
+        p.add atom
+        if atom notin ["(?i)", "^", "\\K", "\\b", "\\B"]:
+          p.add rng.sample(quants)
+      p.add rng.sample(ends)
+      if rng.rand(4) == 0:
+        p = p & "|" & rng.sample(atoms) & rng.sample(ends)
+      var flags = {rfLineMode}
+      if rng.rand(2) == 0:
+        flags.incl rfIgnoreCase
+      if rng.rand(2) == 0:
+        flags.incl rfCrlf
+      if rng.rand(5) == 0:
+        flags.incl rfFindLongest
+      var r: Regex
+      try:
+        r = re(p, flags)
+      except RegexError:
+        continue
+      if r.lineTail == {}:
+        continue
+      inc tested
+      var plain = r
+      plain.lineTail = {}
+      for _ in 0 ..< 12:
+        var s = ""
+        for _ in 0 .. rng.rand(14):
+          s.add rng.sample(pieces)
+        checkpoint p & " " & $flags & " " & s.escape
+        let spans = toSeq(s.findAll(r)).mapIt(it.matchSpan)
+        hits += spans.len
+        check spans == toSeq(s.findAll(plain)).mapIt(it.matchSpan)
+        let at = rng.rand(s.len)
+        check spanOf(search(s, r, start = at)) == spanOf(search(s, plain, start = at))
+        check spanOf(searchBackward(s, r, at)) == spanOf(searchBackward(s, plain, at))
+    check tested > 500
+    check hits > 1000

@@ -3279,6 +3279,145 @@ proc prefixPicksLines(
   lineLit.kind == rlSet and setWeight(lineLit.set) > PrefixMinWeight and
     prefixRate(prefix) < weightShare(lineLit.set)
 
+type
+  TailState = enum
+    tsOpen ## Nothing is known of where the walk stands.
+    tsEnd ## The walk stands at the line's end.
+    tsDone ## The line's last byte is consumed, one of ``bytes``.
+    tsRefuse ## Some match ends elsewhere, or with a byte not known.
+
+  TailWalk = object
+    ## A walk over a pattern from its end to its start.  ``bytes`` is what the
+    ## nodes passed may have consumed as the line's last byte.
+    state: TailState
+    bytes: set[uint8]
+
+const HighBytes = {0x80'u8 .. 0xFF'u8}
+  ## What a character past ASCII may end with.  A subject line mode searches
+  ## is well-formed, so such a character holds no ASCII byte.
+
+proc consume(w: var TailWalk, bs: set[uint8]) =
+  ## One character that ends with a byte of ``bs``, ``{}`` where not known.
+  if w.state == tsEnd and bs != {}:
+    w.bytes = w.bytes + bs
+    w.state = tsDone
+  else:
+    w.state = tsRefuse
+
+proc tailRune(cp: int32, flags: RegexFlags): set[uint8] =
+  ## What a character that stands for the literal ``cp`` ends with.
+  if flags.folds:
+    # An expansion (``ss`` for ``ß``) ends with a character of its own.
+    if cp < 0x80:
+      FoldedLeadBytes[cp] + HighBytes
+    else:
+      {}
+  elif cp in 0'i32 .. 0x7F'i32:
+    {uint8(cp)}
+  else:
+    HighBytes
+
+proc tailLeaf(node: Node, flags: RegexFlags): set[uint8] =
+  ## What a character the class or type ``node`` matches ends with.  An ASCII
+  ## lead byte is all of its character.
+  result = leafLeadBytes(node, flags)
+  if node.kind == nkCharType:
+    if node.charType in {ctNewlineSeq, ctGraphemeCluster}:
+      # More than one character, the last not among the leads.
+      return {}
+  elif flags.folds and (node.negated or atomsReachNonAscii(node.atoms)):
+    # ``(?i)[ß]`` takes "ss", which ends with a character of its own.  A member
+    # below U+0080 has no such expansion.
+    return {}
+  if result * HighBytes != {}:
+    result = result + HighBytes
+
+proc tailWalk(w: var TailWalk, node: Node, flags: RegexFlags) =
+  ## Walk ``w`` over ``node``, from where a match leaves it to where it
+  ## enters it.
+  if w.state in {tsDone, tsRefuse}:
+    return
+  if node == nil:
+    w.state = tsRefuse
+    return
+  case node.kind
+  of nkLiteral:
+    w.consume(tailRune(int32(node.rune), flags))
+  of nkEscapedLiteral:
+    w.consume(tailRune(int32(node.escapedRune), flags))
+  of nkString:
+    if node.runes.len > 0:
+      w.consume(tailRune(int32(node.runes[node.runes.len - 1]), flags))
+  of nkCharClass, nkCharType:
+    w.consume(tailLeaf(node, flags))
+  of nkConcat:
+    for i in countdown(node.children.len - 1, 0):
+      w.tailWalk(node.children[i], flags)
+      if w.state in {tsDone, tsRefuse}:
+        break
+  of nkCapture:
+    w.tailWalk(node.captureBody, flags)
+  of nkNamedCapture:
+    w.tailWalk(node.namedCaptureBody, flags)
+  of nkGroup:
+    w.tailWalk(node.groupBody, flags)
+  of nkAtomicGroup:
+    w.tailWalk(node.atomicBody, flags)
+  of nkFlagGroup:
+    if node.flagBody != nil:
+      w.tailWalk(node.flagBody, flags + node.flagsOn - node.flagsOff)
+    else:
+      # Isolated, which ``parseConcat`` leaves nowhere.  It would hold for what
+      # follows it, which the walk has passed.
+      w.state = tsRefuse
+  of nkQuantifier:
+    if node.quantMax == 0:
+      return
+    let before = w.state
+    w.tailWalk(node.quantBody, flags)
+    if node.quantMin == 0 and w.state != before:
+      # No iteration may run: what stands before the repeat may then be last.
+      w.state = if before == tsEnd and w.state == tsDone: tsEnd else: tsRefuse
+  of nkAlternation:
+    var states: set[TailState]
+    let before = w
+    for alt in node.alternatives.view:
+      var b = before
+      b.tailWalk(alt, flags)
+      states.incl b.state
+      w.bytes = w.bytes + b.bytes
+      if b.state == tsRefuse:
+        break
+    w.state =
+      if tsRefuse in states or (tsOpen in states and states != {tsOpen}):
+        tsRefuse
+      elif tsOpen in states:
+        tsOpen
+      elif states == {tsDone}:
+        tsDone
+      elif states == {}:
+        tsRefuse
+      else:
+        tsEnd
+  of nkAnchor:
+    if node.anchor in {akLineEnd, akStringEnd, akStringEndOrNewline}:
+      w.state = tsEnd
+  of nkLookaround, nkCalloutMax, nkCalloutCount, nkCalloutCmp:
+    discard # Zero-width.
+  else:
+    w.state = tsRefuse
+
+proc lineTailSet(ast: Node, flags: RegexFlags): set[uint8] =
+  ## Under ``rfLineMode``: the bytes a line must end with to hold a match, or
+  ## ``{}`` where a match may end before the line does, may be empty, or takes
+  ## every printable byte there (``.$``), so that the test would not pay.
+  var w: TailWalk
+  w.tailWalk(ast, flags)
+  if w.state == tsDone and not ({0x20'u8 .. 0x7E'u8} <= w.bytes):
+    w.bytes
+  else:
+    {}
+
 type LeadBehindStep = enum
   lbsNone ## Zero-width; the walk may look past it.
   lbsFound
@@ -4247,6 +4386,11 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
       lineLiteral(ast, finalFlags)
     else:
       RequiredLiteral()
+  let lineTail =
+    if rfLineMode in finalFlags:
+      lineTailSet(ast, finalFlags)
+    else:
+      {}
   let leadAnchors = leadAnchorSet(ast, finalFlags)
   let semiEnd = semiEndAnchored(ast)
   when not defined(release):
@@ -4292,6 +4436,7 @@ proc re*(pattern: string, flags: RegexFlags = {}): Regex =
     leadScan = leadSetScan(firstChar, prefix),
     prefixScan = prefix,
     prefixLines = prefix != nil and prefixPicksLines(prefix, lineLit, finalFlags),
+    lineTail = lineTail,
   )
   # After the constructor, which numbers the tree the table indexes.  Derived
   # under ``result.flags`` rather than ``finalFlags`` because the runtime
