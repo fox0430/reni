@@ -207,6 +207,7 @@ proc byteAtATime(r: Regex): Regex =
   result.lineScan = ByteSetScan()
   result.prefixScan = nil
   result.prefixLines = false
+  result.lineRun = nil
 
 suite "searches over the block scan":
   const patterns = [
@@ -215,7 +216,9 @@ suite "searches over the block scan":
     "[^a-y\\s]", "(?i)ab", "\\w+[a-z]", "[a-zA-Z]{8}", "(?i)foo|bar", "(?i)stq|zk",
     "(?i)sq|[ß]q", "b(?:q|z)x|é", "(?=[zq])[b-z]x", "(?i)ssq|zzz", "(?i)ffiq",
     "(?i)hax", "(?i)stop|halt", "(?i)while", "[A-Z][A-Z_]+b", "\\Rqz|zqb",
-    "[bq](?=o)o|(?<=f)oq", "(?:qu){2}x|zzb",
+    "[bq](?=o)o|(?<=f)oq", "(?:qu){2}x|zzb", "(?i)\\s*picker", "(?i)\\w+stop",
+    "\\w+(?:foo|bar)", "(?i)\\w*(?:while|hax)", "(?i)a\\w*sst?op", "[qz].*(?:foo|bar)",
+    "(?i)\\s*stop", "(?i)\\w+hax",
   ]
   const pieces = [
     "a", "b", "q", "z", "x", "K", "_", "AB", " ", "\n", "é", "ü", "\xE9", "\xF0",
@@ -289,6 +292,155 @@ suite "searches over the block scan":
       check spans(s, r) == spans(s, slow)
     check spans("z the cat\nand\nthe z\nthe q", r) ==
       @[Span(a: 14, b: 19), Span(a: 20, b: 25)]
+
+  test "a run anywhere in the match picks lines":
+    proc runOf(pattern: string, flags: RegexFlags = {}): seq[set[uint8]] =
+      let run = re(pattern, flags + {rfLineMode}).lineRun
+      if run != nil:
+        for k in 0 ..< run.len:
+          result.add run.sets[k]
+
+    proc sets(spelled: varargs[string]): seq[set[uint8]] =
+      for s in spelled:
+        var bs: set[uint8]
+        for c in s:
+          bs.incl uint8(c)
+        result.add bs
+
+    when BlockScan:
+      check runOf("(?i)^\\s*todo") == sets("Oo", "Dd", "Oo")
+      # ``t`` has folds past ASCII, so the run would end with it.
+      check runOf("(?i)\\s+(?:todo|fixme)") == sets("OoXx", "DdMm", "OoEe")
+      check runOf("\\w+(foo|bar)") == sets("fb", "ao", "or")
+      check runOf("\\s*(?:(?:foo)|(?<n>b[a]r))") == sets("fb", "ao", "or")
+      check runOf("a?[qx]\\b(?=.)[jz][kv]\\w*") == sets("qx", "jz", "kv")
+      # One where every run ends at its first byte without ``early``.
+      check runOf("(?i)\\s+state").len == 3
+      # A repeat of a fixed number is gone through, another begun and ended.
+      check runOf("\\w+(?:[jq]){2}[kz]") == sets("jq", "jq", "kz")
+      check runOf("\\w+[qz](?:[jx][kv])+[qz]") == sets("qz", "jx", "kv")
+      check runOf("\\w+[qz](?:[jx][kv])*[qz]") == sets()
+      check runOf("\\w+[qz]\\w[jx]+[kv]") == sets()
+      check runOf("\\w+[qz](?:[jx][kv]){0}[jx]") == sets("qz", "jx")
+      check runOf("\\w+[qz](?:[jx][kv]){2}") == sets("qz", "jx", "kv")
+      # A look-ahead is read from where the match stands, and not consumed.
+      check runOf("(?=[qz][jx][kv])\\w+") == sets("qz", "jx", "kv")
+      check runOf("\\w+(?=[qz][jx])[kv]") == sets("qz", "jx")
+      check runOf("(?![qz][jx][kv])\\w+") == sets()
+      check runOf("\\w+(?<=[qz][jx])\\w") == sets()
+      # No line holds a newline.
+      check runOf("[a-y]*[\\nqz][\\njx]") == sets("qz", "jx")
+      # A rare line set, a string and a prefix as rare need none.
+      check runOf("\\w+(?:TODO|FIXME)") == sets()
+      check runOf("\\w+foo") == sets()
+      check runOf("(?i)todo") == sets()
+      check runOf("(?i)picker") == sets()
+      check runOf("foo|bar|qux") == sets()
+      check runOf("\\w+\\d") == sets()
+      check runOf("\\w+(foo|\\1)") == sets()
+      check runOf("\\w+(foo|)") == sets()
+      check runOf("\\w+[qz](?~ab)[jx]") == sets()
+      # ``nse`` may lie in fewer lines than the prefix.
+      check runOf("(?i)license").len == 3
+    check re("(?i)^\\s*todo").lineRun == nil
+
+  test "a run goes through a character wider than its byte in the set":
+    # U+212A is a fold of ``k``, U+017F of ``s``, U+FB06 of ``st``.
+    for (pattern, subject) in {
+      "(?i)\\w*(?:ms|ks)": "a\u212As",
+      "(?i)\\w*(?:ms|ks)": "aM\u017F",
+      "(?i)\\w*(?:ms|sts)": "1\uFB06s",
+      "(?i)\\w*(?:ms|sts)": "1\u017Fts",
+    }:
+      let r = re(pattern, {rfLineMode})
+      when BlockScan:
+        check r.lineRun.early
+      let s = "ms\xE2\n" & subject & "\n" & subject
+      check spans(s, r).len == 3
+      check spans(s, r) == spans(s, byteAtATime(r))
+
+  test "a line is picked by the run and the line set in either order":
+    for pattern in ["(?i)[jq]+.*err", "(?i)err.*[jq]", "[jq].*(?:foo|bar)"]:
+      let r = re(pattern, {rfLineMode})
+      let slow = byteAtATime(r)
+      var rnd = initRand(13)
+      const words = [
+        "err", "ERR", "foo", "bar", "q", "J", "j", "e", "r", "\n", "\n", " ", "\xE9",
+        "\r\n", "é", "xxxxxxxxxxxxxxxxxxxxxxxx",
+      ]
+      for _ in 0 ..< 2000:
+        var s = ""
+        for _ in 0 ..< rnd.rand(30):
+          s.add words[rnd.rand(words.high)]
+        check spans(s, r) == spans(s, slow)
+    let r = re("(?i)[jqv]+.*err", {rfLineMode})
+    when BlockScan:
+      check r.lineRun != nil
+    check spans("err\nq\nq err\nerr q\nj\nQ ERR q\nerr", r) ==
+      @[Span(a: 6, b: 11), Span(a: 20, b: 25)]
+
+  test "the answers under a run are those of a search of every line":
+    const
+      atoms = [
+        "a", "b", "s", "k", "st", "ss", "to", "err", "to", "err", "bk", "oS", "\\s",
+        "\\w", "\\S", "\\d", "[ab]", "[^a]", "[ßs]", "ß", "[s]", "[a-z]", "[qz]",
+        "[a-z&&[^b]]", "(?iI:[as])", "é", "日", "ﬆ", "[kK]", ".", "\\R", "\\X",
+        "\\h", "(?:a|é)", "(?:ss|ß|b)", "(a|b)", "(?:st|ke|é)", "(?:to|err)",
+        "(?i:s)", "(?-i:s)", "(?i)", "(?=st)", "(?=.*q)", "(?!b)", "(?<=a)", "\\b",
+        "\\B", "\\K", "^", "$", "(?>a+)", "(?:a(?i)s|t)", "\\1", "\\xE9", "K",
+        "(?<n>ab)",
+      ]
+      quants = [
+        "", "", "", "", "", "", "", "", "?", "*", "+", "{2}", "{1}", "+?", "*+", "{0}",
+        "{1,2}",
+      ]
+      pieces = [
+        "a", "b", "s", "S", "k", "q", "e", "r", "t", "T", "o", "err", "ERR", "to", " ",
+        "\t", "ß", "ẞ", "é", "日", "ﬆ", "ſ", "K", "1", "\r", "\n", "\n", "\r\n",
+        "\xE9", "\x80", "\xC3", "ss", "st", "\xE1", "aaaaaaaaaaaaaaaaaaaa", "ŉ", "ẖ",
+      ]
+    var rng = initRand(20261125)
+    var tested, hits = 0
+    for _ in 0 ..< 10000:
+      var p = ""
+      for _ in 0 .. 1 + rng.rand(4):
+        let atom = rng.sample(atoms)
+        p.add atom
+        if atom notin ["(?i)", "^", "$", "\\K", "\\b", "\\B"]:
+          p.add rng.sample(quants)
+      if rng.rand(5) == 0:
+        p = p & "|" & rng.sample(atoms) & rng.sample(atoms)
+      var flags = {rfLineMode}
+      if rng.rand(1) == 0:
+        flags.incl rfIgnoreCase
+      if rng.rand(2) == 0:
+        flags.incl rfCrlf
+      if rng.rand(5) == 0:
+        flags.incl rfFindLongest
+      var r: Regex
+      try:
+        r = re(p, flags)
+      except RegexError:
+        continue
+      if r.lineRun == nil:
+        continue
+      inc tested
+      var plain = r
+      plain.lineRun = nil
+      for _ in 0 ..< 20:
+        var s = ""
+        for _ in 0 .. rng.rand(60):
+          s.add rng.sample(pieces)
+        checkpoint p & " " & $flags & " " & s.escape
+        let got = spans(s, r)
+        hits += got.len
+        check got == spans(s, plain)
+        let at = rng.rand(s.len)
+        check search(s, r, start = at).boundaries ==
+          search(s, plain, start = at).boundaries
+    when BlockScan:
+      check tested > 500
+      check hits > 1000
 
   test "a hit inside a character is no start":
     # 0xE9 declares three bytes, so the character walk steps from it over the

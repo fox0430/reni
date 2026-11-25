@@ -123,8 +123,8 @@ assert search("a b\nc(\nd e f(", r).matchSpan == 7 .. 13
 ```
 
 One search covers the whole buffer. A forward search skips lines that lack a
-byte every match needs without searching them; a backward search searches
-each line from `start` back. A pattern that spells out a newline, such as
+byte every match needs, or a few in a row, without searching them; a backward
+search searches each line from `start` back. A pattern that spells out a newline, such as
 `\n`, `\x0a` or `[\n]`, raises `RegexError` under this flag. A class that
 also holds other characters, such as `[\na]`, is allowed. The step budget
 counts the whole call, not each line. Under a pattern whose matches all end
