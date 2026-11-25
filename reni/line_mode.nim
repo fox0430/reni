@@ -708,11 +708,12 @@ proc lineStartOnly(regex: Regex): bool =
   regex.firstCharInfo.kind in {fcAnchorStart, fcLineStart} or
     regex.leadAnchors * {akLineBegin, akStringBegin} != {}
 
-proc lineEndOnly(regex: Regex): bool =
-  ## Line mode: whether every match begins where ``$``, ``\z`` or ``\Z``
-  ## holds, which in a line is its end alone, for the reason [lineStartOnly]
-  ## gives.
-  regex.leadAnchors * {akLineEnd, akStringEnd, akStringEndOrNewline} != {}
+proc lastStretchOnly(regex: Regex): bool =
+  ## Line mode: whether every match lies in its line's last stretch: it begins
+  ## where ``$``, ``\z`` or ``\Z`` holds, which in a line is its end alone, for
+  ## the reason [lineStartOnly] gives, or ends there (``Regex.lineTail``).
+  regex.lineTail != {} or
+    regex.leadAnchors * {akLineEnd, akStringEnd, akStringEndOrNewline} != {}
 
 const NoHit = high(int)
 
@@ -799,7 +800,7 @@ proc scanStretches(
   ## holds -- ``candidate`` at first, [lineCandidate] from ``fromPos``, then
   ## [stretchCandidate] -- has no match, for the reason a line without it has
   ## none: a stretch is all its matcher sees.  The walk goes straight to the
-  ## stretch of that place, and under [lineEndOnly] to the line's last.
+  ## stretch of that place, and under [lastStretchOnly] to the line's last.
   defer:
     clearCuts(ctx)
   let startOnly = lineStartOnly(regex)
@@ -808,7 +809,7 @@ proc scanStretches(
   var known = walkEnd
   var best = -1
   var cand =
-    if lineEndOnly(regex):
+    if lastStretchOnly(regex):
       ce
     else:
       min(candidate, ce)
@@ -884,7 +885,7 @@ proc scanStretchesBackward(
   ## Line mode: [scanStretches] for the backward scan.  The stretches are
   ## searched back from the one that holds ``fromPos``, each later one back
   ## from its end.  The backward scan's ``\G`` is the line's end, so it
-  ## holds in the line's last stretch alone; under [lineEndOnly] only that
+  ## holds in the line's last stretch alone; under [lastStretchOnly] only that
   ## one is searched, and under [lineStartOnly] only the line's first.
   ##
   ## Each stretch's start is found back from its end ([prevMalformed]), so
@@ -899,7 +900,7 @@ proc scanStretchesBackward(
     else:
       prevMalformed(subject, ls, fromPos, ce) + 1
   var b = nextMalformed(subject, a, ce)
-  let lastOnly = akSearchBegin in regex.leadAnchors or lineEndOnly(regex)
+  let lastOnly = akSearchBegin in regex.leadAnchors or lastStretchOnly(regex)
   if lastOnly and b < ce:
     return false
   while true:
@@ -974,6 +975,7 @@ proc searchLinesIn(
   var ls = lineStartAt(ctx, subject, start, memo)
   var fromPos = start
   var first = true
+  let tail = regex.lineTail != {}
   while ls < subject.len:
     let c = lineCandidate(subject, regex, fromPos)
     if c < 0:
@@ -1010,6 +1012,14 @@ proc searchLinesIn(
         fromPos = ls
         first = false
         continue
+    if tail and (ce <= ls or subject[ce - 1].uint8 notin regex.lineTail):
+      # No match ends as this line does.
+      if le >= subject.len:
+        break
+      ls = le + 1
+      fromPos = ls
+      first = false
+      continue
     let clean =
       if memoLine:
         ctx.lineMemoClean
@@ -1165,9 +1175,12 @@ proc searchBackwardLinesIn(
     fromPos = subject.len - 1
     ls = lineStartAt(ctx, subject, fromPos, false)
   var first = true
+  let tail = regex.lineTail != {}
   while true:
     let ce = contentEnd(subject, lineEndAt(subject, fromPos), crlf)
-    if hasHighByte(subject, ls, ce) and not wellFormed(subject, ls, ce):
+    if tail and (ce <= ls or subject[ce - 1].uint8 notin regex.lineTail):
+      discard # No match ends as this line does.
+    elif hasHighByte(subject, ls, ce) and not wellFormed(subject, ls, ce):
       if scanStretchesBackward(
         ctx,
         subject,

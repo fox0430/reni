@@ -1265,6 +1265,13 @@ type
     prefixLines: bool
       ## Under ``rfLineMode``: ``prefixScan`` is expected to turn away more
       ## lines than ``lineLit`` does, and is looked for first.
+    lineTail: set[uint8]
+      ## Under ``rfLineMode``: where not ``{}``, every match ends at its
+      ## line's end and has consumed the line's last byte, one of these.  A
+      ## line that ends otherwise is not searched, and of a line that holds
+      ## malformed bytes only the last stretch is.  ``matchAt`` does not read
+      ## it, so it may run into the step limit where a search does not.  Last,
+      ## for the reason ``requiredLit`` gives.
 
   Span* = object
     ## Half-open byte range [a, b). `a` is the start (inclusive), `b` is
@@ -1492,6 +1499,10 @@ proc prefixScan*(r: Regex): lent PrefixScan {.inline.} =
 proc prefixLines*(r: Regex): bool {.inline.} =
   ## **Internal API.** Whether ``prefixScan`` picks line mode's lines.
   r.prefixLines
+
+proc lineTail*(r: Regex): lent set[uint8] {.inline.} =
+  ## Borrowed, like [requiredByte].
+  r.lineTail
 
 proc lineScan*(r: Regex): lent ByteSetScan {.inline.} =
   ## Borrowed, like [requiredByte].
@@ -1759,6 +1770,7 @@ proc initRegex*(
     leadScan: ByteSetScan = ByteSetScan(),
     prefixScan: PrefixScan = nil,
     prefixLines: bool = false,
+    lineTail: set[uint8] = {},
 ): Regex =
   ## Assemble a compiled ``Regex``.  Numbering the tree and resolving its name
   ## references happen here rather than in the caller: the matcher reaches a
@@ -1812,6 +1824,7 @@ proc initRegex*(
     lineScan: lineScan,
     prefixScan: prefixScan,
     prefixLines: prefixLines,
+    lineTail: lineTail,
   )
 
 func asciiFoldByte*(b: uint8): uint8 {.inline.} =

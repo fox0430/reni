@@ -127,7 +127,10 @@ byte every match needs without searching them; a backward search searches
 each line from `start` back. A pattern that spells out a newline, such as
 `\n`, `\x0a` or `[\n]`, raises `RegexError` under this flag. A class that
 also holds other characters, such as `[\na]`, is allowed. The step budget
-counts the whole call, not each line. Scan with `findAll` or a
+counts the whole call, not each line. Under a pattern whose matches all end
+with their line, such as `(a+)+$`, both searches also skip a line whose last
+byte no match ends with, and so cannot run into the step limit in it. `matchAt`
+always makes its attempt, and can. Scan with `findAll` or a
 `MatchScanner`: they keep the line they are in. A loop of `searchIntoCtx`,
 `searchBackwardIntoCtx` or `matchAtIntoCtx` reads to both ends of the line
 holding its position on every call, so walking one long line that way takes
