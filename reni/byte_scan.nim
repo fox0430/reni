@@ -49,9 +49,11 @@ type ByteSetScan* = object
 const MaxPrefixLen* = 3 ## Positions a [PrefixScan] tests at once.
 
 type PrefixScan* = ref object
-  ## The byte sets of the first ``len`` bytes every match consumes, each
-  ## laid out for the block test; ``sets`` spells them for the ends of the
-  ## data.  A position is a candidate where every byte is in its set.
+  ## The byte sets of ``len`` bytes one after another, each laid out for the
+  ## block test; ``sets`` spells them for the ends of the data.  They are the
+  ## first every match consumes (``Regex.prefixScan``), or lie anywhere in its
+  ## line and tell of no start (``Regex.lineRun``).  A position is a candidate
+  ## where every byte is in its set.
   ##
   ## ``early``: and where the bytes up to one past ASCII are, whatever
   ## follows.  Of a character that may be wider than a byte, what comes

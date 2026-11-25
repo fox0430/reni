@@ -594,14 +594,37 @@ proc prefixCandidate(s: string, regex: Regex, p: int): int =
       return
     result = indexOfPrefix(s, nl + 1, regex.prefixScan)
 
+proc runCandidate(s: string, regex: Regex, p: int): int =
+  ## [lineCandidate] under ``lineRun``: the first line from ``p`` on that holds
+  ## it and a byte of ``lineLit``'s set, in either order, and in it the first
+  ## offset by which both have begun.  The line of the one is where the other
+  ## is looked for next, so either of the two, where rare, skips the lines
+  ## between.
+  var run = indexOfPrefix(s, p, regex.lineRun)
+  if run < 0:
+    return -1
+  var lit = findRequired(s, regex.lineLit, regex.lineScan, p)
+  while run >= 0 and lit >= 0:
+    let nl = lastNewlineIn(s, min(run, lit), max(run, lit))
+    if nl < 0:
+      return max(run, lit)
+    if run < lit:
+      run = indexOfPrefix(s, nl + 1, regex.lineRun)
+    else:
+      lit = findRequired(s, regex.lineLit, regex.lineScan, nl + 1)
+  -1
+
 proc lineCandidate(s: string, regex: Regex, p: int): int =
   ## Line mode: the first offset at or after ``p`` where what every match
-  ## holds occurs, or -1 when it does not: ``Regex.prefixScan`` and
-  ## ``Regex.lineLit`` in one line where ``Regex.prefixLines`` is set, which
-  ## the compiler decides ([prefixPicksLines]); without it ``Regex.lineLit``,
-  ## else the required byte, else the first byte.  The line around it is the
-  ## first that can match: everything the matcher reads lies in its line, so a
-  ## line without it has no match.  ``p`` itself when the pattern names nothing.
+  ## holds occurs, or -1 when it does not: ``Regex.lineRun`` or
+  ## ``Regex.prefixScan``, where the compiler set it or ``Regex.prefixLines``
+  ## ([lineRun], [prefixPicksLines]), and ``Regex.lineLit`` in one line;
+  ## without either ``Regex.lineLit``, else the required byte, else the first
+  ## byte.  The line around it is the first that can match: everything the
+  ## matcher reads lies in its line, so a line without it has no match.  ``p``
+  ## itself when the pattern names nothing.
+  if regex.lineRun != nil:
+    return runCandidate(s, regex, p)
   if regex.prefixLines:
     return prefixCandidate(s, regex, p)
   if regex.lineLit.kind != rlNone:
@@ -725,9 +748,9 @@ proc stretchCandidate(s: string, regex: Regex, p, last: int, hitA, hitB: var int
   ## occurrence again.  Of a string only its least likely byte is looked for.
   ## ``hitA`` and ``hitB`` hold the next hit of each byte of a pair (-1 at
   ## first, ``NoHit`` for none) and ``p`` never goes back, so a byte the line
-  ## lacks is looked for once.  ``prefixLines`` is not read here: the prefix
-  ## may be rarer, but a line of stretches holds malformed bytes and is seldom
-  ## met.
+  ## lacks is looked for once.  Neither ``lineRun`` nor ``prefixLines`` is read
+  ## here: the run or the prefix may be rarer, but a line of stretches holds
+  ## malformed bytes and is seldom met.
   let view = Subject(data: cast[ptr UncheckedArray[char]](unsafeAddr s[0]), size: last)
   case regex.lineLit.kind
   of rlString:
@@ -936,9 +959,10 @@ proc searchLinesIn(
   ## reported in the subject's offsets.
   ##
   ## One pass over the whole subject ([lineCandidate]) skips the lines that
-  ## lack a byte every match holds; the scan runs over each other line's
-  ## view.  The steps are counted over the whole call, as one search's are:
-  ## a budget per line would let a call run ``lines * limit`` steps.
+  ## lack a byte or a run of bytes every match holds; the scan runs over each
+  ## other line's view.  The steps are counted over the whole call, as one
+  ## search's are: a budget per line would let a call run ``lines * limit``
+  ## steps.
   ##
   ## Under ``rfCrlf`` a ``start`` that holds no line, the ``\n`` of a
   ## ``\r\n`` or the end after a final ``\r``, begins with the next line.
