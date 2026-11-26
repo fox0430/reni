@@ -1147,6 +1147,12 @@ type
     derived*: bool ## False in a slot no class under ``(?i)`` fills.
 
   Regex* = object
+    ## A compiled pattern, built by ``re``.  It belongs to the thread that
+    ## built it: no other thread may use it, not even only to search with it
+    ## and not even after that thread is done with it.  Matching touches the
+    ## reference counts of its tree, and under ``--mm:refc`` the tree lives
+    ## on the building thread's heap.  A thread that searches compiles its
+    ## own.
     pattern: string
     ast: Node
     nodes: seq[Node]
@@ -2449,7 +2455,7 @@ const ReduceTable*: array[6, array[6, ReduceAction]] = [
 
 proc extractFirstCharUncached(
   node: Node, flags: RegexFlags, cache: FirstCharCache, ahead: bool
-): FirstCharInfo
+): FirstCharInfo {.gcsafe.}
 
 proc extractFirstChar*(
     node: Node, flags: RegexFlags, cache: FirstCharCache = nil

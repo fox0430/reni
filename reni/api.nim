@@ -753,9 +753,13 @@ proc replace*(
     count: int = 0,
     stepLimit: int = DefaultStepLimit,
     maxRecursionDepth: int = DefaultMaxRecursionDepth,
-): string =
+): string {.effectsOf: fn.} =
   ## Replace matches using a callback function.  The output rule is the one
   ## the template ``replace`` above states.
+  ##
+  ## Takes on ``fn``'s effects: with a ``gcsafe`` callback it is ``gcsafe``,
+  ## and it raises what ``fn`` raises in addition to its own ``RegexError``
+  ## and ``RegexLimitError``.
   result = ""
   var sc = initMatchScanner(
     subject, stepLimit = stepLimit, maxRecursionDepth = maxRecursionDepth

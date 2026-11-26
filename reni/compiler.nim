@@ -315,7 +315,7 @@ iterator refSlots(c: RecursionCheck, node: Node): int =
     for idx in c.namedCaptures.namedGroupsRead(node.backrefName, node.backrefScope):
       yield idx + 1
 
-proc consumes(c: var RecursionCheck, node: Node): bool
+proc consumes(c: var RecursionCheck, node: Node): bool {.gcsafe.}
 
 proc groupConsumes(c: var RecursionCheck, slot: int): bool =
   ## [consumes] for a group, and for a call to it.
@@ -397,7 +397,7 @@ proc consumes(c: var RecursionCheck, node: Node): bool =
     # node.
     result = false
 
-proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8
+proc recursionFlags(c: var RecursionCheck, node: Node, head: bool): uint8 {.gcsafe.}
 
 proc enterGroup(c: var RecursionCheck, slot: int, head: bool): uint8 =
   if c.entered[slot]:
@@ -2821,7 +2821,7 @@ proc offerByte(p: var ReqPair, cp: int32, flags: RegexFlags) =
   elif cp < 0x80:
     p.offer(FoldedLeadBytes[cp], FoldedWeight[cp])
 
-proc reqUnion(node: Node, flags: RegexFlags): ReqPair
+proc reqUnion(node: Node, flags: RegexFlags): ReqPair {.gcsafe.}
 
 proc reqBest(p: var ReqPair, node: Node, flags: RegexFlags) =
   ## The least likely byte set ``node`` requires, into ``p``.

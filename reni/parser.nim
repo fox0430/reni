@@ -1135,8 +1135,8 @@ proc setConditionRef(
       p.error("invalid relative conditional reference '(?(" & $r.number & "))'")
 
 # Forward declarations
-proc parseGroup(p: var Parser, atHead = false): Node
-proc parseAlternation(p: var Parser): Node
+proc parseGroup(p: var Parser, atHead = false): Node {.gcsafe.}
+proc parseAlternation(p: var Parser): Node {.gcsafe.}
 
 type
   ShapeLevel = object

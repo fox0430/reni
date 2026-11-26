@@ -477,7 +477,7 @@ proc parsePosixClass(p: var CcParser): CcAtom =
   else:
     CcAtom(kind: ccPosix, posixClass: cls)
 
-proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom])
+proc parseCharClassBody(p: var CcParser): (bool, seq[CcAtom]) {.gcsafe.}
 
 proc isPosixClass(p: CcParser): bool =
   ## Check if current position starts a valid POSIX class [:name:]
