@@ -212,7 +212,7 @@ proc ensureGroups(g: var GroupSpans) =
 
   walk(g, g.root, false)
 
-proc charSpan(node: Node, g: var GroupSpans, flags: RegexFlags): CharSpan
+proc charSpan(node: Node, g: var GroupSpans, flags: RegexFlags): CharSpan {.gcsafe.}
 
 proc groupSpan(g: var GroupSpans, idx: int): CharSpan =
   ## The span of group ``idx`` (0-based), unbounded when the group is unknown

@@ -288,6 +288,37 @@ What bounds the *work* a match may do is `stepLimit`, described above.
 Debug builds may additionally stop at Nim's call-depth limit before reaching
 the byte budget.
 
+### Threads
+
+A `Regex` and a `MatchContext` belong to the thread that built them. A
+thread that searches compiles its own `Regex` and uses its own
+`MatchContext`; it must not use another thread's, not even only to search
+with it, and not even after the other thread is done with it.
+
+```nim
+import std/typedthreads
+import reni
+
+proc worker(pattern: string) {.thread.} =
+  let r = re(pattern) # this thread's own Regex
+  let ctx = newMatchContext() # and its own context
+  var m: Match
+  if searchIntoCtx(ctx, "an IOError here", r, m):
+    echo m.matchSpan # 3 .. 10
+
+var threads: array[4, Thread[string]]
+for t in threads.mitems:
+  createThread(t, worker, r"\w+Error")
+joinThreads(threads)
+```
+
+Compiling costs little next to searching: a few microseconds for a typical
+grep pattern, a few hundred for an alternation of a few hundred literals,
+and threads that compile at the same time do not wait for each other.
+
+Every proc that compiles or runs a pattern is `gcsafe`, so a `{.thread.}`
+proc can call it; `replace` with a callback is `gcsafe` when the callback is.
+
 ## What `import reni` gives you
 
 The package module exports the matching API and the few types it speaks in,

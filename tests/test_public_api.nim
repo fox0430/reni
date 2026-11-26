@@ -6,7 +6,7 @@
 ## apart silently; the negative half pins the internals as reachable through
 ## ``reni/types`` and not through ``reni``.
 
-import std/[options, sequtils, strutils, unittest]
+import std/[hashes, options, sequtils, strutils, typedthreads, unittest]
 
 import reni
 
@@ -108,6 +108,71 @@ suite "the public API is what the README documents":
     check m.matchSpan == 1 .. 2
     searchIntoCtx(ctx, "abcabc", re("c"), m)
     check m.matchSpan == 2 .. 3
+
+# The README's "Threads" section.  Every entry point that compiles or runs a
+# pattern is called from a ``{.thread.}`` proc, so this file stops compiling
+# if one of them stops being ``gcsafe``.  A worker cannot use ``check``
+# (``check`` is not ``gcsafe``): it folds every answer into a hash, and the
+# main thread compares it with its own.
+
+const
+  ThreadSubject = "Fo1 bar22 baz333\r\nqux4 éa5"
+  ThreadPatterns = [
+    "\\d+", "(?<w>[a-z]+)(\\d+)", "(?i)ba(?=[rz])", "(?<!o)\\d", "^\\w+$", "\\b\\p{L}+"
+  ]
+  ThreadFlags = [{}, {rfLineMode, rfCrlf}]
+  ThreadRuns = ThreadPatterns.len * ThreadFlags.len
+
+var threadAnswers: array[ThreadRuns, Hash]
+
+proc everyEntryPoint(run: int): Hash =
+  ## Each public entry point on pattern ``run``, its answers hashed.
+  let r =
+    re(ThreadPatterns[run div ThreadFlags.len], ThreadFlags[run mod ThreadFlags.len])
+  let s = ThreadSubject
+  var h: Hash = hash(r.captureCount) !& hash(captureIndex(r, "w"))
+  let fm = search(s, r)
+  h = h !& hash($fm.boundaries) !& hash(fm.groupCount)
+  if fm.found:
+    h = h !& hash($captureSpan(fm, 0)) !& hash(captured(fm, 0))
+    h = h !& hash($captureText(fm, 0, s)) !& hash($consumedSpan(fm))
+  h = h !& hash($searchBackward(s, r).boundaries) !& hash($matchAt(s, r, 4).boundaries)
+  let ctx = newMatchContext()
+  var m: Match
+  h = h !& hash(searchIntoCtx(ctx, s, r, m, 2)) !& hash($m.boundaries)
+  h = h !& hash(searchBackwardIntoCtx(ctx, s, r, m)) !& hash($m.boundaries)
+  h = h !& hash(matchAtIntoCtx(ctx, s, r, m, 4)) !& hash($m.boundaries)
+  for fa in findAll(s, r):
+    h = h !& hash($fa.boundaries)
+  var sc = initMatchScanner(s)
+  while scanNext(sc, ctx, s, r, m):
+    h = h !& hash($takeGap(sc, m))
+  h = h !& hash($takeTail(sc, s)) !& hash(nextRunePos(s, 22))
+  h = h !& hash(replace(s, r, "<$0>"))
+  h =
+    h !&
+    hash(
+      replace(
+        s,
+        r,
+        proc(m: Match, s: string): string =
+          $m.boundaries[0],
+      )
+    )
+  h = h !& hash(split(s, r))
+  !$h
+
+proc answerInThread(run: int) {.thread.} =
+  threadAnswers[run] = everyEntryPoint(run)
+
+suite "threads":
+  test "each thread compiles and runs its own Regex":
+    var threads: array[ThreadRuns, Thread[int]]
+    for run in 0 ..< ThreadRuns:
+      createThread(threads[run], answerInThread, run)
+    joinThreads(threads)
+    for run in 0 ..< ThreadRuns:
+      check threadAnswers[run] == everyEntryPoint(run)
 
 suite "the internals are not part of that API":
   # Each of these is reachable by importing ``reni/types`` -- which is how

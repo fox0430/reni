@@ -1002,19 +1002,22 @@ template checkNativeDepth(ctx: MatchContext) =
       raise newException(RegexLimitError, "match call depth exceeded")
 
 # Forward declarations
-proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool
-proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool
-proc matchSeqCont(ctx: MatchContext, parent: Node, idx: int, cont: ContId): bool
-proc runContFromMachine(ctx: MatchContext, cont: ContId): bool
+proc matchWithCont(ctx: MatchContext, node: Node, cont: ContId): bool {.gcsafe.}
+proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool {.gcsafe.}
+proc matchSeqCont(
+  ctx: MatchContext, parent: Node, idx: int, cont: ContId
+): bool {.gcsafe.}
+
+proc runContFromMachine(ctx: MatchContext, cont: ContId): bool {.gcsafe.}
 proc findAbsentPos(
   ctx: MatchContext,
   absentBody: Node,
   fromPos: int,
   loopLeaf: Node = nil,
   loopHi: int32 = -1,
-): int
+): int {.gcsafe.}
 
-proc runCont(ctx: MatchContext, cont: ContId): bool
+proc runCont(ctx: MatchContext, cont: ContId): bool {.gcsafe.}
 
 template absentSuppressed(ctx: MatchContext): bool =
   ## Whether an absent operator here must refuse: it runs on the path of an
@@ -3661,7 +3664,9 @@ proc matchNodeRecursive(ctx: MatchContext, node: Node, cont: ContId): bool =
 proc matchNode(ctx: MatchContext, node: Node): bool =
   matchWithCont(ctx, node, TrueCont)
 
-proc writeFoundCopy(m: var Match, captures: seq[Span], n, startChar: int) {.inline.}
+proc writeFoundCopy(
+  m: var Match, captures: seq[Span], n, startChar: int
+) {.inline, gcsafe.}
 
 proc runCont(ctx: MatchContext, cont: ContId): bool =
   ## Walk the continuation chain starting at ``cont``: each ``Frame``
